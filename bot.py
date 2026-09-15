@@ -5,6 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -91,23 +92,75 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "✅ أنت مشترك في جميع القنوات المطلوبة."
         )
     else:
-        buttons = [
-            [InlineKeyboardButton(
-                text=f"📢 {ch.title}",
-                url=f"https://t.me/{ch.username}",
-            )]
-            for ch in missing
-        ]
-        names = "\n".join(f"  • {ch.title}" for ch in missing)
-        await update.message.reply_text(
-            "✅ تحقق ناجح! أنت لست بوت.\n\n"
-            "⚠️ أنت غير مشترك في القنوات التالية:\n"
-            f"{names}\n\n"
-            "اضغط الزر للاشتراك ثم أعد المحاولة:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        text, markup = _build_missing_message(missing)
+        await update.message.reply_text(text, reply_markup=markup)
 
     return ConversationHandler.END
+
+
+# ── Subscription helpers ────────────────────────────────────────────
+
+def _build_missing_message(
+    missing: list[Channel],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the text + keyboard for missing-channel messages."""
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text=f"📢 {ch.title}",
+            url=f"https://t.me/{ch.username}",
+        )]
+        for ch in missing
+    ]
+    buttons.append(
+        [InlineKeyboardButton(
+            text="✅ تحقق من الاشتراك",
+            callback_data="verify_subscription",
+        )]
+    )
+    names = "\n".join(f"  • {ch.title}" for ch in missing)
+    text = (
+        "✅ تحقق ناجح! أنت لست بوت.\n\n"
+        "⚠️ أنت غير مشترك في القنوات التالية:\n"
+        f"{names}\n\n"
+        "اضغط الزر للاشتراك ثم اضغط \"تحقق من الاشتراك\":"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def verify_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-check all required channels when the verify button is pressed."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    required = get_required_channels()
+
+    if not required:
+        await query.edit_message_text(
+            "✅ لا توجد قنوات مطلوبة حالياً."
+        )
+        return
+
+    missing: list[Channel] = []
+    for ch in required:
+        try:
+            member = await context.bot.get_chat_member(ch.channel_id, user_id)
+            if member.status not in (
+                "member",
+                "administrator",
+                "creator",
+            ):
+                missing.append(ch)
+        except TelegramError:
+            missing.append(ch)
+
+    if not missing:
+        await query.edit_message_text(
+            "✅ تحقق ناجح! أنت مشترك في جميع القنوات المطلوبة."
+        )
+    else:
+        text, markup = _build_missing_message(missing)
+        await query.edit_message_text(text, reply_markup=markup)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -320,6 +373,9 @@ def main() -> None:
     app.add_handler(CommandHandler("addchannel", add_channel))
     app.add_handler(CommandHandler("listchannels", list_channels))
     app.add_handler(CommandHandler("removechannel", remove_channel))
+    app.add_handler(CallbackQueryHandler(
+        verify_subscription, pattern="^verify_subscription$",
+    ))
 
     logger.info("Bot is starting...")
     app.run_polling()
