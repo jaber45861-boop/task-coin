@@ -1,7 +1,7 @@
 import os
 import random
 import logging
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
@@ -68,7 +68,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     user_id = update.effective_user.id
-    missing: list[str] = []
+    missing: list[Channel] = []
 
     for ch in required:
         try:
@@ -78,10 +78,10 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "administrator",
                 "creator",
             ):
-                missing.append(ch.title)
+                missing.append(ch)
         except TelegramError:
             # Cannot verify this channel — treat as missing
-            missing.append(ch.title)
+            missing.append(ch)
 
     context.user_data.pop("anti_bot_answer", None)
 
@@ -91,12 +91,20 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "✅ أنت مشترك في جميع القنوات المطلوبة."
         )
     else:
-        names = "\n".join(f"  • {name}" for name in missing)
+        buttons = [
+            [InlineKeyboardButton(
+                text=f"📢 {ch.title}",
+                url=f"https://t.me/{ch.username}",
+            )]
+            for ch in missing
+        ]
+        names = "\n".join(f"  • {ch.title}" for ch in missing)
         await update.message.reply_text(
             "✅ تحقق ناجح! أنت لست بوت.\n\n"
             "⚠️ أنت غير مشترك في القنوات التالية:\n"
             f"{names}\n\n"
-            "اشترك فيها ثم أعد المحاولة."  
+            "اضغط الزر للاشتراك ثم أعد المحاولة:",
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
     return ConversationHandler.END
