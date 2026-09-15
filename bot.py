@@ -11,7 +11,7 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
-from config import ADMINS, CHANNELS, Channel, is_admin
+from config import ADMINS, CHANNELS, Channel, is_admin, get_required_channels
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -42,7 +42,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Check the user's answer and stop the flow."""
+    """Check the user's answer, then verify channel subscriptions."""
     expected = context.user_data.get("anti_bot_answer")
     text = update.message.text.strip()
 
@@ -52,19 +52,53 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text(
             "❌ إجابة غير صحيحة. حاول مرة أخرى."
         )
+        context.user_data.pop("anti_bot_answer", None)
         return ConversationHandler.END
 
-    if user_answer == expected:
+    if user_answer != expected:
+        await update.message.reply_text("❌ إجابة غير صحيحة.")
+        context.user_data.pop("anti_bot_answer", None)
+        return ConversationHandler.END
+
+    # ── Anti-bot passed — check channel subscriptions ───────────────
+    required = get_required_channels()
+    if not required:
+        await update.message.reply_text("✅ تحقق ناجح! أنت لست بوت.")
+        context.user_data.pop("anti_bot_answer", None)
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    missing: list[str] = []
+
+    for ch in required:
+        try:
+            member = await context.bot.get_chat_member(ch.channel_id, user_id)
+            if member.status not in (
+                "member",
+                "administrator",
+                "creator",
+            ):
+                missing.append(ch.title)
+        except TelegramError:
+            # Cannot verify this channel — treat as missing
+            missing.append(ch.title)
+
+    context.user_data.pop("anti_bot_answer", None)
+
+    if not missing:
         await update.message.reply_text(
-            "✅ تحقق ناجح! أنت لست بوت.\n\n(تم إيقاف التدفق هنا)"
+            "✅ تحقق ناجح! أنت لست بوت.\n"
+            "✅ أنت مشترك في جميع القنوات المطلوبة."
         )
     else:
+        names = "\n".join(f"  • {name}" for name in missing)
         await update.message.reply_text(
-            "❌ إجابة غير صحيحة.\n\n(تم إيقاف التدفق هنا)"
+            "✅ تحقق ناجح! أنت لست بوت.\n\n"
+            "⚠️ أنت غير مشترك في القنوات التالية:\n"
+            f"{names}\n\n"
+            "اشترك فيها ثم أعد المحاولة."  
         )
 
-    # Stop the flow here — no further steps
-    context.user_data.pop("anti_bot_answer", None)
     return ConversationHandler.END
 
 
