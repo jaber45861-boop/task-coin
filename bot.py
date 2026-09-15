@@ -1,6 +1,7 @@
 import os
 import random
 import logging
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -13,6 +14,8 @@ from telegram.ext import (
     filters,
 )
 from config import ADMINS, CHANNELS, Channel, is_admin, get_required_channels
+
+load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
