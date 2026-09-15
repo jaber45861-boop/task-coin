@@ -152,6 +152,34 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.info("Channel added: %s (id=%d) by admin %d", slug, channel_id, user_id)
 
 
+# ── Admin: List Channels ─────────────────────────────────────────────
+
+async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all mandatory subscription channels. Admin only."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    if not CHANNELS:
+        await update.message.reply_text("📭 لا توجد قنوات اشتراك إجباري حالياً.")
+        return
+
+    lines = ["📋 *قنوات الاشتراك الإجباري:*\n"]
+    for ch in CHANNELS.values():
+        required_text = "نعم" if ch.required else "لا"
+        lines.append(
+            f"📌 *{ch.title}*\n"
+            f"   slug: `{ch.slug}`\n"
+            f"   ID: `{ch.channel_id}`\n"
+            f"   username: @{ch.username}\n"
+            f"   required: {required_text}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    logger.info("Channels listed by admin %d", user_id)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -171,6 +199,7 @@ def main() -> None:
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("addchannel", add_channel))
+    app.add_handler(CommandHandler("listchannels", list_channels))
 
     logger.info("Bot is starting...")
     app.run_polling()
