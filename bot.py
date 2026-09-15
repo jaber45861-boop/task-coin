@@ -180,6 +180,48 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("Channels listed by admin %d", user_id)
 
 
+# ── Admin: Remove Channel ────────────────────────────────────────────
+
+async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a mandatory subscription channel by slug. Admin only.
+
+    Usage: /removechannel slug
+    Example: /removechannel main
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    slug = update.message.text.replace("/removechannel", "", 1).strip()
+
+    if not slug:
+        await update.message.reply_text(
+            "❌ صيغة خاطئة. استخدم:\n"
+            "/removechannel slug\n\n"
+            "مثال:\n"
+            "/removechannel main"
+        )
+        return
+
+    if slug not in CHANNELS:
+        await update.message.reply_text(
+            f"❌ القناة بالـslug '{slug}' غير موجودة."
+        )
+        return
+
+    removed = CHANNELS.pop(slug)
+
+    await update.message.reply_text(
+        "✅ تم حذف القناة:\n\n"
+        f"📌 Slug: {removed.slug}\n"
+        f"🆔 ID: {removed.channel_id}\n"
+        f"📛 Username: @{removed.username}\n"
+        f"📝 Title: {removed.title}"
+    )
+    logger.info("Channel removed: %s (id=%d) by admin %d", slug, removed.channel_id, user_id)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -200,6 +242,7 @@ def main() -> None:
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("addchannel", add_channel))
     app.add_handler(CommandHandler("listchannels", list_channels))
+    app.add_handler(CommandHandler("removechannel", remove_channel))
 
     logger.info("Bot is starting...")
     app.run_polling()
