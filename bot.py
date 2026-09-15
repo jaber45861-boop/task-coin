@@ -2,6 +2,7 @@ import os
 import random
 import logging
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -130,6 +131,40 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"(slug: {existing.slug})."
             )
             return
+
+    # ── Validate channel access via Telegram Bot API ────────────────
+    try:
+        chat = await context.bot.get_chat(channel_id)
+    except TelegramError as exc:
+        await update.message.reply_text(
+            "❌ تعذر الوصول للقناة. تأكد من:\n"
+            "• المعرف صحيح (يبدأ بـ -100 للقنوات العامة)\n"
+            "• البوت مضاف للقناة\n\n"
+            f"تفاصيل الخطأ: {exc}"
+        )
+        return
+
+    # Verify the bot can read membership info (must be admin in channel)
+    try:
+        bot_member = await context.bot.get_chat_member(
+            channel_id, context.bot.id
+        )
+    except TelegramError as exc:
+        await update.message.reply_text(
+            "❌ تعذر التحقق من عضوية البوت في القناة.\n"
+            "تأكد أن البوت مشرف (admin) في القناة\n"
+            "ليتمكن من فحص اشتراك المستخدمين لاحقًا.\n\n"
+            f"تفاصيل الخطأ: {exc}"
+        )
+        return
+
+    if bot_member.status not in ("administrator", "creator"):
+        await update.message.reply_text(
+            f"❌ البوت ليس مشرفًا في القناة (حالته: {bot_member.status})\n"
+            "يجب أن يكون البوت *مشرفًا* (admin) في القناة\n"
+            "ليتمكن من فحص اشتراك المستخدمين لاحقًا."
+        )
+        return
 
     # Add the channel
     new_channel = Channel(
