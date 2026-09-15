@@ -1,7 +1,15 @@
 import os
+import random
 import logging
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -9,9 +17,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+ANTI_BOT = 0
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("مرحبًا! أنا TaskCoin Bot 🪙\nأرسل /start للبدء.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send a simple math question as anti-bot step."""
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    op = random.choice(["+", "-"])
+
+    # For subtraction, ensure non-negative result
+    if op == "-" and a < b:
+        a, b = b, a
+
+    correct = a + b if op == "+" else a - b
+    context.user_data["anti_bot_answer"] = correct
+
+    await update.message.reply_text(
+        f"🔒 للتحقق أنك لست بوت:\n\nما ناتج: {a} {op} {b}؟"
+    )
+    return ANTI_BOT
+
+
+async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Check the user's answer and stop the flow."""
+    expected = context.user_data.get("anti_bot_answer")
+    text = update.message.text.strip()
+
+    try:
+        user_answer = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ إجابة غير صحيحة. حاول مرة أخرى."
+        )
+        return ConversationHandler.END
+
+    if user_answer == expected:
+        await update.message.reply_text(
+            "✅ تحقق ناجح! أنت لست بوت.\n\n(تم إيقاف التدفق هنا)"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ إجابة غير صحيحة.\n\n(تم إيقاف التدفق هنا)"
+        )
+
+    # Stop the flow here — no further steps
+    context.user_data.pop("anti_bot_answer", None)
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the anti-bot check."""
+    context.user_data.pop("anti_bot_answer", None)
+    await update.message.reply_text("تم الإلغاء.")
+    return ConversationHandler.END
 
 
 def main() -> None:
@@ -20,7 +79,18 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
 
     app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ANTI_BOT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(conv_handler)
 
     logger.info("Bot is starting...")
     app.run_polling()
