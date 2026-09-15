@@ -20,7 +20,7 @@ from typing import Dict
 # List of Telegram user IDs that have admin privileges.
 # Add more IDs as needed; the bot checks `user_id in ADMINS`.
 ADMINS: list[int] = [
-    # Example: 123456789,
+    6175354851,
 ]
 
 
