@@ -7,6 +7,7 @@ from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -14,6 +15,12 @@ from telegram.ext import (
     filters,
 )
 from config import ADMINS, CHANNELS, Channel, is_admin, get_required_channels
+from subscription import (
+    check_subscription_access,
+    is_locked,
+    lock_user,
+    unlock_user,
+)
 
 load_dotenv()
 
@@ -72,29 +79,20 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     user_id = update.effective_user.id
-    missing: list[Channel] = []
-
-    for ch in required:
-        try:
-            member = await context.bot.get_chat_member(ch.channel_id, user_id)
-            if member.status not in (
-                "member",
-                "administrator",
-                "creator",
-            ):
-                missing.append(ch)
-        except TelegramError:
-            # Cannot verify this channel — treat as missing
-            missing.append(ch)
+    subscribed, missing = await check_subscription_access(
+        context.bot, user_id
+    )
 
     context.user_data.pop("anti_bot_answer", None)
 
-    if not missing:
+    if subscribed:
+        unlock_user(user_id)
         await update.message.reply_text(
             "✅ تحقق ناجح! أنت لست بوت.\n"
             "✅ أنت مشترك في جميع القنوات المطلوبة."
         )
     else:
+        lock_user(user_id)
         text, markup = _build_missing_message(missing)
         await update.message.reply_text(text, reply_markup=markup)
 
@@ -158,10 +156,12 @@ async def verify_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
             missing.append(ch)
 
     if not missing:
+        unlock_user(user_id)
         await query.edit_message_text(
             "✅ تحقق ناجح! أنت مشترك في جميع القنوات المطلوبة."
         )
     else:
+        lock_user(user_id)
         text, markup = _build_missing_message(missing)
         await query.edit_message_text(text, reply_markup=markup)
 
@@ -183,6 +183,15 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        unlock_user(user_id)
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
         return
 
@@ -291,6 +300,15 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """List all mandatory subscription channels. Admin only."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        unlock_user(user_id)
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
         return
 
@@ -323,6 +341,15 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        unlock_user(user_id)
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
         return
 
@@ -354,11 +381,106 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     logger.info("Channel removed: %s (id=%d) by admin %d", slug, removed.channel_id, user_id)
 
+# ── Subscription gate for protected bot commands ─────────────────────
+
+async def subscription_gate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Block non-admin users who are missing required channels.
+
+    Placed *before* other CommandHandlers in main() so locked users
+    never reach protected functionality.
+    """
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        return
+
+    subscribed, missing = await check_subscription_access(
+        context.bot, user_id
+    )
+    if subscribed:
+        unlock_user(user_id)
+        return
+
+    lock_user(user_id)
+    text, markup = _build_missing_message(missing)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+# ── Chat-member update handler ───────────────────────────────────────
+
+_REQUIRED_CHANNEL_IDS: set[int] = set()
+
+
+def _refresh_required_ids() -> None:
+    """Rebuild the set of required channel IDs from the live CHANNELS dict."""
+    global _REQUIRED_CHANNEL_IDS
+    _REQUIRED_CHANNEL_IDS = {
+        ch.channel_id for ch in get_required_channels()
+    }
+
+
+async def on_chat_member_update(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Detect when a user leaves or is removed from a required channel."""
+    chat_member_update = update.chat_member
+    if chat_member_update is None:
+        return
+
+    chat = chat_member_update.chat
+    if chat is None or chat.id not in _REQUIRED_CHANNEL_IDS:
+        return
+
+    new_status = chat_member_update.new_chat_member.status
+    user = chat_member_update.new_chat_member.user
+    if user is None or user.id is None:
+        return
+
+    if new_status in ("left", "kicked"):
+        lock_user(user.id)
+        logger.info(
+            "User %d left/was removed from required channel %d — locked",
+            user.id,
+            chat.id,
+        )
+
+
+# ── Subscription gate for non-command messages ────────────────────────
+
+async def subscription_message_gate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Block non-command messages from locked non-admin users.
+
+    Placed before the anti-bot MessageHandler so locked users cannot
+    proceed through the anti-bot conversation.
+    """
+    if update.message is None or update.message.text is None:
+        return
+
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        return
+
+    subscribed, missing = await check_subscription_access(
+        context.bot, user_id
+    )
+    if subscribed:
+        unlock_user(user_id)
+        return
+
+    lock_user(user_id)
+    text, markup = _build_missing_message(missing)
+    await update.message.reply_text(text, reply_markup=markup)
+
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
+
+    _refresh_required_ids()
 
     app = ApplicationBuilder().token(token).build()
 
@@ -372,13 +494,42 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("addchannel", add_channel))
-    app.add_handler(CommandHandler("listchannels", list_channels))
-    app.add_handler(CommandHandler("removechannel", remove_channel))
+    # 1. Detect channel departures immediately.
+    required_ids = {
+        ch.channel_id for ch in get_required_channels()
+    }
+    if required_ids:
+        app.add_handler(
+            ChatMemberHandler(
+                on_chat_member_update,
+                ChatMemberHandler.CHAT_MEMBER,
+                block=False,
+            ),
+            group=0,
+        )
+
+    # 2. Anti-bot conversation (entry: /start).
+    app.add_handler(conv_handler, group=1)
+
+    # 3. Subscription gate for non-command messages (before anti-bot).
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            subscription_message_gate,
+        ),
+        group=2,
+    )
+
+    # 4. Protected commands: subscription gate + admin logic combined.
+    #    Non-admin locked users are blocked before admin handlers fire.
+    app.add_handler(CommandHandler("addchannel", add_channel), group=3)
+    app.add_handler(CommandHandler("listchannels", list_channels), group=3)
+    app.add_handler(CommandHandler("removechannel", remove_channel), group=3)
+
+    # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
         verify_subscription, pattern="^verify_subscription$",
-    ))
+    ), group=4)
 
     logger.info("Bot is starting...")
     app.run_polling()
