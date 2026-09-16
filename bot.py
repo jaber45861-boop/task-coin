@@ -496,15 +496,11 @@ async def subscription_message_gate(
 ) -> None:
     """Block non-command messages from locked non-admin users.
 
-    Placed before the anti-bot MessageHandler so locked users cannot
-    proceed through the anti-bot conversation.
+    Registered in the same handler group as the ConversationHandler
+    (group=1), so the ConversationHandler consumes anti-bot answer
+    messages before this gate ever sees them.
     """
     if update.message is None or update.message.text is None:
-        return
-
-    # Skip during the anti-bot conversation — check_answer handles
-    # the subscription check itself, avoiding duplicate messages.
-    if context.user_data.get("anti_bot_answer") is not None:
         return
 
     user_id = update.effective_user.id
@@ -559,13 +555,16 @@ def main() -> None:
     # 2. Anti-bot conversation (entry: /start).
     app.add_handler(conv_handler, group=1)
 
-    # 3. Subscription gate for non-command messages (before anti-bot).
+    # 3. Subscription gate for non-command messages.
+    #    Same group as the ConversationHandler so only one fires per
+    #    update: when the ConversationHandler matches (ANTI_BOT state)
+    #    it consumes the update and the gate never fires for it.
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             subscription_message_gate,
         ),
-        group=2,
+        group=1,
     )
 
     # 4. Protected commands: subscription gate + admin logic combined.

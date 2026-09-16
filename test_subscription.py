@@ -951,24 +951,40 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("إجابة غير صحيحة", reply_text)
 
-    async def test_subscription_gate_skips_during_anti_bot(self) -> None:
-        """subscription_message_gate must not fire while the user is
-        inside the anti-bot conversation, preventing duplicate messages."""
+    async def test_correct_answer_produces_exactly_one_reply(self) -> None:
+        """Regression: a correct Anti-Bot answer with missing channels
+        must produce EXACTLY ONE reply_text call (no duplicate messages)."""
         _setup_channels([_CHANNEL_A])
-        from bot import subscription_message_gate
+        from bot import check_answer
 
         update = _make_update(user_id=999, text="42")
         bot = MagicMock()
         bot.get_chat_member = AsyncMock(return_value=_make_chat_member("left"))
         ctx = _make_context(bot)
-        # User is in anti-bot conversation (answer stored)
         ctx.user_data["anti_bot_answer"] = 42
+
+        await check_answer(update, ctx)
+
+        # Exactly ONE reply — no duplicates
+        self.assertEqual(update.message.reply_text.call_count, 1)
+
+    async def test_normal_text_outside_anti_bot_goes_through_gate(self) -> None:
+        """Normal text messages (no active conversation) must still
+        be processed by subscription_message_gate."""
+        _setup_channels([_CHANNEL_A])
+        from bot import subscription_message_gate
+
+        update = _make_update(user_id=999, text="hello")
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(return_value=_make_chat_member("left"))
+        ctx = _make_context(bot)
+        # No anti_bot_answer — user is NOT in a conversation
 
         await subscription_message_gate(update, ctx)
 
-        # Gate must NOT have sent anything
-        update.message.reply_text.assert_not_called()
-        bot.get_chat_member.assert_not_called()
+        # Gate should have checked subscription and sent a message
+        bot.get_chat_member.assert_called_once()
+        update.message.reply_text.assert_called_once()
 
 
 if __name__ == "__main__":
