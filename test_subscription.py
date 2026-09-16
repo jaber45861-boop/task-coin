@@ -812,6 +812,7 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         CHANNELS.clear()
 
     async def test_start_all_subscribed_shows_success(self) -> None:
+        """Correct answer + all channels subscribed → success message."""
         _setup_channels([_CHANNEL_A])
         from bot import check_answer
 
@@ -828,8 +829,11 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         # Should show success
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("مشترك في جميع القنوات", reply_text)
+        # User should be unlocked
+        self.assertFalse(is_locked(999))
 
     async def test_start_missing_channel_shows_lock(self) -> None:
+        """Correct answer + missing channel → lock + missing message."""
         _setup_channels([_CHANNEL_A, _CHANNEL_B])
         from bot import check_answer
 
@@ -853,6 +857,7 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_locked(999))
 
     async def test_start_no_channels_shows_success(self) -> None:
+        """Correct answer + no required channels → success behavior."""
         CHANNELS.clear()
         from bot import check_answer
 
@@ -865,6 +870,86 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, -1)
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("تحقق ناجح", reply_text)
+
+    async def test_start_triggers_subscription_check(self) -> None:
+        """Prove that a correct Anti-Bot answer immediately triggers
+        the required-channel check (get_chat_member is called)."""
+        _setup_channels([_CHANNEL_A])
+        from bot import check_answer
+
+        update = _make_update(user_id=999, text="10")
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(return_value=_make_chat_member("member"))
+        ctx = _make_context(bot)
+        ctx.user_data["anti_bot_answer"] = 10
+
+        await check_answer(update, ctx)
+
+        # get_chat_member MUST have been called → subscription was checked
+        bot.get_chat_member.assert_called_once()
+        call_args = bot.get_chat_member.call_args
+        self.assertEqual(call_args[0][0], _CHANNEL_A.channel_id)
+        self.assertEqual(call_args[0][1], 999)
+
+    async def test_start_missing_channel_shows_buttons(self) -> None:
+        """Correct answer + missing channel → InlineKeyboardMarkup
+        with channel links and verify button appear immediately."""
+        _setup_channels([_CHANNEL_A, _CHANNEL_B])
+        from bot import check_answer
+        from telegram import InlineKeyboardMarkup
+
+        async def fake_get_chat_member(channel_id: int, user_id: int):
+            if channel_id == _CHANNEL_A.channel_id:
+                return _make_chat_member("member")
+            return _make_chat_member("left")
+
+        update = _make_update(user_id=999, text="42")
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(side_effect=fake_get_chat_member)
+        ctx = _make_context(bot)
+        ctx.user_data["anti_bot_answer"] = 42
+
+        await check_answer(update, ctx)
+
+        # reply_text was called with text + reply_markup
+        call_kwargs = update.message.reply_text.call_args
+        markup = call_kwargs[1].get("reply_markup") or (
+            call_kwargs[0][1] if len(call_kwargs[0]) > 1 else None
+        )
+        self.assertIsInstance(markup, InlineKeyboardMarkup)
+
+        # Flatten all buttons
+        flat_buttons = [btn for row in markup.inline_keyboard for btn in row]
+        # Should have one button per missing channel + one verify button
+        self.assertEqual(len(flat_buttons), 2)  # 1 missing channel + 1 verify
+
+        # Channel button URL should link to the missing channel
+        channel_btn = flat_buttons[0]
+        self.assertIn(_CHANNEL_B.username, channel_btn.url)
+
+        # Verify button should have correct callback_data
+        verify_btn = flat_buttons[1]
+        self.assertEqual(verify_btn.callback_data, "verify_subscription")
+        self.assertIn("تحقق", verify_btn.text)
+
+    async def test_start_wrong_answer_no_subscription_check(self) -> None:
+        """Wrong answer → no subscription check, conversation ends."""
+        _setup_channels([_CHANNEL_A])
+        from bot import check_answer
+
+        update = _make_update(user_id=999, text="999")
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock()
+        ctx = _make_context(bot)
+        ctx.user_data["anti_bot_answer"] = 42
+
+        result = await check_answer(update, ctx)
+
+        self.assertEqual(result, -1)
+        # get_chat_member should NOT have been called
+        bot.get_chat_member.assert_not_called()
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("إجابة غير صحيحة", reply_text)
 
 
 if __name__ == "__main__":
