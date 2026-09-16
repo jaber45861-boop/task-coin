@@ -46,6 +46,10 @@ ANTI_BOT = 0
 ADDCHANNEL_USERNAME = 20
 ADDCHANNEL_TITLE = 21
 
+# States for the interactive /removechannel conversation
+REMOVECHANNEL_SELECT = 30
+REMOVECHANNEL_CONFIRM = 31
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Send a simple math question as anti-bot step."""
@@ -607,6 +611,176 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     logger.info("Channel removed: %s (id=%d) by admin %d", slug, removed.channel_id, user_id)
 
+
+# NOTE: The legacy remove_channel handler is retained for backward-compatible
+# unit tests.  The interactive /removechannel ConversationHandler below
+# replaces it in the running bot.
+
+
+async def removechannel_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Entry point for /removechannel.  Handles both direct and interactive.
+
+    /removechannel <slug>  → direct deletion (legacy behaviour).
+    /removechannel         → interactive inline-button workflow.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return ConversationHandler.END
+        unlock_user(user_id)
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    slug = update.message.text.replace("/removechannel", "", 1).strip()
+
+    # ── Direct deletion (legacy path) ───────────────────────────────
+    if slug:
+        if slug not in CHANNELS:
+            await update.message.reply_text(
+                f"❌ القناة بالـslug '{slug}' غير موجودة."
+            )
+            return ConversationHandler.END
+
+        removed = CHANNELS.pop(slug)
+        db.delete_channel(slug)
+
+        await update.message.reply_text(
+            "✅ تم حذف القناة:\n\n"
+            f"📌 Slug: {removed.slug}\n"
+            f"🆔 ID: {removed.channel_id}\n"
+            f"📛 Username: @{removed.username}\n"
+            f"📝 Title: {removed.title}"
+        )
+        logger.info(
+            "Channel removed: %s (id=%d) by admin %d",
+            slug, removed.channel_id, user_id,
+        )
+        return ConversationHandler.END
+
+    # ── Interactive flow ─────────────────────────────────────────────
+    if not CHANNELS:
+        await update.message.reply_text("لا توجد قنوات إجبارية للحذف.")
+        return ConversationHandler.END
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"📢 {ch.title} (@{ch.username})",
+                callback_data=f"rmch:{ch.slug}",
+            )
+        ]
+        for ch in CHANNELS.values()
+    ]
+
+    await update.message.reply_text(
+        "🔄 اختر القناة المراد حذفها:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return REMOVECHANNEL_SELECT
+
+
+async def removechannel_select(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle channel-selection callback → show confirmation."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⛔ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    slug = query.data.split(":", 1)[1]
+
+    if slug not in CHANNELS:
+        await query.edit_message_text(
+            "❌ القناة لم تعد متاحة. ربما تم حذفها بالفعل."
+        )
+        return ConversationHandler.END
+
+    ch = CHANNELS[slug]
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "✅ تأكيد الحذف", callback_data=f"rmch_yes:{slug}"
+            ),
+            InlineKeyboardButton(
+                "❌ إلغاء", callback_data="rmch_no"
+            ),
+        ]
+    ]
+    await query.edit_message_text(
+        f"⚠️ أنت على وشك حذف القناة:\n\n"
+        f"📌 {ch.title}\n"
+        f"📛 @{ch.username}\n"
+        f"🆔 {ch.channel_id}\n\n"
+        "هل أنت متأكد؟",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return REMOVECHANNEL_CONFIRM
+
+
+async def removechannel_confirm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle confirmation callback → delete the channel."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⛔ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    slug = query.data.split(":", 1)[1]
+
+    if slug not in CHANNELS:
+        await query.edit_message_text(
+            "❌ القناة لم تعد متاحة. ربما تم حذفها بالفعل."
+        )
+        return ConversationHandler.END
+
+    removed = CHANNELS.pop(slug)
+    db.delete_channel(slug)
+
+    await query.edit_message_text(
+        "✅ تم حذف القناة بنجاح:\n\n"
+        f"📌 {removed.title}\n"
+        f"📛 @{removed.username}\n"
+        f"🆔 {removed.channel_id}"
+    )
+    logger.info(
+        "Channel removed: %s (id=%d) via interactive flow",
+        slug, removed.channel_id,
+    )
+    return ConversationHandler.END
+
+
+async def removechannel_cancel_cb(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle cancel callback."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ تم الإلغاء. لم يتم حذف أي قناة.")
+    return ConversationHandler.END
+
+
+async def removechannel_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle /cancel during the /removechannel conversation."""
+    await update.message.reply_text("تم الإلغاء.")
+    return ConversationHandler.END
+
+
 # ── Subscription gate for protected bot commands ─────────────────────
 
 async def subscription_gate(
@@ -813,9 +987,29 @@ def main() -> None:
     )
     app.add_handler(addchannel_conv, group=2)
 
-    # 5. Other protected commands: list and remove channels.
+    # 5. Interactive /removechannel conversation (group 3).
+    #    Legacy /removechannel <slug> is handled inside removechannel_start.
+    removechannel_conv = ConversationHandler(
+        entry_points=[CommandHandler("removechannel", removechannel_start)],
+        states={
+            REMOVECHANNEL_SELECT: [
+                CallbackQueryHandler(
+                    removechannel_select, pattern=r"^rmch:"
+                ),
+            ],
+            REMOVECHANNEL_CONFIRM: [
+                CallbackQueryHandler(
+                    removechannel_confirm, pattern=r"^rmch_yes:"
+                ),
+                CallbackQueryHandler(
+                    removechannel_cancel_cb, pattern=r"^rmch_no$"
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", removechannel_cancel)],
+    )
+    app.add_handler(removechannel_conv, group=3)
     app.add_handler(CommandHandler("listchannels", list_channels), group=3)
-    app.add_handler(CommandHandler("removechannel", remove_channel), group=3)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
