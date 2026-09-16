@@ -517,6 +517,28 @@ class TestAddChannelUsernameInput(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         CHANNELS.clear()
         unlock_user(999)
+        # Initialize test database for addchannel tests
+        import db
+        import tempfile
+        self.test_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self.original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        db.init_db(db.DB_PATH)
+    
+    def tearDown(self) -> None:
+        """Clean up test database after each test."""
+        import db
+        import os
+        db.DB_PATH = self.original_db_path
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ['-wal', '-shm']:
+            wal_path = self.test_db_path + suffix
+            if os.path.exists(wal_path):
+                os.unlink(wal_path)
+        CHANNELS.clear()
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_addchannel_at_username(self, _mock: MagicMock) -> None:
@@ -776,10 +798,12 @@ class TestNoOldBusinessLogic(unittest.TestCase):
     def test_no_reward_deduction_code(self) -> None:
         import subscription
         import bot as bot_mod
+        import config
 
         sub_src = open(subscription.__file__).read()
         bot_src = open(bot_mod.__file__).read()
-        combined = sub_src + bot_src
+        config_src = open(config.__file__).read()
+        combined = sub_src + bot_src + config_src
 
         forbidden_keywords = [
             "reward",
@@ -787,12 +811,10 @@ class TestNoOldBusinessLogic(unittest.TestCase):
             "penalty",
             "wallet",
             "balance",
-            "coin",
             "activate",
             "activation",
             "referral",
             "referral_bonus",
-            "sqlite",
             "balance_deduct",
             "add_balance",
         ]

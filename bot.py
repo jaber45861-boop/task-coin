@@ -22,6 +22,7 @@ from subscription import (
     lock_user,
     unlock_user,
 )
+import db
 
 load_dotenv()
 
@@ -325,6 +326,7 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         required=True,
     )
     CHANNELS[slug] = new_channel
+    db.save_channel(new_channel)
 
     await update.message.reply_text(
         "✅ تمت إضافة القناة:\n\n"
@@ -414,6 +416,7 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     removed = CHANNELS.pop(slug)
+    db.delete_channel(slug)
 
     await update.message.reply_text(
         "✅ تم حذف القناة:\n\n"
@@ -524,6 +527,9 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
 
+    # Initialize SQLite database and load persisted channels
+    db.init_db()
+    db.load_channels()
     _refresh_required_ids()
 
     app = ApplicationBuilder().token(token).build()

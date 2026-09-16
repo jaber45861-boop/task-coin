@@ -16,6 +16,11 @@ build/
 .env.local
 .env.production
 
+# Database
+task_coin.db
+task_coin.db-wal
+task_coin.db-shm
+
 # IDE
 .vscode/
 .idea/
