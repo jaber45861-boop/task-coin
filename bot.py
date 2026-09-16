@@ -3,9 +3,17 @@ import random
 import re
 import logging
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     ChatMemberHandler,
@@ -522,6 +530,42 @@ async def subscription_message_gate(
     await update.message.reply_text(text, reply_markup=markup)
 
 
+ADMIN_COMMANDS = [
+    BotCommand("addchannel", "إضافة قناة"),
+    BotCommand("editchannel", "تعديل قناة"),
+    BotCommand("removechannel", "حذف قناة"),
+]
+
+
+async def setup_admin_command_menu(
+    application: Application,
+) -> None:
+    """Push the admin-only command menu to Telegram.
+
+    Sets the BotCommandMenu (the popup shown via the "/" button) so that:
+    • Each admin sees /addchannel, /editchannel, /removechannel.
+    • Normal (non-admin) users see *none* of these management commands.
+
+    The existing direct-text commands (/addchannel, /removechannel, /listchannels)
+    keep working for everyone; only the *menu* is admin-scoped.
+    """
+    bot = application.bot
+
+    # Default scope: clear the admin commands so normal users never see them.
+    await bot.set_my_commands(
+        commands=[],
+        scope=BotCommandScopeDefault(),
+    )
+
+    # Per-admin scope: give each admin the channel-management menu.
+    for admin_id in ADMINS:
+        await bot.set_my_commands(
+            commands=ADMIN_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
+        logger.info("Set admin command menu for user %d", admin_id)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -533,6 +577,9 @@ def main() -> None:
     _refresh_required_ids()
 
     app = ApplicationBuilder().token(token).build()
+
+    # Register the post-init callback to push admin command menus.
+    app.post_init = setup_admin_command_menu
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
