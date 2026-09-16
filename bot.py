@@ -534,6 +534,7 @@ ADMIN_COMMANDS = [
     BotCommand("addchannel", "إضافة قناة"),
     BotCommand("editchannel", "تعديل قناة"),
     BotCommand("removechannel", "حذف قناة"),
+    BotCommand("listchannels", "📋 عرض القنوات"),
 ]
 
 
@@ -543,7 +544,7 @@ async def setup_admin_command_menu(
     """Push the admin-only command menu to Telegram.
 
     Sets the BotCommandMenu (the popup shown via the "/" button) so that:
-    • Each admin sees /addchannel, /editchannel, /removechannel.
+    • Each admin sees /addchannel, /editchannel, /removechannel, /listchannels.
     • Normal (non-admin) users see *none* of these management commands.
 
     The existing direct-text commands (/addchannel, /removechannel, /listchannels)

@@ -23,13 +23,14 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
     """Tests that the admin command menu is configured correctly."""
 
     def test_admin_commands_constant(self) -> None:
-        """ADMIN_COMMANDS should contain exactly the three management commands."""
-        self.assertEqual(len(ADMIN_COMMANDS), 3)
+        """ADMIN_COMMANDS should contain exactly the four management commands."""
+        self.assertEqual(len(ADMIN_COMMANDS), 4)
 
         command_names = [cmd.command for cmd in ADMIN_COMMANDS]
         self.assertIn("addchannel", command_names)
         self.assertIn("editchannel", command_names)
         self.assertIn("removechannel", command_names)
+        self.assertIn("listchannels", command_names)
 
     def test_admin_commands_have_arabic_descriptions(self) -> None:
         """Each admin command should have an Arabic description."""
@@ -48,6 +49,7 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cmd_map["addchannel"], "إضافة قناة")
         self.assertEqual(cmd_map["editchannel"], "تعديل قناة")
         self.assertEqual(cmd_map["removechannel"], "حذف قناة")
+        self.assertEqual(cmd_map["listchannels"], "📋 عرض القنوات")
 
     async def test_setup_sets_admin_scope_for_each_admin(self) -> None:
         """setup_admin_command_menu should call set_my_commands for every admin."""
@@ -87,11 +89,12 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
                     found = True
                     # Verify the commands passed are ADMIN_COMMANDS
                     cmds = kwargs["commands"]
-                    self.assertEqual(len(cmds), 3)
+                    self.assertEqual(len(cmds), 4)
                     names = [c.command for c in cmds]
                     self.assertIn("addchannel", names)
                     self.assertIn("editchannel", names)
                     self.assertIn("removechannel", names)
+                    self.assertIn("listchannels", names)
                     break
             self.assertTrue(
                 found,
@@ -111,10 +114,11 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
         cmds = first_call.kwargs.get("commands", first_call.args[0] if first_call.args else None)
         self.assertEqual(cmds, [])
 
-    async def test_admin_menu_does_not_contain_listchannels(self) -> None:
-        """The admin menu should NOT include /listchannels (it's direct-text only)."""
-        command_names = [cmd.command for cmd in ADMIN_COMMANDS]
-        self.assertNotIn("listchannels", command_names)
+    def test_admin_menu_exactly_four_commands(self) -> None:
+        """No extra commands beyond the four expected management commands."""
+        expected = {"addchannel", "editchannel", "removechannel", "listchannels"}
+        actual = {cmd.command for cmd in ADMIN_COMMANDS}
+        self.assertEqual(actual, expected)
 
 
 class TestCommandHandlersIntact(unittest.TestCase):
