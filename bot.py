@@ -502,6 +502,11 @@ async def subscription_message_gate(
     if update.message is None or update.message.text is None:
         return
 
+    # Skip during the anti-bot conversation — check_answer handles
+    # the subscription check itself, avoiding duplicate messages.
+    if context.user_data.get("anti_bot_answer") is not None:
+        return
+
     user_id = update.effective_user.id
     if is_admin(user_id):
         return

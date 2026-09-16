@@ -951,6 +951,25 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("إجابة غير صحيحة", reply_text)
 
+    async def test_subscription_gate_skips_during_anti_bot(self) -> None:
+        """subscription_message_gate must not fire while the user is
+        inside the anti-bot conversation, preventing duplicate messages."""
+        _setup_channels([_CHANNEL_A])
+        from bot import subscription_message_gate
+
+        update = _make_update(user_id=999, text="42")
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(return_value=_make_chat_member("left"))
+        ctx = _make_context(bot)
+        # User is in anti-bot conversation (answer stored)
+        ctx.user_data["anti_bot_answer"] = 42
+
+        await subscription_message_gate(update, ctx)
+
+        # Gate must NOT have sent anything
+        update.message.reply_text.assert_not_called()
+        bot.get_chat_member.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
