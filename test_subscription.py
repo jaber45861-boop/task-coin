@@ -450,7 +450,7 @@ class TestAdminBypass(unittest.IsolatedAsyncioTestCase):
         update.effective_user = MagicMock()
         update.effective_user.id = _TEST_ADMIN_ID
         update.message = MagicMock()
-        update.message.text = "/addchannel bad_format"
+        update.message.text = "/addchannel bad_format_only_one_part"
         update.message.reply_text = AsyncMock()
 
         bot = MagicMock()
@@ -509,6 +509,265 @@ class TestAdminBypass(unittest.IsolatedAsyncioTestCase):
         # Subscribed non-admin should get "admin only" message
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("للمشرفين فقط", reply_text)
+
+
+class TestAddChannelUsernameInput(unittest.IsolatedAsyncioTestCase):
+    """Tests for the new /addchannel username-based input format."""
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        unlock_user(999)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_at_username(self, _mock: MagicMock) -> None:
+        """slug|@channelusername|title resolves and stores correctly."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100999
+        mock_chat.type = "channel"
+
+        mock_bot_member = _make_chat_member("administrator")
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel main|@testchannel|Test Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        # Channel should be stored
+        self.assertIn("main", CHANNELS)
+        ch = CHANNELS["main"]
+        self.assertEqual(ch.channel_id, -100999)
+        self.assertEqual(ch.username, "testchannel")
+        self.assertEqual(ch.title, "Test Title")
+
+        # Success message
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("تمت إضافة القناة", reply_text)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_tme_link(self, _mock: MagicMock) -> None:
+        """slug|https://t.me/channelusername|title resolves correctly."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100888
+        mock_chat.type = "channel"
+
+        mock_bot_member = _make_chat_member("administrator")
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel mych|https://t.me/mychannel|My Channel"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        self.assertIn("mych", CHANNELS)
+        ch = CHANNELS["mych"]
+        self.assertEqual(ch.channel_id, -100888)
+        self.assertEqual(ch.username, "mychannel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_bare_username(self, _mock: MagicMock) -> None:
+        """slug|username|title (bare, no @) also works."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "channel"
+
+        mock_bot_member = _make_chat_member("administrator")
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel ch2|barechannel|Bare Channel"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        self.assertIn("ch2", CHANNELS)
+        self.assertEqual(CHANNELS["ch2"].username, "barechannel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_wrong_part_count(self, _mock: MagicMock) -> None:
+        """Wrong number of parts shows help text."""
+        from bot import add_channel
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel too|many|parts|here"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("صيغة خاطئة", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_invalid_username(self, _mock: MagicMock) -> None:
+        """Invalid channel reference shows error."""
+        from bot import add_channel
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel main|bad|Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("صيغة غير صحيحة", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_not_a_channel(self, _mock: MagicMock) -> None:
+        """Resolving a group instead of a channel shows error."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100555
+        mock_chat.type = "group"  # not a channel!
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel grp|@mygroup|Group Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("ليست قناة", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_bot_not_admin(self, _mock: MagicMock) -> None:
+        """Bot not being admin in the channel shows error."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100444
+        mock_chat.type = "channel"
+
+        mock_bot_member = _make_chat_member("member")  # not admin!
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel ch3|@notmychannel|Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("ليس مشرفًا", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_duplicate_channel_id(self, _mock: MagicMock) -> None:
+        """Same channel added twice via different slug is rejected."""
+        from bot import add_channel
+
+        # Pre-populate with a channel
+        _setup_channels([Channel(
+            slug="existing",
+            channel_id=-100999,
+            username="existing_ch",
+            title="Existing",
+            required=True,
+        )])
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100999  # same ID!
+        mock_chat.type = "channel"
+
+        mock_bot_member = _make_chat_member("administrator")
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel dup|@existing_ch|Duplicate"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("موجودة مسبقًا", reply_text)
+        self.assertEqual(len(CHANNELS), 1)  # still only the original
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_get_chat_error(self, _mock: MagicMock) -> None:
+        """Telegram API error during get_chat shows error."""
+        from bot import add_channel
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel ch4|@badchannel|Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(side_effect=TelegramError("Not found"))
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("تعذر الوصول", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
 
 
 class TestNoOldBusinessLogic(unittest.TestCase):

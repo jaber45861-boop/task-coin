@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import logging
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -173,13 +174,41 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Channel-reference normalizer ────────────────────────────────────
+
+# Matches @username, t.me/username, and bare username strings.
+_USERNAME_RE = re.compile(
+    r"^(?:https?://(?:www\.)?t\.me/)?@?([A-Za-z0-9_]{5,})$",
+)
+
+
+def _normalize_channel_ref(raw: str) -> str | None:
+    """Extract a clean Telegram username from various input formats.
+
+    Accepted inputs:
+        @channelusername
+        https://t.me/channelusername
+        http://t.me/channelusername
+        www.t.me/channelusername
+        t.me/channelusername
+        channelusername
+
+    Returns the bare username (without @) on success, or None.
+    """
+    m = _USERNAME_RE.match(raw.strip())
+    if m:
+        return m.group(1)
+    return None
+
+
 # ── Admin: Add Channel ───────────────────────────────────────────────
 
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Add a mandatory subscription channel. Admin only.
 
-    Usage: /addchannel slug|channel_id|username|title
-    Example: /addchannel main|-1001234567890|mychannel|My Channel
+    Usage: /addchannel slug|@username|title
+           /addchannel slug|https://t.me/username|title
+    The bot resolves the channel automatically via get_chat().
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -198,16 +227,18 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.replace("/addchannel", "", 1).strip()
     parts = [p.strip() for p in text.split("|")]
 
-    if len(parts) != 4:
+    if len(parts) != 3:
         await update.message.reply_text(
             "❌ صيغة خاطئة. استخدم:\n"
-            "/addchannel slug|channel_id|username|title\n\n"
+            "/addchannel slug|@username|title\n\n"
+            "أو:\n"
+            "/addchannel slug|https://t.me/username|title\n\n"
             "مثال:\n"
-            "/addchannel main|-1001234567890|mychannel|My Channel"
+            "/addchannel main|@mychannel|My Channel"
         )
         return
 
-    slug, channel_id_str, username, title = parts
+    slug, channel_ref, title = parts
 
     # Validate slug
     if not slug or not slug.isalnum() and "_" not in slug:
@@ -216,11 +247,13 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Validate channel_id
-    try:
-        channel_id = int(channel_id_str)
-    except ValueError:
-        await update.message.reply_text("❌ channel_id يجب أن يكون رقمًا.")
+    # Normalize channel reference
+    username = _normalize_channel_ref(channel_ref)
+    if not username:
+        await update.message.reply_text(
+            "❌ صيغة غير صحيحة لاسم القناة.\n"
+            "استخدم @username أو https://t.me/username"
+        )
         return
 
     # Prevent duplicate slug
@@ -230,28 +263,38 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Prevent duplicate channel_id
-    for existing in CHANNELS.values():
-        if existing.channel_id == channel_id:
-            await update.message.reply_text(
-                f"❌ القناة بالمعرف {channel_id} موجودة مسبقًا "
-                f"(slug: {existing.slug})."
-            )
-            return
-
-    # ── Validate channel access via Telegram Bot API ────────────────
+    # ── Resolve channel via Telegram Bot API ────────────────────────
     try:
-        chat = await context.bot.get_chat(channel_id)
+        chat = await context.bot.get_chat(f"@{username}")
     except TelegramError as exc:
         await update.message.reply_text(
             "❌ تعذر الوصول للقناة. تأكد من:\n"
-            "• المعرف صحيح (يبدأ بـ -100 للقنوات العامة)\n"
+            "• اسم القناة صحيح\n"
             "• البوت مضاف للقناة\n\n"
             f"تفاصيل الخطأ: {exc}"
         )
         return
 
-    # Verify the bot can read membership info (must be admin in channel)
+    # Verify it's a channel (not a group or private chat)
+    if chat.type not in ("channel",):
+        await update.message.reply_text(
+            f'❌ "{chat.type}" ليست قناة.\n'
+            "يجب أن يكون المعرف الخاص بقناة Telegram."
+        )
+        return
+
+    channel_id = chat.id
+
+    # Prevent duplicate channel_id
+    for existing in CHANNELS.values():
+        if existing.channel_id == channel_id:
+            await update.message.reply_text(
+                f"❌ القناة @{username} (ID: {channel_id}) موجودة مسبقًا "
+                f"(slug: {existing.slug})."
+            )
+            return
+
+    # Verify the bot is administrator in the channel
     try:
         bot_member = await context.bot.get_chat_member(
             channel_id, context.bot.id
