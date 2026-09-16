@@ -16,6 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from telegram.error import TelegramError
 
 from config import ADMINS, CHANNELS, Channel, is_admin
+
+# Explicit test-only admin ID — never depends on ADMINS being non-empty.
+_TEST_ADMIN_ID = 88888888
 from subscription import (
     check_subscription_access,
     is_locked,
@@ -176,7 +179,6 @@ class TestCheckSubscriptionAccess(unittest.IsolatedAsyncioTestCase):
 
     # Admin user gets same treatment (admin bypass is in handlers, not helper)
     async def test_admin_user_checked_normally_by_helper(self) -> None:
-        admin_id = ADMINS[0]
         _setup_channels([_CHANNEL_A])
 
         async def fake_get_chat_member(channel_id: int, user_id: int):
@@ -185,7 +187,7 @@ class TestCheckSubscriptionAccess(unittest.IsolatedAsyncioTestCase):
         bot = MagicMock()
         bot.get_chat_member = AsyncMock(side_effect=fake_get_chat_member)
 
-        ok, missing = await check_subscription_access(bot, admin_id)
+        ok, missing = await check_subscription_access(bot, _TEST_ADMIN_ID)
 
         # The helper does NOT bypass admins; handlers do that.
         self.assertFalse(ok)
@@ -440,13 +442,13 @@ class TestAdminBypass(unittest.IsolatedAsyncioTestCase):
         _setup_channels([_CHANNEL_A])
 
     # 8. Admin commands remain accessible to configured admins
-    async def test_admin_bypasses_subscription_check(self) -> None:
-        admin_id = ADMINS[0]
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_admin_bypasses_subscription_check(self, _mock_is_admin: MagicMock) -> None:
         from bot import add_channel
 
         update = MagicMock()
         update.effective_user = MagicMock()
-        update.effective_user.id = admin_id
+        update.effective_user.id = _TEST_ADMIN_ID
         update.message = MagicMock()
         update.message.text = "/addchannel bad_format"
         update.message.reply_text = AsyncMock()
