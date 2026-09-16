@@ -43,6 +43,7 @@ def _make_update(user_id: int = 999, text: str | None = None) -> MagicMock:
     update.effective_user.id = user_id
     update.message = MagicMock()
     update.message.reply_text = AsyncMock()
+    update.callback_query = None
     if text is not None:
         update.message.text = text
     else:
@@ -60,6 +61,7 @@ def _make_callback(
     update.callback_query.data = data
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
+    update.effective_user = update.callback_query.from_user
     return update
 
 

@@ -4,9 +4,6 @@ import re
 import logging
 from dotenv import load_dotenv
 from telegram import (
-    BotCommand,
-    BotCommandScopeChat,
-    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -372,6 +369,7 @@ async def addchannel_start(
     """Entry point for the interactive /addchannel workflow.
 
     Checks admin privileges, then prompts for the channel username/link.
+    Works for both /addchannel command and admin panel callback.
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -381,20 +379,37 @@ async def addchannel_start(
         if not subscribed:
             lock_user(user_id)
             text, markup = _build_missing_message(missing)
-            await update.message.reply_text(text, reply_markup=markup)
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(
+                    text, reply_markup=markup
+                )
+            else:
+                await update.message.reply_text(text, reply_markup=markup)
             return ConversationHandler.END
         unlock_user(user_id)
-        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "⛔ هذا الأمر للمشرفين فقط."
+            )
+        else:
+            await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
         return ConversationHandler.END
 
     # Clean up any leftover state from a previous interrupted flow.
     context.user_data.pop("addchannel_channel_id", None)
     context.user_data.pop("addchannel_username", None)
 
-    await update.message.reply_text(
+    prompt = (
         "أرسل Username القناة مثل @Crypto1583 أو رابط القناة مثل "
         "https://t.me/Crypto1583"
     )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(prompt)
+    else:
+        await update.message.reply_text(prompt)
     return ADDCHANNEL_USERNAME
 
 
@@ -624,6 +639,7 @@ async def removechannel_start(
 
     /removechannel <slug>  → direct deletion (legacy behaviour).
     /removechannel         → interactive inline-button workflow.
+    admin_panel:remove     → interactive inline-button workflow (from panel).
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -633,41 +649,61 @@ async def removechannel_start(
         if not subscribed:
             lock_user(user_id)
             text, markup = _build_missing_message(missing)
-            await update.message.reply_text(text, reply_markup=markup)
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(
+                    text, reply_markup=markup
+                )
+            else:
+                await update.message.reply_text(text, reply_markup=markup)
             return ConversationHandler.END
         unlock_user(user_id)
-        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "⛔ هذا الأمر للمشرفين فقط."
+            )
+        else:
+            await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
         return ConversationHandler.END
 
-    slug = update.message.text.replace("/removechannel", "", 1).strip()
+    # ── Direct deletion (legacy path) — only for text commands ─────
+    if not update.callback_query:
+        slug = update.message.text.replace("/removechannel", "", 1).strip()
+        if slug:
+            if slug not in CHANNELS:
+                await update.message.reply_text(
+                    f"❌ القناة بالـslug '{slug}' غير موجودة."
+                )
+                return ConversationHandler.END
 
-    # ── Direct deletion (legacy path) ───────────────────────────────
-    if slug:
-        if slug not in CHANNELS:
+            removed = CHANNELS.pop(slug)
+            db.delete_channel(slug)
+
             await update.message.reply_text(
-                f"❌ القناة بالـslug '{slug}' غير موجودة."
+                "✅ تم حذف القناة:\n\n"
+                f"📌 Slug: {removed.slug}\n"
+                f"🆔 ID: {removed.channel_id}\n"
+                f"📛 Username: @{removed.username}\n"
+                f"📝 Title: {removed.title}"
+            )
+            logger.info(
+                "Channel removed: %s (id=%d) by admin %d",
+                slug, removed.channel_id, user_id,
             )
             return ConversationHandler.END
 
-        removed = CHANNELS.pop(slug)
-        db.delete_channel(slug)
-
-        await update.message.reply_text(
-            "✅ تم حذف القناة:\n\n"
-            f"📌 Slug: {removed.slug}\n"
-            f"🆔 ID: {removed.channel_id}\n"
-            f"📛 Username: @{removed.username}\n"
-            f"📝 Title: {removed.title}"
-        )
-        logger.info(
-            "Channel removed: %s (id=%d) by admin %d",
-            slug, removed.channel_id, user_id,
-        )
-        return ConversationHandler.END
-
     # ── Interactive flow ─────────────────────────────────────────────
     if not CHANNELS:
-        await update.message.reply_text("لا توجد قنوات إجبارية للحذف.")
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "لا توجد قنوات إجبارية للحذف."
+            )
+        else:
+            await update.message.reply_text(
+                "لا توجد قنوات إجبارية للحذف."
+            )
         return ConversationHandler.END
 
     buttons: list[list[InlineKeyboardButton]] = [
@@ -680,10 +716,17 @@ async def removechannel_start(
         for ch in CHANNELS.values()
     ]
 
-    await update.message.reply_text(
-        "🔄 اختر القناة المراد حذفها:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "🔄 اختر القناة المراد حذفها:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        await update.message.reply_text(
+            "🔄 اختر القناة المراد حذفها:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
     return REMOVECHANNEL_SELECT
 
 
@@ -876,40 +919,66 @@ async def subscription_message_gate(
     await update.message.reply_text(text, reply_markup=markup)
 
 
-ADMIN_COMMANDS = [
-    BotCommand("addchannel", "إضافة قناة"),
-    BotCommand("removechannel", "حذف قناة"),
-    BotCommand("listchannels", "📋 عرض القنوات"),
-]
+# ── Admin Channel Panel (inline buttons) ────────────────────────────
 
 
-async def setup_admin_command_menu(
-    application: Application,
+async def admin_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Push the admin-only command menu to Telegram.
+    """Admin-only /admin command that shows the channel management panel."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
 
-    Sets the BotCommandMenu (the popup shown via the "/" button) so that:
-    • Each admin sees /addchannel, /editchannel, /removechannel, /listchannels.
-    • Normal (non-admin) users see *none* of these management commands.
-
-    The existing direct-text commands (/addchannel, /removechannel, /listchannels)
-    keep working for everyone; only the *menu* is admin-scoped.
-    """
-    bot = application.bot
-
-    # Default scope: clear the admin commands so normal users never see them.
-    await bot.set_my_commands(
-        commands=[],
-        scope=BotCommandScopeDefault(),
+    buttons = [
+        [InlineKeyboardButton("➕ إضافة قناة", callback_data="admin_panel:add")],
+        [InlineKeyboardButton("🗑️ حذف قناة", callback_data="admin_panel:remove")],
+        [InlineKeyboardButton("📋 عرض القنوات", callback_data="admin_panel:list")],
+    ]
+    await update.message.reply_text(
+        "⚙️ إدارة القنوات",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
+    logger.info("Admin panel opened by admin %d", user_id)
 
-    # Per-admin scope: give each admin the channel-management menu.
-    for admin_id in ADMINS:
-        await bot.set_my_commands(
-            commands=ADMIN_COMMANDS,
-            scope=BotCommandScopeChat(chat_id=admin_id),
+
+async def admin_panel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle admin panel callback (list button)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    action = query.data.split(":", 1)[1]
+
+    if action == "list":
+        if not CHANNELS:
+            await query.edit_message_text(
+                "📭 لا توجد قنوات اشتراك إجباري حالياً."
+            )
+            return
+
+        lines = ["📋 *قنوات الاشتراك الإجباري:*\n"]
+        for ch in CHANNELS.values():
+            required_text = "نعم" if ch.required else "لا"
+            lines.append(
+                f"📌 *{ch.title}*\n"
+                f"   slug: `{ch.slug}`\n"
+                f"   ID: `{ch.channel_id}`\n"
+                f"   username: @{ch.username}\n"
+                f"   required: {required_text}\n"
+            )
+
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown"
         )
-        logger.info("Set admin command menu for user %d", admin_id)
+        logger.info("Channels listed by admin %d via panel", user_id)
 
 
 def main() -> None:
@@ -923,9 +992,6 @@ def main() -> None:
     _refresh_required_ids()
 
     app = ApplicationBuilder().token(token).build()
-
-    # Register the post-init callback to push admin command menus.
-    app.post_init = setup_admin_command_menu
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -968,8 +1034,14 @@ def main() -> None:
 
     # 4. Interactive /addchannel conversation (group 2, before other commands).
     #    Admin check + subscription gate are inside addchannel_start.
+    #    Also accepts admin panel "Add" callback as entry point.
     addchannel_conv = ConversationHandler(
-        entry_points=[CommandHandler("addchannel", addchannel_start)],
+        entry_points=[
+            CommandHandler("addchannel", addchannel_start),
+            CallbackQueryHandler(
+                addchannel_start, pattern=r"^admin_panel:add$"
+            ),
+        ],
         states={
             ADDCHANNEL_USERNAME: [
                 MessageHandler(
@@ -988,8 +1060,14 @@ def main() -> None:
 
     # 5. Interactive /removechannel conversation (group 3).
     #    Legacy /removechannel <slug> is handled inside removechannel_start.
+    #    Also accepts admin panel "Remove" callback as entry point.
     removechannel_conv = ConversationHandler(
-        entry_points=[CommandHandler("removechannel", removechannel_start)],
+        entry_points=[
+            CommandHandler("removechannel", removechannel_start),
+            CallbackQueryHandler(
+                removechannel_start, pattern=r"^admin_panel:remove$"
+            ),
+        ],
         states={
             REMOVECHANNEL_SELECT: [
                 CallbackQueryHandler(
@@ -1014,6 +1092,13 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(
         verify_subscription, pattern="^verify_subscription$",
     ), group=4)
+
+    # 7. Admin panel: list callback + /admin command.
+    #    /admin is NOT added to the BotCommand menu.
+    app.add_handler(CallbackQueryHandler(
+        admin_panel_callback, pattern=r"^admin_panel:list$",
+    ), group=5)
+    app.add_handler(CommandHandler("admin", admin_command), group=5)
 
     logger.info("Bot is starting...")
     app.run_polling()
