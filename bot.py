@@ -878,7 +878,6 @@ async def subscription_message_gate(
 
 ADMIN_COMMANDS = [
     BotCommand("addchannel", "إضافة قناة"),
-    BotCommand("editchannel", "تعديل قناة"),
     BotCommand("removechannel", "حذف قناة"),
     BotCommand("listchannels", "📋 عرض القنوات"),
 ]

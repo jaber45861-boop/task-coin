@@ -23,12 +23,11 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
     """Tests that the admin command menu is configured correctly."""
 
     def test_admin_commands_constant(self) -> None:
-        """ADMIN_COMMANDS should contain exactly the four management commands."""
-        self.assertEqual(len(ADMIN_COMMANDS), 4)
+        """ADMIN_COMMANDS should contain exactly the three management commands."""
+        self.assertEqual(len(ADMIN_COMMANDS), 3)
 
         command_names = [cmd.command for cmd in ADMIN_COMMANDS]
         self.assertIn("addchannel", command_names)
-        self.assertIn("editchannel", command_names)
         self.assertIn("removechannel", command_names)
         self.assertIn("listchannels", command_names)
 
@@ -47,7 +46,6 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
         """Verify exact slug and Arabic text for each admin command."""
         cmd_map = {cmd.command: cmd.description for cmd in ADMIN_COMMANDS}
         self.assertEqual(cmd_map["addchannel"], "إضافة قناة")
-        self.assertEqual(cmd_map["editchannel"], "تعديل قناة")
         self.assertEqual(cmd_map["removechannel"], "حذف قناة")
         self.assertEqual(cmd_map["listchannels"], "📋 عرض القنوات")
 
@@ -89,10 +87,9 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
                     found = True
                     # Verify the commands passed are ADMIN_COMMANDS
                     cmds = kwargs["commands"]
-                    self.assertEqual(len(cmds), 4)
+                    self.assertEqual(len(cmds), 3)
                     names = [c.command for c in cmds]
                     self.assertIn("addchannel", names)
-                    self.assertIn("editchannel", names)
                     self.assertIn("removechannel", names)
                     self.assertIn("listchannels", names)
                     break
@@ -114,9 +111,9 @@ class TestAdminCommandMenu(unittest.IsolatedAsyncioTestCase):
         cmds = first_call.kwargs.get("commands", first_call.args[0] if first_call.args else None)
         self.assertEqual(cmds, [])
 
-    def test_admin_menu_exactly_four_commands(self) -> None:
-        """No extra commands beyond the four expected management commands."""
-        expected = {"addchannel", "editchannel", "removechannel", "listchannels"}
+    def test_admin_menu_exactly_three_commands(self) -> None:
+        """No extra commands beyond the three expected management commands."""
+        expected = {"addchannel", "removechannel", "listchannels"}
         actual = {cmd.command for cmd in ADMIN_COMMANDS}
         self.assertEqual(actual, expected)
 
@@ -170,17 +167,12 @@ class TestCommandHandlersIntact(unittest.TestCase):
         self.assertTrue(callable(on_chat_member_update))
 
     def test_admin_commands_are_new(self) -> None:
-        """editchannel is registered in the menu but has no handler yet —
-        that's expected per the task scope (do not implement edit workflow)."""
+        """All admin menu commands have existing handlers."""
         import bot as bot_mod
 
-        # addchannel, removechannel, listchannels all have handlers
         self.assertTrue(callable(bot_mod.add_channel))
         self.assertTrue(callable(bot_mod.remove_channel))
         self.assertTrue(callable(bot_mod.list_channels))
-
-        # editchannel should NOT have a handler function yet
-        self.assertFalse(hasattr(bot_mod, "editchannel"))
 
 
 if __name__ == "__main__":
