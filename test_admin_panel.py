@@ -408,20 +408,104 @@ class TestNoNativeCommandMenu(unittest.TestCase):
         import bot as bot_mod
         self.assertFalse(hasattr(bot_mod, "setup_admin_command_menu"))
 
-    def test_bot_command_scope_not_imported(self) -> None:
-        """BotCommandScopeChat and BotCommandScopeDefault should not be imported."""
+    def test_bot_command_scopes_used_for_deletion(self) -> None:
+        """BotCommandScopeChat and BotCommandScopeDefault are imported for deletion."""
         import bot as bot_mod
         import inspect
         source = inspect.getsource(bot_mod)
-        self.assertNotIn("BotCommandScopeChat", source)
-        self.assertNotIn("BotCommandScopeDefault", source)
+        self.assertIn("BotCommandScopeChat", source)
+        self.assertIn("BotCommandScopeDefault", source)
 
-    def test_post_init_not_set(self) -> None:
-        """app.post_init should not be set to setup_admin_command_menu."""
+    def test_post_init_set_to_clear_command_menus(self) -> None:
+        """app.post_init should be set to clear_command_menus, not setup_admin_command_menu."""
         import bot as bot_mod
         import inspect
         source = inspect.getsource(bot_mod.main)
-        self.assertNotIn("post_init", source)
+        self.assertIn("clear_command_menus", source)
+        self.assertNotIn("setup_admin_command_menu", source)
+
+
+# ── Tests: Command menu cleanup on startup ──────────────────────────
+
+
+class TestClearCommandMenus(unittest.IsolatedAsyncioTestCase):
+    """Tests that clear_command_menus deletes old commands from Telegram."""
+
+    async def test_clears_default_scope(self) -> None:
+        """clear_command_menus calls delete_my_commands for BotCommandScopeDefault."""
+        from bot import clear_command_menus
+
+        mock_app = MagicMock()
+        mock_app.bot = MagicMock()
+        mock_app.bot.delete_my_commands = AsyncMock()
+
+        await clear_command_menus(mock_app)
+
+        # Should be called once for default scope
+        default_calls = [
+            call for call in mock_app.bot.delete_my_commands.call_args_list
+            if call.kwargs.get("scope") is not None
+            and type(call.kwargs["scope"]).__name__ == "BotCommandScopeDefault"
+        ]
+        self.assertEqual(len(default_calls), 1)
+
+    async def test_clears_admin_scopes(self) -> None:
+        """clear_command_menus calls delete_my_commands for each admin BotCommandScopeChat."""
+        from bot import clear_command_menus
+        from config import ADMINS
+
+        mock_app = MagicMock()
+        mock_app.bot = MagicMock()
+        mock_app.bot.delete_my_commands = AsyncMock()
+
+        await clear_command_menus(mock_app)
+
+        # Should be called once per admin + once for default
+        expected_calls = 1 + len(ADMINS)
+        self.assertEqual(
+            mock_app.bot.delete_my_commands.call_count, expected_calls
+        )
+
+        # Verify each admin gets a BotCommandScopeChat call
+        for admin_id in ADMINS:
+            found = False
+            for call in mock_app.bot.delete_my_commands.call_args_list:
+                scope = call.kwargs.get("scope")
+                if scope is not None and getattr(scope, "chat_id", None) == admin_id:
+                    found = True
+                    break
+            self.assertTrue(
+                found,
+                f"delete_my_commands not called with BotCommandScopeChat "
+                f"for admin {admin_id}",
+            )
+
+    async def test_no_set_my_commands_called(self) -> None:
+        """clear_command_menus should NOT call set_my_commands."""
+        from bot import clear_command_menus
+
+        mock_app = MagicMock()
+        mock_app.bot = MagicMock()
+        mock_app.bot.delete_my_commands = AsyncMock()
+        mock_app.bot.set_my_commands = AsyncMock()
+
+        await clear_command_menus(mock_app)
+
+        mock_app.bot.set_my_commands.assert_not_called()
+
+    async def test_clear_command_menus_is_callable(self) -> None:
+        """clear_command_menus should be importable and callable."""
+        from bot import clear_command_menus
+        self.assertTrue(callable(clear_command_menus))
+
+    def test_no_replacement_menu_registered(self) -> None:
+        """No ADMIN_COMMANDS or set_my_commands registration should exist."""
+        import bot as bot_mod
+        import inspect
+        source = inspect.getsource(bot_mod)
+        self.assertNotIn("set_my_commands", source)
+        self.assertNotIn("ADMIN_COMMANDS", source)
+        self.assertNotIn("setup_admin_command_menu", source)
 
 
 # ── Tests: Existing direct commands still work ────────────────────────

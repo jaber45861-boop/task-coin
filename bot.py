@@ -4,6 +4,8 @@ import re
 import logging
 from dotenv import load_dotenv
 from telegram import (
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -919,6 +921,30 @@ async def subscription_message_gate(
     await update.message.reply_text(text, reply_markup=markup)
 
 
+# ── Clear legacy command menus on startup ──────────────────────────
+
+
+async def clear_command_menus(application: Application) -> None:
+    """Remove previously registered bot commands from Telegram.
+
+    Clears commands from the default scope and every configured admin
+    BotCommandScopeChat so old /addchannel /removechannel /listchannels
+    entries no longer appear in the native command menu.
+    """
+    bot = application.bot
+
+    # 1. Clear default scope
+    await bot.delete_my_commands(scope=BotCommandScopeDefault())
+    logger.info("Cleared default command menu")
+
+    # 2. Clear each admin's per-chat scope
+    for admin_id in ADMINS:
+        await bot.delete_my_commands(
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
+        logger.info("Cleared command menu for admin %d", admin_id)
+
+
 # ── Admin Channel Panel (inline buttons) ────────────────────────────
 
 
@@ -992,6 +1018,9 @@ def main() -> None:
     _refresh_required_ids()
 
     app = ApplicationBuilder().token(token).build()
+
+    # Clear legacy command menus registered by earlier bot versions.
+    app.post_init = clear_command_menus
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
