@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 ANTI_BOT = 0
 
+# States for the interactive /addchannel conversation
+ADDCHANNEL_USERNAME = 20
+ADDCHANNEL_TITLE = 21
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Send a simple math question as anti-bot step."""
@@ -347,6 +351,174 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.info("Channel added: %s (id=%d) by admin %d", slug, channel_id, user_id)
 
 
+# NOTE: The legacy add_channel handler is retained for backward-compatible
+# unit tests.  The interactive /addchannel ConversationHandler below
+# replaces it in the running bot.
+
+
+def _derive_slug(username: str) -> str:
+    """Derive a safe channel slug from a Telegram username."""
+    slug = re.sub(r"[^a-z0-9_]", "", username.lower())
+    return slug or "channel"
+
+
+async def addchannel_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Entry point for the interactive /addchannel workflow.
+
+    Checks admin privileges, then prompts for the channel username/link.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return ConversationHandler.END
+        unlock_user(user_id)
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    # Clean up any leftover state from a previous interrupted flow.
+    context.user_data.pop("addchannel_channel_id", None)
+    context.user_data.pop("addchannel_username", None)
+
+    await update.message.reply_text(
+        "أرسل Username القناة مثل @Crypto1583 أو رابط القناة مثل "
+        "https://t.me/Crypto1583"
+    )
+    return ADDCHANNEL_USERNAME
+
+
+async def addchannel_username(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Validate the channel username/link and prompt for the title."""
+    text = update.message.text.strip()
+    username = _normalize_channel_ref(text)
+
+    if not username:
+        await update.message.reply_text(
+            "❌ صيغة غير صحيحة. أرسل Username مثل @Crypto1583\n"
+            "أو رابط مثل https://t.me/Crypto1583"
+        )
+        return ADDCHANNEL_USERNAME
+
+    # ── Validate via Telegram Bot API (same as the original handler) ──
+    try:
+        chat = await context.bot.get_chat(f"@{username}")
+    except TelegramError as exc:
+        await update.message.reply_text(
+            "❌ تعذر الوصول للقناة. تأكد من:\n"
+            "• اسم القناة صحيح\n"
+            "• البوت مضاف للقناة\n\n"
+            f"تفاصيل الخطأ: {exc}"
+        )
+        return ADDCHANNEL_USERNAME
+
+    if chat.type not in ("channel",):
+        await update.message.reply_text(
+            f'❌ "{chat.type}" ليست قناة.\n'
+            "يجب أن يكون المعرف الخاص بقناة Telegram."
+        )
+        return ADDCHANNEL_USERNAME
+
+    # Prevent duplicate channel_id
+    for existing in CHANNELS.values():
+        if existing.channel_id == chat.id:
+            await update.message.reply_text(
+                f"❌ القناة @{username} (ID: {chat.id}) موجودة مسبقًا "
+                f"(slug: {existing.slug})."
+            )
+            return ADDCHANNEL_USERNAME
+
+    # Verify the bot is administrator in the channel
+    try:
+        bot_member = await context.bot.get_chat_member(
+            chat.id, context.bot.id
+        )
+    except TelegramError as exc:
+        await update.message.reply_text(
+            "❌ تعذر التحقق من عضوية البوت في القناة.\n"
+            "تأكد أن البوت مشرف (admin) في القناة\n"
+            "ليتمكن من فحص اشتراك المستخدمين لاحقًا.\n\n"
+            f"تفاصيل الخطأ: {exc}"
+        )
+        return ADDCHANNEL_USERNAME
+
+    if bot_member.status not in ("administrator", "creator"):
+        await update.message.reply_text(
+            f"❌ البوت ليس مشرفًا في القناة (حالته: {bot_member.status})\n"
+            "يجب أن يكون البوت *مشرفًا* (admin) في القناة\n"
+            "ليتمكن من فحص اشتراك المستخدمين لاحقًا."
+        )
+        return ADDCHANNEL_USERNAME
+
+    # Store validated data for the next step
+    context.user_data["addchannel_channel_id"] = chat.id
+    context.user_data["addchannel_username"] = username
+
+    await update.message.reply_text("أرسل اسم القناة")
+    return ADDCHANNEL_TITLE
+
+
+async def addchannel_title(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receive the title, persist the channel, and finish."""
+    title = update.message.text.strip()
+    if not title:
+        await update.message.reply_text(
+            "❌ اسم القناة لا يمكن أن يكون فارغًا.\nأرسل اسم القناة."
+        )
+        return ADDCHANNEL_TITLE
+
+    channel_id = context.user_data.pop("addchannel_channel_id")
+    username = context.user_data.pop("addchannel_username")
+
+    slug = _derive_slug(username)
+    # Ensure slug uniqueness
+    if slug in CHANNELS:
+        slug = f"{slug}_{abs(channel_id)}"
+
+    new_channel = Channel(
+        slug=slug,
+        channel_id=channel_id,
+        username=username,
+        title=title,
+        required=True,
+    )
+    CHANNELS[slug] = new_channel
+    db.save_channel(new_channel)
+
+    await update.message.reply_text(
+        "✅ تمت إضافة القناة:\n\n"
+        f"📌 Slug: {slug}\n"
+        f"🆔 ID: {channel_id}\n"
+        f"📛 Username: @{username}\n"
+        f"📝 Title: {title}\n"
+        "🔒 Required: نعم"
+    )
+    logger.info(
+        "Channel added: %s (id=%d) via interactive flow", slug, channel_id
+    )
+    return ConversationHandler.END
+
+
+async def addchannel_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Cancel the /addchannel conversation."""
+    context.user_data.pop("addchannel_channel_id", None)
+    context.user_data.pop("addchannel_username", None)
+    await update.message.reply_text("تم الإلغاء.")
+    return ConversationHandler.END
+
+
 # ── Admin: List Channels ─────────────────────────────────────────────
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -621,9 +793,27 @@ def main() -> None:
         group=1,
     )
 
-    # 4. Protected commands: subscription gate + admin logic combined.
-    #    Non-admin locked users are blocked before admin handlers fire.
-    app.add_handler(CommandHandler("addchannel", add_channel), group=3)
+    # 4. Interactive /addchannel conversation (group 2, before other commands).
+    #    Admin check + subscription gate are inside addchannel_start.
+    addchannel_conv = ConversationHandler(
+        entry_points=[CommandHandler("addchannel", addchannel_start)],
+        states={
+            ADDCHANNEL_USERNAME: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, addchannel_username
+                ),
+            ],
+            ADDCHANNEL_TITLE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, addchannel_title
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", addchannel_cancel)],
+    )
+    app.add_handler(addchannel_conv, group=2)
+
+    # 5. Other protected commands: list and remove channels.
     app.add_handler(CommandHandler("listchannels", list_channels), group=3)
     app.add_handler(CommandHandler("removechannel", remove_channel), group=3)
 
