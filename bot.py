@@ -1081,6 +1081,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_callback_query=True,
     )
 
     # 1. Detect channel departures immediately.
@@ -1135,6 +1136,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", addchannel_cancel)],
+        per_callback_query=True,
     )
     app.add_handler(addchannel_conv, group=2)
 
@@ -1164,6 +1166,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", removechannel_cancel)],
+        per_callback_query=True,
     )
     app.add_handler(removechannel_conv, group=3)
     app.add_handler(CommandHandler("listchannels", list_channels), group=3)
