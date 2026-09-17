@@ -233,7 +233,7 @@ class TestAddchannelUsername(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, ADDCHANNEL_USERNAME)
         reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("ليس مشرفًا", reply)
+        self.assertIn("ليس عضوًا كافيًا", reply)
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_duplicate_channel_id_rejected(self, _mock: MagicMock) -> None:
@@ -296,8 +296,12 @@ class TestAddchannelUsername(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
-    async def test_supergroup_bot_not_admin_rejected(self, _mock: MagicMock) -> None:
-        """Supergroup where bot is not admin is rejected."""
+    async def test_supergroup_member_status_accepted(self, _mock: MagicMock) -> None:
+        """Supergroup where bot is a member (not admin) is accepted.
+
+        For supergroups a regular member is enough to check subscriptions;
+        for channels the bot must be admin.
+        """
         bot = MagicMock()
         mock_chat = MagicMock()
         mock_chat.id = -100666
@@ -312,9 +316,34 @@ class TestAddchannelUsername(unittest.IsolatedAsyncioTestCase):
 
         result = await addchannel_username(update, ctx)
 
+        # Should advance to title step, not stay in username step        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100666)
+        self.assertEqual(ctx.user_data["addchannel_username"], "notmygroup")
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_channel_member_status_rejected(self, _mock: MagicMock) -> None:
+        """Channel where bot is member (not admin) is still rejected.
+
+        For channels the bot MUST be admin (Telegram API requirement).
+        """
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100888
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="member"),
+        )
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="@notmychannel")
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
         self.assertEqual(result, ADDCHANNEL_USERNAME)
         reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("ليس مشرفًا", reply)
+        self.assertIn("ليس عضوًا كافيًا", reply)
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_supergroup_stores_chat_type(self, _mock: MagicMock) -> None:
@@ -701,10 +730,10 @@ class TestAddchannelUsernameBareTmeLink(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.user_data["addchannel_username"], "testchannel")
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
-    async def test_bare_tme_supergroup_bot_not_admin_rejected(
+    async def test_bare_tme_supergroup_member_accepted(
         self, _mock: MagicMock
     ) -> None:
-        """Bare t.me supergroup where bot is not admin is rejected."""
+        """Bare t.me supergroup where bot is a member (not admin) is accepted."""
         bot = MagicMock()
         mock_chat = MagicMock()
         mock_chat.id = -100666
@@ -721,9 +750,9 @@ class TestAddchannelUsernameBareTmeLink(unittest.IsolatedAsyncioTestCase):
 
         result = await addchannel_username(update, ctx)
 
-        self.assertEqual(result, ADDCHANNEL_USERNAME)
-        reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("ليس مشرفًا", reply)
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100666)
+        self.assertEqual(ctx.user_data["addchannel_username"], "notmygroup")
 
 
 # ── Tests: legacy add_channel with bare t.me/ links ───────────────────

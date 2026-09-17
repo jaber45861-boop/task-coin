@@ -359,25 +359,34 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-    # Verify the bot is administrator in the channel
+    # Verify the bot has access in the channel/supergroup.
+    # For channels the bot must be admin (Telegram API requirement).
+    # For supergroups a regular member is enough.
     try:
         bot_member = await context.bot.get_chat_member(
             channel_id, context.bot.id
         )
     except TelegramError as exc:
         await update.message.reply_text(
-            "❌ تعذر التحقق من عضوية البوت في القناة.\n"
-            "تأكد أن البوت مشرف (admin) في القناة\n"
+            "❌ تعذر التحقق من عضوية البوت في القناة/المجموعة.\n"
+            "تأكد أن البوت مضاف للقناة أو المجموعة\n"
             "ليتمكن من فحص اشتراك المستخدمين لاحقًا.\n\n"
             f"تفاصيل الخطأ: {exc}"
         )
         return
 
-    if bot_member.status not in ("administrator", "creator"):
+    if chat.type == "channel":
+        _bot_ok = bot_member.status in ("administrator", "creator")
+    else:
+        _bot_ok = bot_member.status in (
+            "member", "administrator", "creator",
+        )
+
+    if not _bot_ok:
         await update.message.reply_text(
-            f"❌ البوت ليس مشرفًا في القناة (حالته: {bot_member.status})\n"
+            f"❌ البوت ليس عضوًا كافيًا في {chat.type} (حالته: {bot_member.status})\n"
             "يجب أن يكون البوت *مشرفًا* (admin) في القناة\n"
-            "ليتمكن من فحص اشتراك المستخدمين لاحقًا."
+            "أو *عضوًا* (member) في المجموعة."
         )
         return
 
@@ -509,25 +518,34 @@ async def addchannel_username(
             )
             return ADDCHANNEL_USERNAME
 
-    # Verify the bot is administrator in the channel/supergroup
+    # Verify the bot has access in the channel/supergroup.
+    # For channels the bot must be admin (Telegram API requirement).
+    # For supergroups a regular member is enough.
     try:
         bot_member = await context.bot.get_chat_member(
             chat.id, context.bot.id
         )
     except TelegramError as exc:
         await update.message.reply_text(
-            "❌ تعذر التحقق من عضوية البوت في القناة.\n"
-            "تأكد أن البوت مشرف (admin) في القناة\n"
+            "❌ تعذر التحقق من عضوية البوت في القناة/المجموعة.\n"
+            "تأكد أن البوت مضاف للقناة أو المجموعة\n"
             "ليتمكن من فحص اشتراك المستخدمين لاحقًا.\n\n"
             f"تفاصيل الخطأ: {exc}"
         )
         return ADDCHANNEL_USERNAME
 
-    if bot_member.status not in ("administrator", "creator"):
+    if chat.type == "channel":
+        _bot_ok = bot_member.status in ("administrator", "creator")
+    else:
+        _bot_ok = bot_member.status in (
+            "member", "administrator", "creator",
+        )
+
+    if not _bot_ok:
         await update.message.reply_text(
-            f"❌ البوت ليس مشرفًا في القناة (حالته: {bot_member.status})\n"
+            f"❌ البوت ليس عضوًا كافيًا في {chat.type} (حالته: {bot_member.status})\n"
             "يجب أن يكون البوت *مشرفًا* (admin) في القناة\n"
-            "ليتمكن من فحص اشتراك المستخدمين لاحقًا."
+            "أو *عضوًا* (member) في المجموعة."
         )
         return ADDCHANNEL_USERNAME
 
