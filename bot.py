@@ -1081,7 +1081,6 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_callback_query=True,
     )
 
     # 1. Detect channel departures immediately.
@@ -1136,9 +1135,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", addchannel_cancel)],
-        per_callback_query=True,
     )
-    app.add_handler(addchannel_conv, group=2)
 
     # 5. Interactive /removechannel conversation (group 3).
     #    Legacy /removechannel <slug> is handled inside removechannel_start.
@@ -1166,10 +1163,16 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", removechannel_cancel)],
-        per_callback_query=True,
     )
-    app.add_handler(removechannel_conv, group=3)
-    app.add_handler(CommandHandler("listchannels", list_channels), group=3)
+
+    # Register add/remove conversations in group 0 (BEFORE the anti-bot
+    # ConversationHandler in group 1).  This ensures admin-panel callback
+    # queries (admin_panel:add / admin_panel:remove) are matched by these
+    # ConversationHandler entry points before the anti-bot handler can
+    # intercept them when per_callback_query is not supported.
+    app.add_handler(addchannel_conv, group=0)
+    app.add_handler(removechannel_conv, group=0)
+    app.add_handler(CommandHandler("listchannels", list_channels), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
