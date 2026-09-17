@@ -23,6 +23,7 @@ from bot import (
     ADDCHANNEL_TITLE,
     ADDCHANNEL_USERNAME,
     _derive_slug,
+    _normalize_channel_ref,
     addchannel_cancel,
     addchannel_start,
     addchannel_title,
@@ -556,6 +557,274 @@ class TestAddchannelDuplicateSlug(unittest.IsolatedAsyncioTestCase):
         suffixed = "testchannel_100222"
         self.assertIn(suffixed, CHANNELS)
         self.assertEqual(CHANNELS[suffixed].channel_id, -100222)
+
+
+
+# ── Tests: _normalize_channel_ref (parser) ───────────────────────────
+
+
+class TestNormalizeChannelRef(unittest.TestCase):
+    """Direct unit tests for the _normalize_channel_ref parser.
+
+    Covers all accepted input formats: @username, t.me/, www.t.me/,
+    https://, http://, and bare username.
+    """
+
+    def test_at_username(self) -> None:
+        result = _normalize_channel_ref("@Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_bare_username(self) -> None:
+        result = _normalize_channel_ref("Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_https_tme(self) -> None:
+        result = _normalize_channel_ref("https://t.me/Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_http_tme(self) -> None:
+        result = _normalize_channel_ref("http://t.me/Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_www_tme(self) -> None:
+        result = _normalize_channel_ref("www.t.me/Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_bare_tme(self) -> None:
+        """Bare t.me/ link without protocol must be accepted."""
+        result = _normalize_channel_ref("t.me/Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_https_www_tme(self) -> None:
+        result = _normalize_channel_ref("https://www.t.me/Crypto1583")
+        self.assertEqual(result, "Crypto1583")
+
+    def test_short_username_rejected(self) -> None:
+        """Usernames shorter than 5 characters are rejected."""
+        result = _normalize_channel_ref("@abc")
+        self.assertIsNone(result)
+
+    def test_invalid_chars_rejected(self) -> None:
+        result = _normalize_channel_ref("@bad username")
+        self.assertIsNone(result)
+
+    def test_none_returns_none(self) -> None:
+        result = _normalize_channel_ref("")
+        self.assertIsNone(result)
+
+    def test_whitespace_stripped(self) -> None:
+        result = _normalize_channel_ref("  @Crypto1583  ")
+        self.assertEqual(result, "Crypto1583")
+
+
+# ── Tests: addchannel_username with bare t.me/ links ──────────────────
+
+
+class TestAddchannelUsernameBareTmeLink(unittest.IsolatedAsyncioTestCase):
+    """Tests that bare t.me/ links (no protocol) are accepted
+    in the interactive addchannel_username handler.
+
+    These are the cases that previously failed.
+    """
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_bare_tme_channel_accepted(self, _mock: MagicMock) -> None:
+        """Bare t.me/channelusername for a channel is accepted."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100999
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID, text="t.me/testchannel",
+        )
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100999)
+        self.assertEqual(ctx.user_data["addchannel_username"], "testchannel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_bare_tme_supergroup_accepted(self, _mock: MagicMock) -> None:
+        """Bare t.me/groupusername for a supergroup is accepted."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID, text="t.me/mygroup",
+        )
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100777)
+        self.assertEqual(ctx.user_data["addchannel_username"], "mygroup")
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_www_tme_channel_accepted(self, _mock: MagicMock) -> None:
+        """www.t.me/channelusername without protocol is accepted."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100888
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID, text="www.t.me/testchannel",
+        )
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100888)
+        self.assertEqual(ctx.user_data["addchannel_username"], "testchannel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_bare_tme_supergroup_bot_not_admin_rejected(
+        self, _mock: MagicMock
+    ) -> None:
+        """Bare t.me supergroup where bot is not admin is rejected."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100666
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="member"),
+        )
+
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID, text="t.me/notmygroup",
+        )
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ليس مشرفًا", reply)
+
+
+# ── Tests: legacy add_channel with bare t.me/ links ───────────────────
+
+
+class TestLegacyAddChannelBareTmeLink(unittest.IsolatedAsyncioTestCase):
+    """Tests that the legacy /addchannel slug|ref|title command
+    also accepts bare t.me/ links via _normalize_channel_ref.
+    """
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        self.test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        import db as _db
+        self.original_db_path = _db.DB_PATH
+        _db.DB_PATH = self.test_db_path
+        _db.init_db(_db.DB_PATH)
+
+    def tearDown(self) -> None:
+        import db as _db
+        _db.DB_PATH = self.original_db_path
+        CHANNELS.clear()
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ("-wal", "-shm"):
+            p = self.test_db_path + suffix
+            if os.path.exists(p):
+                os.unlink(p)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_legacy_bare_tme_link(self, _mock: MagicMock) -> None:
+        """slug|t.me/username|title works in the legacy command."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100999
+        mock_chat.type = "channel"
+
+        mock_bot_member = MagicMock()
+        mock_bot_member.status = "administrator"
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel main|t.me/testchannel|Test Title"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        self.assertIn("main", CHANNELS)
+        ch = CHANNELS["main"]
+        self.assertEqual(ch.channel_id, -100999)
+        self.assertEqual(ch.username, "testchannel")
+        self.assertEqual(ch.title, "Test Title")
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("تمت إضافة القناة", reply_text)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_legacy_bare_tme_supergroup(self, _mock: MagicMock) -> None:
+        """slug|t.me/groupname|title for a supergroup works in legacy."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "supergroup"
+
+        mock_bot_member = MagicMock()
+        mock_bot_member.status = "administrator"
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel grp|t.me/mygroup|My Group"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        self.assertIn("grp", CHANNELS)
+        ch = CHANNELS["grp"]
+        self.assertEqual(ch.channel_id, -100777)
+        self.assertEqual(ch.username, "mygroup")
+        self.assertEqual(ch.title, "My Group")
+        self.assertEqual(ch.chat_type, "supergroup")
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("تمت إضافة القناة", reply_text)
 
 
 if __name__ == "__main__":

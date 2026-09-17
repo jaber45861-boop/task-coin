@@ -241,8 +241,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ── Channel-reference normalizer ────────────────────────────────────
 
 # Matches @username, t.me/username, and bare username strings.
+# Accepts https://, http://, bare t.me/, www.t.me/ prefixes.
 _USERNAME_RE = re.compile(
-    r"^(?:https?://(?:www\.)?t\.me/)?@?([A-Za-z0-9_]{5,})$",
+    r"^(?:(?:https?://)?(?:www\.)?t\.me/)?@?([A-Za-z0-9_]{5,})$",
 )
 
 
