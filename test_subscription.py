@@ -169,6 +169,38 @@ class TestCheckSubscriptionAccess(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(missing), 1)
         self.assertEqual(missing[0].channel_id, _CHANNEL_A.channel_id)
 
+    # Supergroup channel works same as regular channel for subscription check
+    async def test_supergroup_subscription_checked(self) -> None:
+        sg_channel = Channel(
+            slug="sg_ch", channel_id=-100555,
+            username="sg_channel", title="SG Channel", required=True,
+            chat_type="supergroup",
+        )
+        _setup_channels([sg_channel])
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(return_value=_make_chat_member("member"))
+
+        ok, missing = await check_subscription_access(bot, 999)
+
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    async def test_supergroup_not_subscribed_detected(self) -> None:
+        sg_channel = Channel(
+            slug="sg_ch2", channel_id=-100666,
+            username="sg_channel2", title="SG Channel 2", required=True,
+            chat_type="supergroup",
+        )
+        _setup_channels([sg_channel])
+        bot = MagicMock()
+        bot.get_chat_member = AsyncMock(return_value=_make_chat_member("left"))
+
+        ok, missing = await check_subscription_access(bot, 999)
+
+        self.assertFalse(ok)
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].channel_id, -100666)
+
     # No required channels → always allowed
     async def test_no_required_channels(self) -> None:
         CHANNELS.clear()
@@ -789,6 +821,71 @@ class TestAddChannelUsernameInput(unittest.IsolatedAsyncioTestCase):
 
         reply_text = update.message.reply_text.call_args[0][0]
         self.assertIn("تعذر الوصول", reply_text)
+        self.assertEqual(len(CHANNELS), 0)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_supergroup_accepted(self, _mock: MagicMock) -> None:
+        """Supergroup type is accepted via legacy /addchannel command."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100666
+        mock_chat.type = "supergroup"
+
+        mock_bot_member = _make_chat_member("administrator")
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel grp|@mygroup|My Group"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        # Channel should be stored with chat_type=supergroup
+        self.assertIn("grp", CHANNELS)
+        ch = CHANNELS["grp"]
+        self.assertEqual(ch.channel_id, -100666)
+        self.assertEqual(ch.username, "mygroup")
+        self.assertEqual(ch.title, "My Group")
+        self.assertEqual(ch.chat_type, "supergroup")
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("تمت إضافة القناة", reply_text)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_addchannel_supergroup_bot_not_admin_rejected(self, _mock: MagicMock) -> None:
+        """Supergroup where bot is not admin is rejected."""
+        from bot import add_channel
+
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "supergroup"
+
+        mock_bot_member = _make_chat_member("member")  # not admin!
+
+        update = MagicMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = _TEST_ADMIN_ID
+        update.message = MagicMock()
+        update.message.text = "/addchannel grp2|@notmygroup|Group"
+        update.message.reply_text = AsyncMock()
+
+        bot = MagicMock()
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(return_value=mock_bot_member)
+        ctx = _make_context(bot)
+
+        await add_channel(update, ctx)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("ليس مشرفًا", reply_text)
         self.assertEqual(len(CHANNELS), 0)
 
 

@@ -339,11 +339,11 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Verify it's a channel (not a group or private chat)
-    if chat.type not in ("channel",):
+    # Verify it's a channel or supergroup
+    if chat.type not in ("channel", "supergroup"):
         await update.message.reply_text(
-            f'❌ "{chat.type}" ليست قناة.\n'
-            "يجب أن يكون المعرف الخاص بقناة Telegram."
+            f'❌ "{chat.type}" ليست قناة أو supergroup.\n'
+            "يجب أن يكون المعرف الخاص بقناة أو supergroup Telegram."
         )
         return
 
@@ -387,6 +387,7 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         username=username,
         title=title,
         required=True,
+        chat_type=chat.type,
     )
     CHANNELS[slug] = new_channel
     db.save_channel(new_channel)
@@ -450,6 +451,7 @@ async def addchannel_start(
     # Clean up any leftover state from a previous interrupted flow.
     context.user_data.pop("addchannel_channel_id", None)
     context.user_data.pop("addchannel_username", None)
+    context.user_data.pop("addchannel_chat_type", None)
 
     prompt = (
         "أرسل Username القناة مثل @Crypto1583 أو رابط القناة مثل "
@@ -489,10 +491,11 @@ async def addchannel_username(
         )
         return ADDCHANNEL_USERNAME
 
-    if chat.type not in ("channel",):
+    # Verify it's a channel or supergroup
+    if chat.type not in ("channel", "supergroup"):
         await update.message.reply_text(
-            f'❌ "{chat.type}" ليست قناة.\n'
-            "يجب أن يكون المعرف الخاص بقناة Telegram."
+            f'❌ "{chat.type}" ليست قناة أو supergroup.\n'
+            "يجب أن يكون المعرف الخاص بقناة أو supergroup Telegram."
         )
         return ADDCHANNEL_USERNAME
 
@@ -505,7 +508,7 @@ async def addchannel_username(
             )
             return ADDCHANNEL_USERNAME
 
-    # Verify the bot is administrator in the channel
+    # Verify the bot is administrator in the channel/supergroup
     try:
         bot_member = await context.bot.get_chat_member(
             chat.id, context.bot.id
@@ -530,6 +533,7 @@ async def addchannel_username(
     # Store validated data for the next step
     context.user_data["addchannel_channel_id"] = chat.id
     context.user_data["addchannel_username"] = username
+    context.user_data["addchannel_chat_type"] = chat.type
 
     await update.message.reply_text("أرسل اسم القناة")
     return ADDCHANNEL_TITLE
@@ -548,6 +552,7 @@ async def addchannel_title(
 
     channel_id = context.user_data.pop("addchannel_channel_id")
     username = context.user_data.pop("addchannel_username")
+    chat_type = context.user_data.pop("addchannel_chat_type", "channel")
 
     slug = _derive_slug(username)
     # Ensure slug uniqueness
@@ -560,6 +565,7 @@ async def addchannel_title(
         username=username,
         title=title,
         required=True,
+        chat_type=chat_type,
     )
     CHANNELS[slug] = new_channel
     db.save_channel(new_channel)
@@ -584,6 +590,7 @@ async def addchannel_cancel(
     """Cancel the /addchannel conversation."""
     context.user_data.pop("addchannel_channel_id", None)
     context.user_data.pop("addchannel_username", None)
+    context.user_data.pop("addchannel_chat_type", None)
     await update.message.reply_text("تم الإلغاء.")
     return ConversationHandler.END
 

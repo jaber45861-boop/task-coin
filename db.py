@@ -38,9 +38,15 @@ def init_db(db_path: str | None = None) -> None:
                 channel_id INTEGER NOT NULL UNIQUE,
                 username TEXT NOT NULL,
                 title TEXT NOT NULL,
-                required INTEGER NOT NULL DEFAULT 1
+                required INTEGER NOT NULL DEFAULT 1,
+                chat_type TEXT NOT NULL DEFAULT 'channel'
             )
         """)
+        # Migration: add chat_type column if missing (pre-existing DBs)
+        try:
+            conn.execute("ALTER TABLE required_channels ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'channel'")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
         logger.info("Database initialized: %s", db_path)
     finally:
@@ -54,18 +60,19 @@ def load_channels(db_path: str | None = None) -> None:
     conn = get_connection(db_path)
     try:
         cursor = conn.execute(
-            "SELECT slug, channel_id, username, title, required FROM required_channels"
+            "SELECT slug, channel_id, username, title, required, chat_type FROM required_channels"
         )
         rows = cursor.fetchall()
         
         CHANNELS.clear()
-        for slug, channel_id, username, title, required in rows:
+        for slug, channel_id, username, title, required, chat_type in rows:
             CHANNELS[slug] = Channel(
                 slug=slug,
                 channel_id=channel_id,
                 username=username,
                 title=title,
                 required=bool(required),
+                chat_type=chat_type if chat_type else "channel",
             )
         
         logger.info("Loaded %d channels from database", len(rows))
@@ -81,10 +88,10 @@ def save_channel(channel: Channel, db_path: str | None = None) -> None:
     try:
         conn.execute(
             """INSERT OR REPLACE INTO required_channels 
-               (slug, channel_id, username, title, required)
-               VALUES (?, ?, ?, ?, ?)""",
+               (slug, channel_id, username, title, required, chat_type)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (channel.slug, channel.channel_id, channel.username, 
-             channel.title, int(channel.required))
+             channel.title, int(channel.required), channel.chat_type)
         )
         conn.commit()
         logger.info("Channel saved to DB: %s", channel.slug)
@@ -112,17 +119,15 @@ def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Chann
     conn = get_connection(db_path)
     try:
         cursor = conn.execute(
-            "SELECT slug, channel_id, username, title, required FROM required_channels WHERE slug = ?",
+            "SELECT slug, channel_id, username, title, required, chat_type FROM required_channels WHERE slug = ?",
             (slug,)
         )
         row = cursor.fetchone()
         if row:
             return Channel(
-                slug=row[0],
-                channel_id=row[1],
-                username=row[2],
-                title=row[3],
-                required=bool(row[4]),
+                slug=row[0], channel_id=row[1], username=row[2],
+                title=row[3], required=bool(row[4]),
+                chat_type=row[5] if row[5] else "channel",
             )
         return None
     finally:

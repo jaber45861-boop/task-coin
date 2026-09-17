@@ -272,6 +272,89 @@ class TestAddchannelUsername(unittest.IsolatedAsyncioTestCase):
         reply = update.message.reply_text.call_args[0][0]
         self.assertIn("تعذر الوصول", reply)
 
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_supergroup_accepted(self, _mock: MagicMock) -> None:
+        """Supergroup type is accepted like a channel."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="@mygroup")
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100777)
+        self.assertEqual(ctx.user_data["addchannel_username"], "mygroup")
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_supergroup_bot_not_admin_rejected(self, _mock: MagicMock) -> None:
+        """Supergroup where bot is not admin is rejected."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100666
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="member"),
+        )
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="@notmygroup")
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ليس مشرفًا", reply)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_supergroup_stores_chat_type(self, _mock: MagicMock) -> None:
+        """Supergroup stores chat_type='supergroup' for later use."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100555
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="@mygroup")
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_channel_stores_chat_type(self, _mock: MagicMock) -> None:
+        """Channel stores chat_type='channel' for later use."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100444
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="@mychannel")
+        ctx = _make_context(bot)
+
+        result = await addchannel_username(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "channel")
+
 
 # ── Tests: addchannel_title ───────────────────────────────────────────
 
@@ -345,6 +428,41 @@ class TestAddchannelTitle(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(retrieved)
         self.assertEqual(retrieved.channel_id, -100666)
         self.assertEqual(retrieved.title, "Persist Test")
+
+    async def test_supergroup_chat_type_persisted(self) -> None:
+        """Supergroup chat_type is persisted to SQLite."""
+        import db
+
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="My Group")
+        ctx = _make_context()
+        ctx.user_data["addchannel_channel_id"] = -100555
+        ctx.user_data["addchannel_username"] = "mygroup"
+        ctx.user_data["addchannel_chat_type"] = "supergroup"
+
+        await addchannel_title(update, ctx)
+
+        self.assertIn("mygroup", CHANNELS)
+        ch = CHANNELS["mygroup"]
+        self.assertEqual(ch.chat_type, "supergroup")
+
+        # Verify persisted to SQLite
+        retrieved = db.get_channel_from_db("mygroup", self.test_db_path)
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.chat_type, "supergroup")
+
+    async def test_channel_chat_type_default(self) -> None:
+        """When chat_type is not set, defaults to 'channel'."""
+        update = _make_update(user_id=_TEST_ADMIN_ID, text="Default Type")
+        ctx = _make_context()
+        ctx.user_data["addchannel_channel_id"] = -100333
+        ctx.user_data["addchannel_username"] = "defaultch"
+        # No addchannel_chat_type set — should default to 'channel'
+
+        await addchannel_title(update, ctx)
+
+        self.assertIn("defaultch", CHANNELS)
+        ch = CHANNELS["defaultch"]
+        self.assertEqual(ch.chat_type, "channel")
 
 
 # ── Tests: addchannel_cancel ──────────────────────────────────────────

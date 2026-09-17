@@ -247,6 +247,85 @@ class TestSQLitePersistence(unittest.TestCase):
         self.assertEqual(CHANNELS["replace_test"].username, "replace2")
         self.assertFalse(CHANNELS["replace_test"].required)
 
+    def test_supergroup_chat_type_persisted(self):
+        """Supergroup chat_type is persisted and loaded correctly."""
+        db.init_db(self.test_db_path)
+
+        channel = Channel(
+            slug="sg_test",
+            channel_id=-100888,
+            username="sg_test_group",
+            title="Supergroup Test",
+            required=True,
+            chat_type="supergroup",
+        )
+        db.save_channel(channel, self.test_db_path)
+
+        retrieved = db.get_channel_from_db("sg_test", self.test_db_path)
+
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.chat_type, "supergroup")
+
+    def test_channel_chat_type_persisted(self):
+        """Channel chat_type is persisted and loaded correctly."""
+        db.init_db(self.test_db_path)
+
+        channel = Channel(
+            slug="ch_test",
+            channel_id=-100999,
+            username="ch_test_channel",
+            title="Channel Test",
+            required=True,
+            chat_type="channel",
+        )
+        db.save_channel(channel, self.test_db_path)
+
+        retrieved = db.get_channel_from_db("ch_test", self.test_db_path)
+
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.chat_type, "channel")
+
+    def test_load_channels_restores_chat_type(self):
+        """load_channels restores chat_type for both types."""
+        db.init_db(self.test_db_path)
+
+        ch1 = Channel(
+            slug="ch_sg", channel_id=-100111,
+            username="ch_sg", title="SG", required=True,
+            chat_type="supergroup",
+        )
+        ch2 = Channel(
+            slug="ch_ch", channel_id=-200222,
+            username="ch_ch", title="CH", required=True,
+            chat_type="channel",
+        )
+        db.save_channel(ch1, self.test_db_path)
+        db.save_channel(ch2, self.test_db_path)
+
+        db.load_channels(self.test_db_path)
+
+        self.assertEqual(CHANNELS["ch_sg"].chat_type, "supergroup")
+        self.assertEqual(CHANNELS["ch_ch"].chat_type, "channel")
+
+    def test_default_chat_type_when_missing(self):
+        """Existing DB rows without chat_type get 'channel' default."""
+        db.init_db(self.test_db_path)
+
+        # Manually insert a row without chat_type (simulating old DB)
+        conn = sqlite3.connect(self.test_db_path)
+        conn.execute(
+            "INSERT INTO required_channels (slug, channel_id, username, title, required) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old_row", -300333, "oldch", "Old", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        db.load_channels(self.test_db_path)
+
+        self.assertIn("old_row", CHANNELS)
+        self.assertEqual(CHANNELS["old_row"].chat_type, "channel")
+
 
 class TestBotSQLiteIntegration(unittest.TestCase):
     """Integration tests for bot.py with SQLite persistence."""

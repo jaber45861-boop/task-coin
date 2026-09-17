@@ -43,7 +43,7 @@ def is_admin(user_id: int) -> bool:
 class Channel:
     """Represents a mandatory subscription channel."""
 
-    __slots__ = ("slug", "channel_id", "username", "title", "required")
+    __slots__ = ("slug", "channel_id", "username", "title", "required", "chat_type")
 
     def __init__(
         self,
@@ -52,15 +52,17 @@ class Channel:
         username: str,
         title: str,
         required: bool = True,
+        chat_type: str = "channel",
     ) -> None:
         self.slug = slug
         self.channel_id = channel_id
         self.username = username
         self.title = title
         self.required = required
+        self.chat_type = chat_type
 
     def __repr__(self) -> str:
-        return f"Channel(slug={self.slug!r}, channel_id={self.channel_id}, username={self.username!r})"
+        return f"Channel(slug={self.slug!r}, channel_id={self.channel_id}, username={self.username!r}, chat_type={self.chat_type!r})"
 
 
 # ── Dynamic Channel Storage ──────────────────────────────────────────
