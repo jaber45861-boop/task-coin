@@ -40,6 +40,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ANTI_BOT = 0
+ANTI_BOT_BLOCKED = 1
+
+MAX_ANTI_BOT_ATTEMPTS = 3
 
 # States for the interactive /addchannel conversation
 ADDCHANNEL_USERNAME = 20
@@ -50,45 +53,90 @@ REMOVECHANNEL_SELECT = 30
 REMOVECHANNEL_CONFIRM = 31
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Send a simple math question as anti-bot step."""
+async def _send_math_question(message) -> tuple[str, int]:
+    """Generate a math question and return (question_text, answer)."""
     a = random.randint(1, 20)
     b = random.randint(1, 20)
     op = random.choice(["+", "-"])
 
-    # For subtraction, ensure non-negative result
     if op == "-" and a < b:
         a, b = b, a
 
     correct = a + b if op == "+" else a - b
-    context.user_data["anti_bot_answer"] = correct
+    return f"🔒 للتحقق أنك لست بوت:\n\nما ناتج: {a} {op} {b}؟", correct
 
-    await update.message.reply_text(
-        f"🔒 للتحقق أنك لست بوت:\n\nما ناتج: {a} {op} {b}؟"
-    )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send a simple math question as anti-bot step."""
+    question, correct = await _send_math_question(update.message)
+    context.user_data["anti_bot_answer"] = correct
+    context.user_data["anti_bot_attempts"] = 0
+
+    await update.message.reply_text(question)
     return ANTI_BOT
 
 
+async def _blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle messages from users who exhausted their anti-bot attempts."""
+    await update.message.reply_text(
+        "🚫 لقد تجاوزت الحد الأقصى للمحاولات. "
+        "أرسل /start للبدء من جديد."
+    )
+    return ANTI_BOT_BLOCKED
+
+
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Check the user's answer, then verify channel subscriptions."""
+    """Check the user's answer with up to 3 attempts."""
     expected = context.user_data.get("anti_bot_answer")
+    attempts = context.user_data.get("anti_bot_attempts", 0)
     text = update.message.text.strip()
 
     try:
         user_answer = int(text)
     except ValueError:
+        attempts += 1
+        context.user_data["anti_bot_attempts"] = attempts
+        if attempts >= MAX_ANTI_BOT_ATTEMPTS:
+            context.user_data.pop("anti_bot_answer", None)
+            context.user_data.pop("anti_bot_attempts", None)
+            await update.message.reply_text(
+                "🚫 لقد تجاوزت الحد الأقصى للمحاولات. "
+                "أرسل /start للبدء من جديد."
+            )
+            return ANTI_BOT_BLOCKED
+        question, new_correct = await _send_math_question(update.message)
+        context.user_data["anti_bot_answer"] = new_correct
+        remaining = MAX_ANTI_BOT_ATTEMPTS - attempts
         await update.message.reply_text(
-            "❌ إجابة غير صحيحة. حاول مرة أخرى."
+            "❌ إجابة غير صحيحة. "
+            f"متبقي {remaining} محاولة."
         )
-        context.user_data.pop("anti_bot_answer", None)
-        return ConversationHandler.END
+        await update.message.reply_text(question)
+        return ANTI_BOT
 
     if user_answer != expected:
-        await update.message.reply_text("❌ إجابة غير صحيحة.")
-        context.user_data.pop("anti_bot_answer", None)
-        return ConversationHandler.END
+        attempts += 1
+        context.user_data["anti_bot_attempts"] = attempts
+        if attempts >= MAX_ANTI_BOT_ATTEMPTS:
+            context.user_data.pop("anti_bot_answer", None)
+            context.user_data.pop("anti_bot_attempts", None)
+            await update.message.reply_text(
+                "🚫 لقد تجاوزت الحد الأقصى للمحاولات. "
+                "أرسل /start للبدء من جديد."
+            )
+            return ANTI_BOT_BLOCKED
+        question, new_correct = await _send_math_question(update.message)
+        context.user_data["anti_bot_answer"] = new_correct
+        remaining = MAX_ANTI_BOT_ATTEMPTS - attempts
+        await update.message.reply_text(
+            "❌ إجابة غير صحيحة. "
+            f"متبقي {remaining} محاولة."
+        )
+        await update.message.reply_text(question)
+        return ANTI_BOT
 
     # ── Anti-bot passed — check channel subscriptions ───────────────
+    context.user_data.pop("anti_bot_attempts", None)
     required = get_required_channels()
     if not required:
         await update.message.reply_text("✅ تحقق ناجح! أنت لست بوت.")
@@ -1027,6 +1075,9 @@ def main() -> None:
         states={
             ANTI_BOT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer),
+            ],
+            ANTI_BOT_BLOCKED: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _blocked),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

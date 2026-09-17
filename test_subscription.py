@@ -967,10 +967,10 @@ class TestConversationFlow(unittest.IsolatedAsyncioTestCase):
 
         result = await check_answer(update, ctx)
 
-        self.assertEqual(result, -1)
+        self.assertEqual(result, 0)  # ANTI_BOT — user stays in conversation for more attempts
         # get_chat_member should NOT have been called
         bot.get_chat_member.assert_not_called()
-        reply_text = update.message.reply_text.call_args[0][0]
+        reply_text = update.message.reply_text.call_args_list[0][0][0]
         self.assertIn("إجابة غير صحيحة", reply_text)
 
     async def test_correct_answer_produces_exactly_one_reply(self) -> None:
