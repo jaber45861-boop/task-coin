@@ -173,7 +173,7 @@ class TestAdminPanelButtons(unittest.IsolatedAsyncioTestCase):
 
         markup = update.message.reply_text.call_args[1]["reply_markup"]
         flat = [btn for row in markup.inline_keyboard for btn in row]
-        self.assertEqual(flat[0].text, "➕ إضافة قناة")
+        self.assertEqual(flat[0].text, "➕ إضافة قناة أو مجموعة")
         self.assertEqual(flat[0].callback_data, "admin_panel:add")
         self.assertEqual(flat[1].text, "🗑️ حذف قناة")
         self.assertEqual(flat[1].callback_data, "admin_panel:remove")
@@ -224,25 +224,23 @@ class TestUnauthorizedCallbacks(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_unauthorized_add_callback(self, _mock: MagicMock) -> None:
-        """Non-admin clicking add button is rejected."""
+        """Non-admin clicking add button is rejected by admin_panel_callback."""
         update = _make_callback(_NON_ADMIN_ID, "admin_panel:add")
         ctx = _make_context()
 
-        result = await addchannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ConversationHandler.END)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("للمشرفين فقط", text)
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_unauthorized_remove_callback(self, _mock: MagicMock) -> None:
-        """Non-admin clicking remove button is rejected."""
+        """Non-admin clicking remove button is rejected by admin_panel_callback."""
         update = _make_callback(_NON_ADMIN_ID, "admin_panel:remove")
         ctx = _make_context()
 
-        result = await removechannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ConversationHandler.END)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("للمشرفين فقط", text)
 
@@ -259,14 +257,14 @@ class TestAddButtonReachesWorkflow(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_add_button_enters_addchannel_flow(self, _mock: MagicMock) -> None:
-        """Clicking Add button starts the addchannel conversation."""
+        """Clicking Add button via admin_panel_callback starts the addchannel conversation."""
         update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
         ctx = _make_context()
 
-        result = await addchannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ADDCHANNEL_USERNAME)
-        update.callback_query.answer.assert_called_once()
+        # answer() called by admin_panel_callback, then again by addchannel_start
+        self.assertTrue(update.callback_query.answer.called)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Username", text)
 
@@ -278,14 +276,14 @@ class TestAddButtonReachesWorkflow(unittest.IsolatedAsyncioTestCase):
         ctx.user_data["addchannel_channel_id"] = -999
         ctx.user_data["addchannel_username"] = "stale"
 
-        await addchannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
         self.assertNotIn("addchannel_channel_id", ctx.user_data)
         self.assertNotIn("addchannel_username", ctx.user_data)
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_add_button_unsubscribed_non_admin(self, _mock: MagicMock) -> None:
-        """Non-admin with missing subscriptions gets lock from panel add."""
+        """Non-admin clicking add button is rejected by admin_panel_callback."""
         ch = Channel(
             slug="ch1", channel_id=-100111,
             username="ch1user", title="Ch1", required=True,
@@ -299,10 +297,11 @@ class TestAddButtonReachesWorkflow(unittest.IsolatedAsyncioTestCase):
         update = _make_callback(_NON_ADMIN_ID, "admin_panel:add")
         ctx = _make_context(bot)
 
-        result = await addchannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ConversationHandler.END)
-        self.assertTrue(is_locked(_NON_ADMIN_ID))
+        # admin_panel_callback rejects non-admins before routing to addchannel_start
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", text)
 
 
 # ── Tests: Delete button reaches existing delete workflow ─────────────
@@ -740,13 +739,12 @@ class TestPanelCallbackAdminVerification(unittest.IsolatedAsyncioTestCase):
     async def test_add_callback_independently_checks_admin(
         self, _mock: MagicMock
     ) -> None:
-        """Add callback checks admin independently."""
+        """Add callback checks admin independently via admin_panel_callback."""
         update = _make_callback(_NON_ADMIN_ID, "admin_panel:add")
         ctx = _make_context()
 
-        result = await addchannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ConversationHandler.END)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("للمشرفين فقط", text)
 
@@ -754,15 +752,66 @@ class TestPanelCallbackAdminVerification(unittest.IsolatedAsyncioTestCase):
     async def test_remove_callback_independently_checks_admin(
         self, _mock: MagicMock
     ) -> None:
-        """Remove callback checks admin independently."""
+        """Remove callback checks admin independently via admin_panel_callback."""
         update = _make_callback(_NON_ADMIN_ID, "admin_panel:remove")
         ctx = _make_context()
 
-        result = await removechannel_start(update, ctx)
+        await admin_panel_callback(update, ctx)
 
-        self.assertEqual(result, ConversationHandler.END)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("للمشرفين فقط", text)
+
+
+# ── Tests: admin_panel_callback routes add/remove correctly ──────────
+
+
+class TestAdminPanelCallbackRoutesAdd(unittest.IsolatedAsyncioTestCase):
+    """Test that admin_panel_callback properly routes the add callback."""
+
+    def setUp(self) -> None:
+        unlock_user(_TEST_ADMIN_ID)
+        CHANNELS.clear()
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_callback_reaches_addchannel_start(
+        self, _mock: MagicMock
+    ) -> None:
+        """admin_panel:add callback is routed to addchannel_start."""
+        update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context()
+
+        await admin_panel_callback(update, ctx)
+
+        # answer() called by admin_panel_callback, then again by addchannel_start
+        self.assertTrue(update.callback_query.answer.called)
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Username", text)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_button_returns_correct_state(
+        self, _mock: MagicMock
+    ) -> None:
+        """admin_panel:add returns ADDCHANNEL_USERNAME via addchannel_start."""
+        update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context()
+
+        result = await addchannel_start(update, ctx)
+
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_list_button_still_works_via_callback(
+        self, _mock: MagicMock
+    ) -> None:
+        """admin_panel:list still shows the channel list."""
+        _setup_channels([_CHANNEL_A])
+        update = _make_callback(_TEST_ADMIN_ID, "admin_panel:list")
+        ctx = _make_context()
+
+        await admin_panel_callback(update, ctx)
+
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Channel A", text)
 
 
 if __name__ == "__main__":

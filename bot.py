@@ -1013,7 +1013,7 @@ async def admin_command(
         return
 
     buttons = [
-        [InlineKeyboardButton("➕ إضافة قناة", callback_data="admin_panel:add")],
+        [InlineKeyboardButton("➕ إضافة قناة أو مجموعة", callback_data="admin_panel:add")],
         [InlineKeyboardButton("🗑️ حذف قناة", callback_data="admin_panel:remove")],
         [InlineKeyboardButton("📋 عرض القنوات", callback_data="admin_panel:list")],
     ]
@@ -1027,7 +1027,7 @@ async def admin_command(
 async def admin_panel_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle admin panel callback (list button)."""
+    """Handle admin panel callbacks (add, remove, list)."""
     query = update.callback_query
     await query.answer()
 
@@ -1038,7 +1038,13 @@ async def admin_panel_callback(
 
     action = query.data.split(":", 1)[1]
 
-    if action == "list":
+    if action == "add":
+        # Route to the interactive addchannel workflow.
+        await addchannel_start(update, context)
+    elif action == "remove":
+        # Route to the interactive removechannel workflow.
+        await removechannel_start(update, context)
+    elif action == "list":
         if not CHANNELS:
             await query.edit_message_text(
                 "📭 لا توجد قنوات اشتراك إجباري حالياً."
@@ -1125,9 +1131,6 @@ def main() -> None:
     addchannel_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addchannel", addchannel_start),
-            CallbackQueryHandler(
-                addchannel_start, pattern=r"^admin_panel:add$"
-            ),
         ],
         states={
             ADDCHANNEL_USERNAME: [
@@ -1150,9 +1153,6 @@ def main() -> None:
     removechannel_conv = ConversationHandler(
         entry_points=[
             CommandHandler("removechannel", removechannel_start),
-            CallbackQueryHandler(
-                removechannel_start, pattern=r"^admin_panel:remove$"
-            ),
         ],
         states={
             REMOVECHANNEL_SELECT: [
@@ -1186,10 +1186,10 @@ def main() -> None:
         verify_subscription, pattern="^verify_subscription$",
     ), group=4)
 
-    # 7. Admin panel: list callback + /admin command.
+    # 7. Admin panel: add/remove/list callbacks + /admin command.
     #    /admin is NOT added to the BotCommand menu.
     app.add_handler(CallbackQueryHandler(
-        admin_panel_callback, pattern=r"^admin_panel:list$",
+        admin_panel_callback, pattern=r"^admin_panel:(add|remove|list)$",
     ), group=5)
     app.add_handler(CommandHandler("admin", admin_command), group=5)
 
