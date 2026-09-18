@@ -69,6 +69,19 @@ def init_db(db_path: str | None = None) -> None:
             )
         """)
 
+        # ── Task definitions table ─────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                type TEXT NOT NULL,
+                reward INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
@@ -128,6 +141,125 @@ def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Chann
                 title=row["title"], required=bool(row["required"]), chat_type=row["chat_type"] if row["chat_type"] else "channel",
             )
         return None
+
+
+# ── Task Definitions ──────────────────────────────────────────────
+
+
+def create_task(title: str, description: str, task_type: str, reward: int, active: bool = True, db_path: str | None = None) -> int:
+    """Create a new task definition. Returns the new task ID."""
+    if not title or not title.strip():
+        raise ValueError("title cannot be empty")
+    if not description or not description.strip():
+        raise ValueError("description cannot be empty")
+    if not task_type or not task_type.strip():
+        raise ValueError("type cannot be empty")
+    if reward < 0:
+        raise ValueError("reward cannot be negative")
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (title, description, type, reward, active) VALUES (?, ?, ?, ?, ?)",
+            (title.strip(), description.strip(), task_type.strip(), reward, int(active))
+        )
+        task_id = cursor.lastrowid
+        logger.info("Task created: id=%d title=%s", task_id, title)
+        return task_id
+
+
+def get_task(task_id: int, db_path: str | None = None) -> dict | None:
+    """Get a task by ID."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, title, description, type, reward, active, created_at FROM tasks WHERE id = ?",
+            (task_id,)
+        ).fetchone()
+        if row:
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "description": row["description"],
+                "type": row["type"],
+                "reward": row["reward"],
+                "active": bool(row["active"]),
+                "created_at": row["created_at"],
+            }
+        return None
+
+
+def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[dict]:
+    """List all tasks, optionally filtering to active only."""
+    with get_connection(db_path) as conn:
+        if active_only:
+            cursor = conn.execute(
+                "SELECT id, title, description, type, reward, active, created_at FROM tasks WHERE active = 1"
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT id, title, description, type, reward, active, created_at FROM tasks"
+            )
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "description": row["description"],
+                "type": row["type"],
+                "reward": row["reward"],
+                "active": bool(row["active"]),
+                "created_at": row["created_at"],
+            }
+            for row in cursor.fetchall()
+        ]
+
+
+def update_task(task_id: int, title: str | None = None, description: str | None = None,
+                task_type: str | None = None, reward: int | None = None,
+                active: bool | None = None, db_path: str | None = None) -> bool:
+    """Update a task. Returns True if the task existed and was updated."""
+    if title is not None and (not title or not title.strip()):
+        raise ValueError("title cannot be empty")
+    if description is not None and (not description or not description.strip()):
+        raise ValueError("description cannot be empty")
+    if task_type is not None and (not task_type or not task_type.strip()):
+        raise ValueError("type cannot be empty")
+    if reward is not None and reward < 0:
+        raise ValueError("reward cannot be negative")
+
+    fields = []
+    values = []
+    if title is not None:
+        fields.append("title = ?")
+        values.append(title.strip())
+    if description is not None:
+        fields.append("description = ?")
+        values.append(description.strip())
+    if task_type is not None:
+        fields.append("type = ?")
+        values.append(task_type.strip())
+    if reward is not None:
+        fields.append("reward = ?")
+        values.append(reward)
+    if active is not None:
+        fields.append("active = ?")
+        values.append(int(active))
+
+    if not fields:
+        return False
+
+    values.append(task_id)
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?",
+            values
+        )
+        return cursor.rowcount > 0
+
+
+def delete_task(task_id: int, db_path: str | None = None) -> bool:
+    """Delete a task. Returns True if the task existed."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0
 
 
 # ── User & Referral Attribution ───────────────────────────────────

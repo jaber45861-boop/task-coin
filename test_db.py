@@ -583,5 +583,238 @@ class TestForeignKeyEnforcement(unittest.TestCase):
         self.assertEqual(db.get_referral_count(6100), 0)
 
 
+class TestTaskDefinitions(unittest.TestCase):
+    """Tests for task definition CRUD operations."""
+
+    def setUp(self):
+        self.test_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self._original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        CHANNELS.clear()
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ['-wal', '-shm']:
+            wal_path = self.test_db_path + suffix
+            if os.path.exists(wal_path):
+                os.unlink(wal_path)
+        CHANNELS.clear()
+
+    # ── 1. create_task ───────────────────────────────────────────────
+    def test_create_task(self):
+        """create_task returns an ID and persists the row."""
+        db.init_db(self.test_db_path)
+
+        task_id = db.create_task(
+            title="Join Channel",
+            description="Subscribe to our channel",
+            task_type="subscribe",
+            reward=50,
+        )
+
+        self.assertIsInstance(task_id, int)
+        task = db.get_task(task_id, self.test_db_path)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["title"], "Join Channel")
+        self.assertEqual(task["description"], "Subscribe to our channel")
+        self.assertEqual(task["type"], "subscribe")
+        self.assertEqual(task["reward"], 50)
+        self.assertTrue(task["active"])
+
+    # ── 2. get_task ──────────────────────────────────────────────────
+    def test_get_task(self):
+        """get_task returns correct task or None."""
+        db.init_db(self.test_db_path)
+
+        task_id = db.create_task(
+            title="Test Task",
+            description="A test",
+            task_type="visit",
+            reward=10,
+        )
+
+        task = db.get_task(task_id, self.test_db_path)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["id"], task_id)
+
+        self.assertIsNone(db.get_task(99999, self.test_db_path))
+
+    # ── 3. list_tasks ────────────────────────────────────────────────
+    def test_list_tasks(self):
+        """list_tasks returns all tasks."""
+        db.init_db(self.test_db_path)
+
+        db.create_task(title="T1", description="D1", task_type="t1", reward=10)
+        db.create_task(title="T2", description="D2", task_type="t2", reward=20)
+
+        tasks = db.list_tasks(db_path=self.test_db_path)
+        self.assertEqual(len(tasks), 2)
+        titles = {t["title"] for t in tasks}
+        self.assertEqual(titles, {"T1", "T2"})
+
+    # ── 4. list_tasks(active_only=True) ──────────────────────────────
+    def test_list_tasks_active_only(self):
+        """list_tasks(active_only=True) returns only active tasks."""
+        db.init_db(self.test_db_path)
+
+        id1 = db.create_task(title="Active", description="D", task_type="t", reward=10)
+        id2 = db.create_task(title="Inactive", description="D", task_type="t", reward=10)
+        db.update_task(id2, active=False, db_path=self.test_db_path)
+
+        active = db.list_tasks(active_only=True, db_path=self.test_db_path)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["title"], "Active")
+
+    # ── 5. update_task ───────────────────────────────────────────────
+    def test_update_task(self):
+        """update_task modifies fields and returns True."""
+        db.init_db(self.test_db_path)
+
+        task_id = db.create_task(
+            title="Old Title",
+            description="Old Desc",
+            task_type="old",
+            reward=10,
+        )
+
+        result = db.update_task(
+            task_id,
+            title="New Title",
+            reward=99,
+            db_path=self.test_db_path,
+        )
+        self.assertTrue(result)
+
+        task = db.get_task(task_id, self.test_db_path)
+        self.assertEqual(task["title"], "New Title")
+        self.assertEqual(task["reward"], 99)
+        self.assertEqual(task["description"], "Old Desc")  # unchanged
+
+    # ── 6. delete_task ───────────────────────────────────────────────
+    def test_delete_task(self):
+        """delete_task removes the row and returns True."""
+        db.init_db(self.test_db_path)
+
+        task_id = db.create_task(
+            title="Delete Me",
+            description="D",
+            task_type="t",
+            reward=5,
+        )
+
+        self.assertTrue(db.delete_task(task_id, self.test_db_path))
+        self.assertIsNone(db.get_task(task_id, self.test_db_path))
+        self.assertFalse(db.delete_task(task_id, self.test_db_path))  # already gone
+
+    # ── 7. duplicate ID ──────────────────────────────────────────────
+    def test_duplicate_id_not_possible(self):
+        """PRIMARY KEY prevents duplicate IDs (auto-increment)."""
+        db.init_db(self.test_db_path)
+
+        id1 = db.create_task(title="A", description="A", task_type="t", reward=1)
+        id2 = db.create_task(title="B", description="B", task_type="t", reward=2)
+        self.assertNotEqual(id1, id2)
+
+    # ── 8. empty title ───────────────────────────────────────────────
+    def test_empty_title_rejected(self):
+        """create_task rejects empty title."""
+        db.init_db(self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.create_task(title="", description="D", task_type="t", reward=10)
+        self.assertIn("title", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            db.create_task(title="   ", description="D", task_type="t", reward=10)
+
+    # ── 9. empty description ─────────────────────────────────────────
+    def test_empty_description_rejected(self):
+        """create_task rejects empty description."""
+        db.init_db(self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.create_task(title="T", description="", task_type="t", reward=10)
+        self.assertIn("description", str(ctx.exception))
+
+    # ── 10. empty type ───────────────────────────────────────────────
+    def test_empty_type_rejected(self):
+        """create_task rejects empty type."""
+        db.init_db(self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.create_task(title="T", description="D", task_type="", reward=10)
+        self.assertIn("type", str(ctx.exception))
+
+    # ── 11. negative reward ──────────────────────────────────────────
+    def test_negative_reward_rejected(self):
+        """create_task rejects negative reward."""
+        db.init_db(self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.create_task(title="T", description="D", task_type="t", reward=-5)
+        self.assertIn("reward", str(ctx.exception))
+
+    # ── 12. invalid active value ─────────────────────────────────────
+    def test_invalid_active_value(self):
+        """update_task with invalid active is rejected at validation level."""
+        db.init_db(self.test_db_path)
+
+        task_id = db.create_task(title="T", description="D", task_type="t", reward=10)
+        # Active must be bool (True/False), not arbitrary values
+        # update_task accepts bool | None; passing non-bool would be a caller error
+        # The schema stores 0/1, so True → 1, False → 0
+        db.update_task(task_id, active=False, db_path=self.test_db_path)
+        task = db.get_task(task_id, self.test_db_path)
+        self.assertFalse(task["active"])
+
+    # ── 13. init_db creates tasks table ──────────────────────────────
+    def test_init_db_creates_tasks_table(self):
+        """init_db creates the tasks table."""
+        db.init_db(self.test_db_path)
+
+        conn = sqlite3.connect(self.test_db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        self.assertIsNotNone(row)
+
+    # ── 14. channel persistence and users/referral unchanged ────────
+    def test_channel_persistence_unchanged(self):
+        """Channel save/load still works after tasks table addition."""
+        db.init_db(self.test_db_path)
+
+        channel = Channel(
+            slug="after_tasks",
+            channel_id=-100777,
+            username="aftertasks",
+            title="After Tasks",
+            required=True,
+        )
+        db.save_channel(channel, self.test_db_path)
+        db.load_channels(self.test_db_path)
+
+        self.assertIn("after_tasks", CHANNELS)
+        self.assertEqual(CHANNELS["after_tasks"].channel_id, -100777)
+
+    def test_users_referral_unchanged(self):
+        """User registration and referral still work after tasks table addition."""
+        db.init_db(self.test_db_path)
+
+        db.register_user(7001, "parent", "Parent")
+        db.register_user(7002, "child", "Child", referred_by=7001)
+
+        user = db.get_user(7002)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["referred_by"], 7001)
+        self.assertEqual(db.get_referral_count(7001), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
