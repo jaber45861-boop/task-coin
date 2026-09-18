@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.Python
 *.egg-info/
 dist/
 build/
@@ -14,6 +15,16 @@ venv/
 env/
 ENV/
 
+# Environment
+.env
+.env.local
+.env.production
+
+# Database
+task_coin.db
+task_coin.db-wal
+task_coin.db-shm
+
 # IDE
 .vscode/
 .idea/
@@ -24,11 +35,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-
-# Environment variables
-.env
-.env.local
-.env.production
 
 # Logs
 *.log
