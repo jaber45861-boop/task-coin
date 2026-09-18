@@ -331,12 +331,18 @@ def get_user_task(user_id: int, task_id: int, db_path: str | None = None) -> dic
 
 
 def update_user_task_status(user_id: int, task_id: int, new_status: str,
-                           db_path: str | None = None) -> bool:
+                           db_path: str | None = None,
+                           _allow_completion: bool = False) -> bool:
     """Update user_task status with transition validation.
 
     Allowed transitions:
-        available → started
-        started   → completed
+        available → started           (always allowed)
+        started   → completed         (only via CompletionGate)
+
+    The ``_allow_completion`` flag is an internal guard: only the
+    CompletionGate in ``task_completion.py`` passes ``True``.  Any
+    other caller attempting ``started → completed`` will get a
+    ``ValueError``.
 
     Returns True if updated, False if row not found.
     Raises ValueError for invalid status or illegal transition.
@@ -364,6 +370,11 @@ def update_user_task_status(user_id: int, task_id: int, new_status: str,
             raise ValueError(
                 f"cannot transition from '{current}' to '{new_status}'; "
                 f"only '{USER_TASK_STATUS_COMPLETED}' is allowed"
+            )
+        if current == USER_TASK_STATUS_STARTED and new_status == USER_TASK_STATUS_COMPLETED and not _allow_completion:
+            raise ValueError(
+                "started → completed is restricted to the CompletionGate; "
+                "pass _allow_completion=True from within task_completion.py"
             )
         if current == USER_TASK_STATUS_COMPLETED:
             raise ValueError(f"task already completed; no further transitions allowed")

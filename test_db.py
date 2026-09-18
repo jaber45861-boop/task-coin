@@ -908,13 +908,14 @@ class TestUserTaskState(unittest.TestCase):
 
     # ── 6. transition to completed ─────────────────────────────────
     def test_transition_to_completed(self):
-        """started → completed sets completed_at timestamp."""
+        """started → completed sets completed_at timestamp (via gate)."""
         db.create_user_task(1001, self.task_id, self.test_db_path)
         db.update_user_task_status(
             1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
         )
         db.update_user_task_status(
-            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED,
+            self.test_db_path, _allow_completion=True,
         )
 
         row = db.get_user_task(1001, self.task_id, self.test_db_path)
@@ -984,6 +985,19 @@ class TestUserTaskState(unittest.TestCase):
             )
         self.assertIn("started", str(ctx.exception))
 
+    def test_started_to_completed_rejected_without_gate(self):
+        """started → completed without _allow_completion raises ValueError."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            db.update_user_task_status(
+                1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+            )
+        self.assertIn("CompletionGate", str(ctx.exception))
+
     # ── 14. cannot restart after completed ─────────────────────────
     def test_cannot_restart_after_completed(self):
         """completed → started is not allowed."""
@@ -992,7 +1006,8 @@ class TestUserTaskState(unittest.TestCase):
             1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
         )
         db.update_user_task_status(
-            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED,
+            self.test_db_path, _allow_completion=True,
         )
 
         with self.assertRaises(ValueError) as ctx:
