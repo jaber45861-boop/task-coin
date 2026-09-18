@@ -441,8 +441,8 @@ class TestStartThenAnswerFlow(unittest.IsolatedAsyncioTestCase):
 
         await start(start_update, ctx)
 
-        # Wrong answer
-        wrong_update = _make_update(_TEST_USER_ID, "0")
+        # Wrong answer (-999 can never be the correct math result)
+        wrong_update = _make_update(_TEST_USER_ID, "-999")
         result = await check_answer(wrong_update, ctx)
         self.assertEqual(result, ANTI_BOT)
 

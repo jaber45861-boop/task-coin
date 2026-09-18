@@ -1057,10 +1057,7 @@ async def admin_panel_callback(
 
     action = query.data.split(":", 1)[1]
 
-    if action == "add":
-        # Route to the interactive addchannel workflow.
-        await addchannel_start(update, context)
-    elif action == "remove":
+    if action == "remove":
         # Route to the interactive removechannel workflow.
         await removechannel_start(update, context)
     elif action == "list":
@@ -1150,6 +1147,9 @@ def main() -> None:
     addchannel_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addchannel", addchannel_start),
+            CallbackQueryHandler(
+                addchannel_start, pattern="^admin_panel:add$"
+            ),
         ],
         states={
             ADDCHANNEL_USERNAME: [

@@ -25,6 +25,7 @@ from bot import (
     admin_command,
     admin_panel_callback,
     addchannel_start,
+    addchannel_username,
     removechannel_start,
     list_channels,
 )
@@ -257,13 +258,14 @@ class TestAddButtonReachesWorkflow(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
     async def test_add_button_enters_addchannel_flow(self, _mock: MagicMock) -> None:
-        """Clicking Add button via admin_panel_callback starts the addchannel conversation."""
+        """Clicking Add button routes to addchannel_start via ConversationHandler."""
+        # The ConversationHandler entry point calls addchannel_start directly.
         update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
         ctx = _make_context()
 
-        await admin_panel_callback(update, ctx)
+        result = await addchannel_start(update, ctx)
 
-        # answer() called by admin_panel_callback, then again by addchannel_start
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
         self.assertTrue(update.callback_query.answer.called)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Username", text)
@@ -276,7 +278,7 @@ class TestAddButtonReachesWorkflow(unittest.IsolatedAsyncioTestCase):
         ctx.user_data["addchannel_channel_id"] = -999
         ctx.user_data["addchannel_username"] = "stale"
 
-        await admin_panel_callback(update, ctx)
+        await addchannel_start(update, ctx)
 
         self.assertNotIn("addchannel_channel_id", ctx.user_data)
         self.assertNotIn("addchannel_username", ctx.user_data)
@@ -773,16 +775,18 @@ class TestAdminPanelCallbackRoutesAdd(unittest.IsolatedAsyncioTestCase):
         CHANNELS.clear()
 
     @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
-    async def test_add_callback_reaches_addchannel_start(
+    async def test_add_callback_enters_addchannel_conv(
         self, _mock: MagicMock
     ) -> None:
-        """admin_panel:add callback is routed to addchannel_start."""
+        """admin_panel:add callback enters addchannel_start via ConversationHandler entry point."""
         update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
         ctx = _make_context()
 
-        await admin_panel_callback(update, ctx)
+        result = await addchannel_start(update, ctx)
 
-        # answer() called by admin_panel_callback, then again by addchannel_start
+        # addchannel_start returns ADDCHANNEL_USERNAME, which the ConversationHandler
+        # uses to transition to the username-input state.
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
         self.assertTrue(update.callback_query.answer.called)
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Username", text)
@@ -812,6 +816,114 @@ class TestAdminPanelCallbackRoutesAdd(unittest.IsolatedAsyncioTestCase):
 
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Channel A", text)
+
+
+
+# ── Tests: Full flow admin_panel:add → username/link → addchannel_username ──
+
+
+class TestAdminPanelAddFullFlow(unittest.IsolatedAsyncioTestCase):
+    """Test the full flow: admin_panel:add callback → username/link input → addchannel_username.
+
+    This verifies that the ConversationHandler entry point for admin_panel:add
+    properly transitions through the addchannel conversation states.
+    """
+
+    def setUp(self) -> None:
+        unlock_user(_TEST_ADMIN_ID)
+        CHANNELS.clear()
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_then_at_username_advances(self, _mock: MagicMock) -> None:
+        """admin_panel:add → @username → advances to ADDCHANNEL_TITLE."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100999
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        # Step 1: admin_panel:add → addchannel_start returns ADDCHANNEL_USERNAME
+        start_update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context(bot)
+        result = await addchannel_start(start_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+
+        # Step 2: user sends @username → addchannel_username returns ADDCHANNEL_TITLE
+        msg_update = _make_update(_TEST_ADMIN_ID, text="@testchannel")
+        result = await addchannel_username(msg_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100999)
+        self.assertEqual(ctx.user_data["addchannel_username"], "testchannel")
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "channel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_then_tme_link_advances(self, _mock: MagicMock) -> None:
+        """admin_panel:add → t.me link → advances to ADDCHANNEL_TITLE."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100777
+        mock_chat.type = "supergroup"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        # Step 1: admin_panel:add → addchannel_start
+        start_update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context(bot)
+        result = await addchannel_start(start_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+
+        # Step 2: user sends t.me link → addchannel_username
+        msg_update = _make_update(_TEST_ADMIN_ID, text="https://t.me/mygroup")
+        result = await addchannel_username(msg_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100777)
+        self.assertEqual(ctx.user_data["addchannel_username"], "mygroup")
+        self.assertEqual(ctx.user_data["addchannel_chat_type"], "supergroup")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_then_bare_tme_link_advances(self, _mock: MagicMock) -> None:
+        """admin_panel:add → bare t.me/link → advances to ADDCHANNEL_TITLE."""
+        bot = MagicMock()
+        mock_chat = MagicMock()
+        mock_chat.id = -100666
+        mock_chat.type = "channel"
+        bot.get_chat = AsyncMock(return_value=mock_chat)
+        bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status="administrator"),
+        )
+
+        # Step 1: admin_panel:add
+        start_update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context(bot)
+        result = await addchannel_start(start_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+
+        # Step 2: user sends bare t.me link
+        msg_update = _make_update(_TEST_ADMIN_ID, text="t.me/testchannel")
+        result = await addchannel_username(msg_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_TITLE)
+        self.assertEqual(ctx.user_data["addchannel_channel_id"], -100666)
+        self.assertEqual(ctx.user_data["addchannel_username"], "testchannel")
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_add_then_invalid_rejected_stays(self, _mock: MagicMock) -> None:
+        """admin_panel:add → invalid input → stays in ADDCHANNEL_USERNAME."""
+        start_update = _make_callback(_TEST_ADMIN_ID, "admin_panel:add")
+        ctx = _make_context()
+        result = await addchannel_start(start_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+
+        # User sends invalid input
+        msg_update = _make_update(_TEST_ADMIN_ID, text="bad")
+        result = await addchannel_username(msg_update, ctx)
+        self.assertEqual(result, ADDCHANNEL_USERNAME)
+        reply = msg_update.message.reply_text.call_args[0][0]
+        self.assertIn("صيغة غير صحيحة", reply)
 
 
 if __name__ == "__main__":
