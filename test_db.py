@@ -463,5 +463,125 @@ class TestBotSQLiteIntegration(unittest.TestCase):
         self.assertIsNone(row)
 
 
+class TestForeignKeyEnforcement(unittest.TestCase):
+    """Tests for SQLite foreign-key enforcement consistency."""
+
+    def setUp(self):
+        self.test_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self._original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        CHANNELS.clear()
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ['-wal', '-shm']:
+            wal_path = self.test_db_path + suffix
+            if os.path.exists(wal_path):
+                os.unlink(wal_path)
+        CHANNELS.clear()
+
+    def test_get_connection_enables_foreign_keys(self):
+        """get_connection() sets PRAGMA foreign_keys=ON."""
+        with db.get_connection(self.test_db_path) as conn:
+            row = conn.execute("PRAGMA foreign_keys").fetchone()
+            self.assertEqual(row[0], 1)
+
+    def test_register_user_connection_has_foreign_keys(self):
+        """register_user() uses a connection with foreign_keys=ON."""
+        db.init_db(self.test_db_path)
+
+        # Patch get_connection to capture the pragma state
+        original_get_connection = db.get_connection
+        pragma_values = []
+
+        def spy_get_connection(db_path=None):
+            ctx = original_get_connection(db_path)
+            class SpyContext:
+                def __enter__(self_inner):
+                    conn = ctx.__enter__()
+                    row = conn.execute("PRAGMA foreign_keys").fetchone()
+                    pragma_values.append(row[0])
+                    return conn
+                def __exit__(self_inner, *args):
+                    return ctx.__exit__(*args)
+            return SpyContext()
+
+        db.get_connection = spy_get_connection
+        try:
+            db.register_user(1001, "fk_user", "FK User")
+            # register_user calls get_connection twice: once in get_user(), once in itself
+            self.assertTrue(all(v == 1 for v in pragma_values))
+            self.assertGreaterEqual(len(pragma_values), 2)
+        finally:
+            db.get_connection = original_get_connection
+
+    def test_foreign_key_enforcement_rejects_invalid_referral(self):
+        """INSERT with referred_by pointing to non-existent user is rejected."""
+        db.init_db(self.test_db_path)
+
+        # Directly insert with invalid FK reference
+        with db.get_connection(self.test_db_path) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO users (user_id, username, first_name, referred_by) "
+                    "VALUES (?, ?, ?, ?)",
+                    (2001, "orphan", "Orphan", 99999)
+                )
+
+    def test_foreign_key_enforcement_allows_valid_referral(self):
+        """INSERT with valid referred_by succeeds."""
+        db.init_db(self.test_db_path)
+
+        # Create referrer first
+        db.register_user(3001, "referrer", "Referrer")
+        # Create referred user
+        db.register_user(3002, "referred", "Referred", referred_by=3001)
+
+        user = db.get_user(3002)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["referred_by"], 3001)
+
+    def test_register_user_blocks_self_referral(self):
+        """register_user blocks self-referral (sets referred_by to None)."""
+        db.init_db(self.test_db_path)
+
+        db.register_user(4001, "self_ref", "Self", referred_by=4001)
+
+        user = db.get_user(4001)
+        self.assertIsNotNone(user)
+        self.assertIsNone(user["referred_by"])
+
+    def test_register_user_idempotent(self):
+        """Duplicate register_user calls are idempotent."""
+        db.init_db(self.test_db_path)
+
+        # Create referrer first (FK requires it to exist)
+        db.register_user(5002, "referrer", "Referrer")
+
+        result1 = db.register_user(5001, "dup", "Dup", referred_by=5002)
+        result2 = db.register_user(5001, "dup2", "Dup2", referred_by=5003)
+
+        self.assertTrue(result1)
+        self.assertFalse(result2)
+
+        user = db.get_user(5001)
+        self.assertEqual(user["referred_by"], 5002)  # first referrer wins
+
+    def test_referral_count_accuracy(self):
+        """get_referral_count returns correct count."""
+        db.init_db(self.test_db_path)
+
+        db.register_user(6001, "parent", "Parent")
+        for i in range(5):
+            db.register_user(6100 + i, f"child{i}", f"Child{i}", referred_by=6001)
+
+        self.assertEqual(db.get_referral_count(6001), 5)
+        self.assertEqual(db.get_referral_count(6100), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

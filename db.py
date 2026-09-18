@@ -39,12 +39,7 @@ def get_connection(db_path: str | None = None):
 
 def init_db(db_path: str | None = None) -> None:
     """Initialize all database tables (channels + users)."""
-    if db_path is None:
-        db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
+    with get_connection(db_path) as conn:
         # ── Required channels table ─────────────────────────────────
         conn.execute("""
             CREATE TABLE IF NOT EXISTS required_channels (
@@ -74,19 +69,12 @@ def init_db(db_path: str | None = None) -> None:
             )
         """)
 
-        conn.commit()
-        logger.info("Database initialized: %s", db_path)
-    finally:
-        conn.close()
+        logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
 def load_channels(db_path: str | None = None) -> None:
     """Load all required channels from SQLite into the in-memory CHANNELS dict."""
-    if db_path is None:
-        db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with get_connection(db_path) as conn:
         cursor = conn.execute(
             "SELECT slug, channel_id, username, title, required, chat_type FROM required_channels"
         )
@@ -104,16 +92,11 @@ def load_channels(db_path: str | None = None) -> None:
             )
 
         logger.info("Loaded %d channels from database", len(rows))
-    finally:
-        conn.close()
 
 
 def save_channel(channel: Channel, db_path: str | None = None) -> None:
     """Persist a channel to the SQLite database."""
-    if db_path is None:
-        db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
-    try:
+    with get_connection(db_path) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO required_channels 
                (slug, channel_id, username, title, required, chat_type)
@@ -121,32 +104,19 @@ def save_channel(channel: Channel, db_path: str | None = None) -> None:
             (channel.slug, channel.channel_id, channel.username,
              channel.title, int(channel.required), channel.chat_type)
         )
-        conn.commit()
         logger.info("Channel saved to DB: %s", channel.slug)
-    finally:
-        conn.close()
 
 
 def delete_channel(slug: str, db_path: str | None = None) -> None:
     """Remove a channel from the SQLite database."""
-    if db_path is None:
-        db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
-    try:
+    with get_connection(db_path) as conn:
         conn.execute("DELETE FROM required_channels WHERE slug = ?", (slug,))
-        conn.commit()
         logger.info("Channel deleted from DB: %s", slug)
-    finally:
-        conn.close()
 
 
 def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Channel]:
     """Retrieve a single channel from the database."""
-    if db_path is None:
-        db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with get_connection(db_path) as conn:
         cursor = conn.execute(
             "SELECT slug, channel_id, username, title, required, chat_type FROM required_channels WHERE slug = ?",
             (slug,)
@@ -155,12 +125,9 @@ def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Chann
         if row:
             return Channel(
                 slug=row["slug"], channel_id=row["channel_id"], username=row["username"],
-                title=row["title"], required=bool(row["required"]),
-                chat_type=row["chat_type"] if row["chat_type"] else "channel",
+                title=row["title"], required=bool(row["required"]), chat_type=row["chat_type"] if row["chat_type"] else "channel",
             )
         return None
-    finally:
-        conn.close()
 
 
 # ── User & Referral Attribution ───────────────────────────────────
@@ -186,18 +153,15 @@ def register_user(user_id: int, username: str | None, first_name: str | None, re
     if referred_by == user_id:
         referred_by = None
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            "INSERT INTO users (user_id, username, first_name, referred_by) VALUES (?, ?, ?, ?)",
-            (user_id, username, first_name, referred_by)
-        )
-        conn.commit()
-    except sqlite3.OperationalError:
-        # users table does not exist — silently ignore
-        logger.debug("users table missing, skipping register_user for %d", user_id)
-    finally:
-        conn.close()
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO users (user_id, username, first_name, referred_by) VALUES (?, ?, ?, ?)",
+                (user_id, username, first_name, referred_by)
+            )
+        except sqlite3.OperationalError:
+            # users table does not exist — silently ignore
+            logger.debug("users table missing, skipping register_user for %d", user_id)
 
     return True
 
@@ -205,9 +169,7 @@ def register_user(user_id: int, username: str | None, first_name: str | None, re
 def get_user(user_id: int) -> dict | None:
     """Get user by ID."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
+        with get_connection() as conn:
             row = conn.execute(
                 "SELECT user_id, username, first_name, referred_by, created_at FROM users WHERE user_id = ?",
                 (user_id,)
@@ -222,8 +184,6 @@ def get_user(user_id: int) -> dict | None:
                     "created_at": row["created_at"],
                 }
             return None
-        finally:
-            conn.close()
     except sqlite3.OperationalError:
         # users table does not exist — treat as no user found
         return None
@@ -239,13 +199,9 @@ def get_referrer(user_id: int) -> dict | None:
 
 def get_referral_count(user_id: int) -> int:
     """Get number of users referred by this user."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
+    with get_connection() as conn:
         row = conn.execute(
             "SELECT COUNT(*) as count FROM users WHERE referred_by = ?",
             (user_id,)
         ).fetchone()
         return row["count"]
-    finally:
-        conn.close()
