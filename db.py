@@ -15,6 +15,16 @@ from config import Channel, CHANNELS
 
 logger = logging.getLogger(__name__)
 
+# ── Allowed user_task statuses ─────────────────────────────────────
+USER_TASK_STATUS_AVAILABLE = "available"
+USER_TASK_STATUS_STARTED = "started"
+USER_TASK_STATUS_COMPLETED = "completed"
+ALLOWED_USER_TASK_STATUSES = {
+    USER_TASK_STATUS_AVAILABLE,
+    USER_TASK_STATUS_STARTED,
+    USER_TASK_STATUS_COMPLETED,
+}
+
 DB_PATH = os.environ.get("TASKCOIN_DB_PATH", "task_coin.db")
 
 
@@ -79,6 +89,20 @@ def init_db(db_path: str | None = None) -> None:
                 reward INTEGER NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ── User task state table ────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_tasks (
+                user_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available',
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                PRIMARY KEY (user_id, task_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (task_id) REFERENCES tasks(id)
             )
         """)
 
@@ -260,6 +284,124 @@ def delete_task(task_id: int, db_path: str | None = None) -> bool:
     with get_connection(db_path) as conn:
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cursor.rowcount > 0
+
+
+# ── User Task State ──────────────────────────────────────────────
+
+
+def create_user_task(user_id: int, task_id: int, db_path: str | None = None) -> bool:
+    """Create a user_task row with status 'available'.
+
+    Returns True on success.
+    Raises ValueError if user/task don't exist or status is invalid.
+    Raises sqlite3.IntegrityError on duplicate (user_id, task_id).
+    """
+    with get_connection(db_path) as conn:
+        # Validate user exists
+        if not conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone():
+            raise ValueError(f"user_id {user_id} does not exist")
+        # Validate task exists
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+            raise ValueError(f"task_id {task_id} does not exist")
+
+        conn.execute(
+            "INSERT INTO user_tasks (user_id, task_id, status) VALUES (?, ?, ?)",
+            (user_id, task_id, USER_TASK_STATUS_AVAILABLE)
+        )
+        return True
+
+
+def get_user_task(user_id: int, task_id: int, db_path: str | None = None) -> dict | None:
+    """Get a single user_task row."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT user_id, task_id, status, started_at, completed_at "
+            "FROM user_tasks WHERE user_id = ? AND task_id = ?",
+            (user_id, task_id)
+        ).fetchone()
+        if row:
+            return {
+                "user_id": row["user_id"],
+                "task_id": row["task_id"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+            }
+        return None
+
+
+def update_user_task_status(user_id: int, task_id: int, new_status: str,
+                           db_path: str | None = None) -> bool:
+    """Update user_task status with transition validation.
+
+    Allowed transitions:
+        available → started
+        started   → completed
+
+    Returns True if updated, False if row not found.
+    Raises ValueError for invalid status or illegal transition.
+    """
+    if new_status not in ALLOWED_USER_TASK_STATUSES:
+        raise ValueError(f"invalid status: {new_status}")
+
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM user_tasks WHERE user_id = ? AND task_id = ?",
+            (user_id, task_id)
+        ).fetchone()
+        if not row:
+            return False
+
+        current = row["status"]
+
+        # Validate transition
+        if current == USER_TASK_STATUS_AVAILABLE and new_status != USER_TASK_STATUS_STARTED:
+            raise ValueError(
+                f"cannot transition from '{current}' to '{new_status}'; "
+                f"must go to '{USER_TASK_STATUS_STARTED}' first"
+            )
+        if current == USER_TASK_STATUS_STARTED and new_status != USER_TASK_STATUS_COMPLETED:
+            raise ValueError(
+                f"cannot transition from '{current}' to '{new_status}'; "
+                f"only '{USER_TASK_STATUS_COMPLETED}' is allowed"
+            )
+        if current == USER_TASK_STATUS_COMPLETED:
+            raise ValueError(f"task already completed; no further transitions allowed")
+
+        # Set timestamps based on new status
+        if new_status == USER_TASK_STATUS_STARTED:
+            conn.execute(
+                "UPDATE user_tasks SET status = ?, started_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ? AND task_id = ?",
+                (new_status, user_id, task_id)
+            )
+        elif new_status == USER_TASK_STATUS_COMPLETED:
+            conn.execute(
+                "UPDATE user_tasks SET status = ?, completed_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ? AND task_id = ?",
+                (new_status, user_id, task_id)
+            )
+        return True
+
+
+def list_user_tasks(user_id: int, db_path: str | None = None) -> list[dict]:
+    """List all user_tasks for a given user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT user_id, task_id, status, started_at, completed_at "
+            "FROM user_tasks WHERE user_id = ?",
+            (user_id,)
+        )
+        return [
+            {
+                "user_id": row["user_id"],
+                "task_id": row["task_id"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+            }
+            for row in cursor.fetchall()
+        ]
 
 
 # ── User & Referral Attribution ───────────────────────────────────

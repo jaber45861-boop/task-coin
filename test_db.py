@@ -816,5 +816,232 @@ class TestTaskDefinitions(unittest.TestCase):
         self.assertEqual(db.get_referral_count(7001), 1)
 
 
+class TestUserTaskState(unittest.TestCase):
+    """Tests for user task state persistence."""
+
+    def setUp(self):
+        self.test_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self._original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        CHANNELS.clear()
+        # Initialize DB and create prerequisite user + task
+        db.init_db(self.test_db_path)
+        db.register_user(1001, "alice", "Alice")
+        self.task_id = db.create_task(
+            title="Join Channel",
+            description="Subscribe",
+            task_type="subscribe",
+            reward=50,
+            db_path=self.test_db_path,
+        )
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ['-wal', '-shm']:
+            wal_path = self.test_db_path + suffix
+            if os.path.exists(wal_path):
+                os.unlink(wal_path)
+        CHANNELS.clear()
+
+    # ── 1. create_user_task ────────────────────────────────────────
+    def test_create_user_task(self):
+        """create_user_task returns True and persists."""
+        result = db.create_user_task(1001, self.task_id, self.test_db_path)
+        self.assertTrue(result)
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["user_id"], 1001)
+        self.assertEqual(row["task_id"], self.task_id)
+
+    # ── 2. default status is available ─────────────────────────────
+    def test_default_status_is_available(self):
+        """New user_task has status 'available'."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertEqual(row["status"], db.USER_TASK_STATUS_AVAILABLE)
+
+    # ── 3. get_user_task ───────────────────────────────────────────
+    def test_get_user_task(self):
+        """get_user_task returns correct row or None."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["user_id"], 1001)
+
+        self.assertIsNone(db.get_user_task(1001, 99999, self.test_db_path))
+        self.assertIsNone(db.get_user_task(99999, self.task_id, self.test_db_path))
+
+    # ── 4. list_user_tasks ─────────────────────────────────────────
+    def test_list_user_tasks(self):
+        """list_user_tasks returns all tasks for a user."""
+        task2 = db.create_task(
+            title="Visit Site", description="Go to site",
+            task_type="visit", reward=10, db_path=self.test_db_path,
+        )
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        db.create_user_task(1001, task2, self.test_db_path)
+
+        tasks = db.list_user_tasks(1001, self.test_db_path)
+        self.assertEqual(len(tasks), 2)
+        ids = {t["task_id"] for t in tasks}
+        self.assertEqual(ids, {self.task_id, task2})
+
+    # ── 5. transition to started ───────────────────────────────────
+    def test_transition_to_started(self):
+        """available → started sets started_at timestamp."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+
+        result = db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+        self.assertTrue(result)
+
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertEqual(row["status"], db.USER_TASK_STATUS_STARTED)
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNone(row["completed_at"])
+
+    # ── 6. transition to completed ─────────────────────────────────
+    def test_transition_to_completed(self):
+        """started → completed sets completed_at timestamp."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+        )
+
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertEqual(row["status"], db.USER_TASK_STATUS_COMPLETED)
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNotNone(row["completed_at"])
+
+    # ── 7. duplicate user/task ─────────────────────────────────────
+    def test_duplicate_user_task_rejected(self):
+        """PRIMARY KEY prevents duplicate (user_id, task_id)."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.create_user_task(1001, self.task_id, self.test_db_path)
+
+    # ── 8. invalid user ────────────────────────────────────────────
+    def test_invalid_user_rejected(self):
+        """create_user_task rejects non-existent user."""
+        with self.assertRaises(ValueError) as ctx:
+            db.create_user_task(99999, self.task_id, self.test_db_path)
+        self.assertIn("99999", str(ctx.exception))
+
+    # ── 9. invalid task ────────────────────────────────────────────
+    def test_invalid_task_rejected(self):
+        """create_user_task rejects non-existent task."""
+        with self.assertRaises(ValueError) as ctx:
+            db.create_user_task(1001, 99999, self.test_db_path)
+        self.assertIn("99999", str(ctx.exception))
+
+    # ── 10. invalid status ─────────────────────────────────────────
+    def test_invalid_status_rejected(self):
+        """update_user_task_status rejects unknown status."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.update_user_task_status(
+                1001, self.task_id, "bogus", self.test_db_path
+            )
+        self.assertIn("bogus", str(ctx.exception))
+
+    # ── 11. foreign-key enforcement ────────────────────────────────
+    def test_fk_enforcement_user_tasks(self):
+        """Direct INSERT with bad FK is rejected."""
+        with self.assertRaises(sqlite3.IntegrityError):
+            with db.get_connection(self.test_db_path) as conn:
+                conn.execute(
+                    "INSERT INTO user_tasks (user_id, task_id, status) VALUES (?, ?, ?)",
+                    (99999, 99999, "available")
+                )
+
+    # ── 12. timestamps behavior ────────────────────────────────────
+    def test_timestamps_initially_none(self):
+        """started_at and completed_at are None when status is available."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertIsNone(row["started_at"])
+        self.assertIsNone(row["completed_at"])
+
+    # ── 13. cannot skip to completed ───────────────────────────────
+    def test_cannot_skip_to_completed(self):
+        """available → completed is not allowed."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            db.update_user_task_status(
+                1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+            )
+        self.assertIn("started", str(ctx.exception))
+
+    # ── 14. cannot restart after completed ─────────────────────────
+    def test_cannot_restart_after_completed(self):
+        """completed → started is not allowed."""
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            db.update_user_task_status(
+                1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+            )
+        self.assertIn("completed", str(ctx.exception))
+
+    # ── 15. list_user_tasks for unknown user returns empty ──────────
+    def test_list_user_tasks_empty(self):
+        """list_user_tasks returns [] for user with no tasks."""
+        self.assertEqual(db.list_user_tasks(99999, self.test_db_path), [])
+
+    # ── 16. update non-existent row returns False ──────────────────
+    def test_update_nonexistent_returns_false(self):
+        """update_user_task_status returns False if row doesn't exist."""
+        result = db.update_user_task_status(
+            99999, 99999, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+        self.assertFalse(result)
+
+    # ── 17. existing features unchanged ────────────────────────────
+    def test_channels_still_work(self):
+        """Channel persistence unaffected by user_tasks table."""
+        channel = Channel(
+            slug="ut_test", channel_id=-100555, username="utt",
+            title="UT Test", required=True,
+        )
+        db.save_channel(channel, self.test_db_path)
+        db.load_channels(self.test_db_path)
+        self.assertIn("ut_test", CHANNELS)
+
+    def test_tasks_crud_still_work(self):
+        """Task CRUD unaffected by user_tasks table."""
+        tid = db.create_task(
+            title="CRUD Test", description="D", task_type="t",
+            reward=5, db_path=self.test_db_path,
+        )
+        task = db.get_task(tid, self.test_db_path)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["title"], "CRUD Test")
+
+    def test_referral_still_works(self):
+        """Referral attribution unaffected by user_tasks table."""
+        db.register_user(8001, "p", "P")
+        db.register_user(8002, "c", "C", referred_by=8001)
+        user = db.get_user(8002)
+        self.assertEqual(user["referred_by"], 8001)
+
+
 if __name__ == "__main__":
     unittest.main()
