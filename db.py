@@ -88,9 +88,15 @@ def init_db(db_path: str | None = None) -> None:
                 type TEXT NOT NULL,
                 reward INTEGER NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
+                task_data TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migration: add task_data column if missing (pre-existing DBs)
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN task_data TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # ── User task state table ────────────────────────────────
         conn.execute("""
@@ -170,8 +176,14 @@ def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Chann
 # ── Task Definitions ──────────────────────────────────────────────
 
 
-def create_task(title: str, description: str, task_type: str, reward: int, active: bool = True, db_path: str | None = None) -> int:
-    """Create a new task definition. Returns the new task ID."""
+def create_task(title: str, description: str, task_type: str, reward: int,
+                active: bool = True, db_path: str | None = None,
+                task_data: str | None = None) -> int:
+    """Create a new task definition. Returns the new task ID.
+
+    Args:
+        task_data: Optional JSON string with task-specific verification data.
+    """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
     if not description or not description.strip():
@@ -183,8 +195,8 @@ def create_task(title: str, description: str, task_type: str, reward: int, activ
 
     with get_connection(db_path) as conn:
         cursor = conn.execute(
-            "INSERT INTO tasks (title, description, type, reward, active) VALUES (?, ?, ?, ?, ?)",
-            (title.strip(), description.strip(), task_type.strip(), reward, int(active))
+            "INSERT INTO tasks (title, description, type, reward, active, task_data) VALUES (?, ?, ?, ?, ?, ?)",
+            (title.strip(), description.strip(), task_type.strip(), reward, int(active), task_data)
         )
         task_id = cursor.lastrowid
         logger.info("Task created: id=%d title=%s", task_id, title)
@@ -195,7 +207,7 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
     """Get a task by ID."""
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT id, title, description, type, reward, active, created_at FROM tasks WHERE id = ?",
+            "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
         if row:
@@ -206,6 +218,7 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
                 "type": row["type"],
                 "reward": row["reward"],
                 "active": bool(row["active"]),
+                "task_data": row["task_data"],
                 "created_at": row["created_at"],
             }
         return None
@@ -216,11 +229,11 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
     with get_connection(db_path) as conn:
         if active_only:
             cursor = conn.execute(
-                "SELECT id, title, description, type, reward, active, created_at FROM tasks WHERE active = 1"
+                "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks WHERE active = 1"
             )
         else:
             cursor = conn.execute(
-                "SELECT id, title, description, type, reward, active, created_at FROM tasks"
+                "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks"
             )
         return [
             {
@@ -230,6 +243,7 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
                 "type": row["type"],
                 "reward": row["reward"],
                 "active": bool(row["active"]),
+                "task_data": row["task_data"],
                 "created_at": row["created_at"],
             }
             for row in cursor.fetchall()

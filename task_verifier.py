@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -119,6 +120,64 @@ def clear_verifiers() -> None:
     _verifier_registry.clear()
 
 
+# ── Deterministic Task Verifier ───────────────────────────────────
+
+
+class DeterministicTaskVerifier(TaskVerifier):
+    """Verifies a task by comparing an explicit expected value against
+    a supplied value in task_data.
+
+    Verification rule:
+        - task_data must contain both 'expected' and 'actual' keys.
+        - If both are present and ``actual == expected`` → PASSED.
+        - If both are present but differ → FAILED.
+        - If either key is missing or task_data is malformed → ERROR.
+
+    Security:
+        - Truthy/falsy shortcuts (True, 1, "yes", etc.) are NOT accepted.
+        - The comparison is exact (==), not truthiness-based.
+        - Extra unrelated keys do not bypass the check.
+    """
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        task_data = context.task_data
+
+        # 1. task_data must be a dict
+        if not isinstance(task_data, dict):
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                reason="task_data is not a dict",
+            )
+
+        # 2. Both 'expected' and 'actual' must be present
+        if "expected" not in task_data:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                reason="missing 'expected' in task_data",
+            )
+        if "actual" not in task_data:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                reason="missing 'actual' in task_data",
+            )
+
+        expected = task_data["expected"]
+        actual = task_data["actual"]
+
+        # 3. Exact comparison (no truthy/falsy shortcuts)
+        if actual == expected:
+            return VerificationResult(status=VerificationStatus.PASSED)
+        else:
+            return VerificationResult(
+                status=VerificationStatus.FAILED,
+                reason=f"expected {expected!r}, got {actual!r}",
+            )
+
+
+# Register the deterministic verifier
+register_verifier("deterministic", DeterministicTaskVerifier())
+
+
 # ── Main Entry Point ─────────────────────────────────────────────
 
 
@@ -164,6 +223,16 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
         )
 
     # 4. Build context and verify
+    # Parse task_data JSON if present, otherwise empty dict
+    raw_task_data = task.get("task_data")
+    parsed_task_data: dict[str, Any] = {}
+    if raw_task_data:
+        try:
+            parsed_task_data = json.loads(raw_task_data)
+        except (ValueError, TypeError):
+            parsed_task_data = {}
+
+    # Merge task metadata + task-type-specific data into context
     context = VerificationContext(
         user_id=user_id,
         task_id=task_id,
@@ -172,6 +241,7 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
             "title": task["title"],
             "description": task["description"],
             "reward": task["reward"],
+            **parsed_task_data,
         },
     )
 
