@@ -121,17 +121,76 @@ class TestDeterministicVerifierUnit(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.status, VerificationStatus.FAILED)
 
-    def test_one_matches_true_in_python(self):
-        """In Python, True == 1 because bool is a subclass of int.
-        This is expected Python behavior, not a bypass."""
+    # ── Type-strict comparison regression tests ──────────────
+    def test_true_vs_int_fails(self):
+        """True (bool) vs 1 (int) → FAILED (different types)."""
         ctx = VerificationContext(
             user_id=1, task_id=1, task_type="deterministic",
             task_data={"expected": True, "actual": 1},
         )
         result = self.verifier.verify(ctx)
-        # Python considers True == 1 as equal — exact match via ==
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_int_vs_true_fails(self):
+        """1 (int) vs True (bool) → FAILED (different types)."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": 1, "actual": True},
+        )
+        result = self.verifier.verify(ctx)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_false_vs_zero_fails(self):
+        """False (bool) vs 0 (int) → FAILED (different types)."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": False, "actual": 0},
+        )
+        result = self.verifier.verify(ctx)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_zero_vs_false_fails(self):
+        """0 (int) vs False (bool) → FAILED (different types)."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": 0, "actual": False},
+        )
+        result = self.verifier.verify(ctx)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_int_vs_float_fails(self):
+        """1 (int) vs 1.0 (float) → FAILED (different types)."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": 1, "actual": 1.0},
+        )
+        result = self.verifier.verify(ctx)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_same_type_equal_passes(self):
+        """Same type, same value → PASSED."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": 42, "actual": 42},
+        )
+        result = self.verifier.verify(ctx)
         self.assertTrue(result.passed)
         self.assertEqual(result.status, VerificationStatus.PASSED)
+
+    def test_same_type_unequal_fails(self):
+        """Same type, different value → FAILED."""
+        ctx = VerificationContext(
+            user_id=1, task_id=1, task_type="deterministic",
+            task_data={"expected": 42, "actual": 43},
+        )
+        result = self.verifier.verify(ctx)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, VerificationStatus.FAILED)
 
     # ── 3. Missing 'actual' → ERROR ───────────────────────────
     def test_missing_actual_error(self):

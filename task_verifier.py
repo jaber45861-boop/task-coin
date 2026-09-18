@@ -129,13 +129,13 @@ class DeterministicTaskVerifier(TaskVerifier):
 
     Verification rule:
         - task_data must contain both 'expected' and 'actual' keys.
-        - If both are present and ``actual == expected`` → PASSED.
-        - If both are present but differ → FAILED.
+        - If both are present, same type, and ``actual == expected`` → PASSED.
+        - If both are present but differ in value or type → FAILED.
         - If either key is missing or task_data is malformed → ERROR.
 
     Security:
         - Truthy/falsy shortcuts (True, 1, "yes", etc.) are NOT accepted.
-        - The comparison is exact (==), not truthiness-based.
+        - The comparison is type-strict (``type(a) is type(b) and a == b``).
         - Extra unrelated keys do not bypass the check.
     """
 
@@ -164,13 +164,14 @@ class DeterministicTaskVerifier(TaskVerifier):
         expected = task_data["expected"]
         actual = task_data["actual"]
 
-        # 3. Exact comparison (no truthy/falsy shortcuts)
-        if actual == expected:
+        # 3. Type-strict exact comparison (no truthy/falsy shortcuts)
+        if type(actual) is type(expected) and actual == expected:
             return VerificationResult(status=VerificationStatus.PASSED)
         else:
             return VerificationResult(
                 status=VerificationStatus.FAILED,
-                reason=f"expected {expected!r}, got {actual!r}",
+                reason=f"expected {expected!r} ({type(expected).__name__}), "
+                       f"got {actual!r} ({type(actual).__name__})",
             )
 
 
