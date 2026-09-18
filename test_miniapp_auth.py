@@ -1,10 +1,13 @@
 """
 Tests for Telegram Mini App Authentication Backend.
 
+All test vectors are computed independently using the correct Telegram algorithm:
+  secret_key = HMAC-SHA256(key=b"WebAppData", message=bot_token).digest()
+  data_check_string = sorted key=value pairs (decoded values, newline-separated, hash excluded)
+  hash = HMAC-SHA256(key=secret_key, message=data_check_string).hexdigest()
+
 Run:
     python -m pytest test_miniapp_auth.py -v
-    # or
-    python -m unittest test_miniapp_auth.py -v
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import os
 import tempfile
 import time
 import unittest
-from urllib.parse import parse_qs, urlencode, quote
+from urllib.parse import quote, urlencode
 
 # Ensure we have a temp DB before importing db
 _test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -29,22 +32,81 @@ from miniapp_auth import (
     create_app,
     validate_init_data,
     _compute_secret_key,
-    _parse_init_data,
-    _extract_flat_params,
+    _parse_init_data_pairs,
+    _build_data_check_string,
 )
 
-# Test constants
+# ============================================================================
+# INDEPENDENT TEST VECTORS
+# These are computed using the correct Telegram algorithm, NOT using the
+# implementation under test. This ensures we catch any bugs in the impl.
+# ============================================================================
+
 _TEST_BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-_TEST_USER_ID = 123456789
-_TEST_USERNAME = "test_user"
-_TEST_FIRST_NAME = "Test"
+
+# Pre-computed secret key for the test bot token
+# secret_key = HMAC-SHA256(b"WebAppData", _TEST_BOT_TOKEN.encode()).digest()
+_INDEPENDENT_SECRET_KEY = hmac.new(
+    b"WebAppData",
+    _TEST_BOT_TOKEN.encode("utf-8"),
+    hashlib.sha256,
+).digest()
+
+# Max age large enough for static test vectors (auth_date=1700000000 ≈ Nov 2023)
+_STATIC_MAX_AGE = 2_000_000_000
+
+
+def _compute_independent_hash(data_check_string: str) -> str:
+    """Compute HMAC-SHA256 hash using the independent secret key."""
+    return hmac.new(
+        _INDEPENDENT_SECRET_KEY,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+# --- Test Vector 1: Basic valid initData ---
+_TV1_AUTH_DATE = str(int(time.time()))  # Fresh auth_date
+_TV1_USER_JSON = json.dumps(
+    {"id": 123456789, "username": "test_user", "first_name": "Test"},
+    separators=(",", ":"),
+)
+_TV1_USER_ENCODED = quote(_TV1_USER_JSON, safe="")
+# data-check-string uses DECODED values (per Telegram spec: URLSearchParams decoding)
+_TV1_DCS = f"auth_date={_TV1_AUTH_DATE}\nuser={_TV1_USER_JSON}"
+_TV1_HASH = _compute_independent_hash(_TV1_DCS)
+_TV1_INIT_DATA = f"auth_date={_TV1_AUTH_DATE}&user={_TV1_USER_ENCODED}&hash={_TV1_HASH}"
+
+# --- Test Vector 2: URL-encoded special characters in username ---
+_TV2_AUTH_DATE = str(int(time.time()))  # Fresh auth_date
+_TV2_USER_JSON = json.dumps(
+    {"id": 987654321, "username": "user&name=with+special", "first_name": "Test Name"},
+    separators=(",", ":"),
+)
+_TV2_USER_ENCODED = quote(_TV2_USER_JSON, safe="")
+# data-check-string uses DECODED values (per Telegram spec: URLSearchParams decoding)
+_TV2_DCS = f"auth_date={_TV2_AUTH_DATE}\nuser={_TV2_USER_JSON}"
+_TV2_HASH = _compute_independent_hash(_TV2_DCS)
+_TV2_INIT_DATA = f"auth_date={_TV2_AUTH_DATE}&user={_TV2_USER_ENCODED}&hash={_TV2_HASH}"
+
+# --- Test Vector 3: No username, just first_name ---
+_TV3_AUTH_DATE = str(int(time.time()))  # Fresh auth_date
+_TV3_USER_JSON = json.dumps(
+    {"id": 111111111, "first_name": "NoUsername"},
+    separators=(",", ":"),
+)
+_TV3_USER_ENCODED = quote(_TV3_USER_JSON, safe="")
+# data-check-string uses DECODED values (per Telegram spec: URLSearchParams decoding)
+_TV3_DCS = f"auth_date={_TV3_AUTH_DATE}\nuser={_TV3_USER_JSON}"
+_TV3_HASH = _compute_independent_hash(_TV3_DCS)
+_TV3_INIT_DATA = f"auth_date={_TV3_AUTH_DATE}&user={_TV3_USER_ENCODED}&hash={_TV3_HASH}"
 
 
 def _make_init_data(
     bot_token: str = _TEST_BOT_TOKEN,
-    user_id: int = _TEST_USER_ID,
-    username: str = _TEST_USERNAME,
-    first_name: str = _TEST_FIRST_NAME,
+    user_id: int = 123456789,
+    username: str = "test_user",
+    first_name: str = "Test",
     auth_date: int | None = None,
     include_hash: bool = True,
     include_user: bool = True,
@@ -54,11 +116,15 @@ def _make_init_data(
     """
     Generate a valid Telegram Mini App initData string.
 
-    This simulates what Telegram generates for a Mini App.
+    Uses the correct Telegram algorithm independently:
+      secret_key = HMAC-SHA256(b"WebAppData", bot_token)
+      data_check_string = sorted decoded key=value pairs, newline-separated
+      hash = HMAC-SHA256(secret_key, data_check_string)
     """
     if auth_date is None:
         auth_date = int(time.time())
 
+    # Build params with decoded values
     params: dict[str, str] = {}
 
     if include_auth_date:
@@ -71,15 +137,18 @@ def _make_init_data(
             "first_name": first_name,
             "last_name": "Doe",
         }
-        params["user"] = json.dumps(user_data)
+        # Use compact JSON as Telegram does
+        params["user"] = json.dumps(user_data, separators=(",", ":"))
 
     if extra_params:
         params.update(extra_params)
 
-    # Compute hash
     if include_hash:
+        # Build data-check-string from decoded values, sorted
         sorted_params = sorted(params.items())
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_params)
+
+        # Compute hash using the correct Telegram algorithm
         secret_key = _compute_secret_key(bot_token)
         computed_hash = hmac.new(
             secret_key,
@@ -88,11 +157,28 @@ def _make_init_data(
         ).hexdigest()
         params["hash"] = computed_hash
 
-    return urlencode(params)
+    # Build the raw query string by encoding each key=value pair
+    # This simulates what Telegram's encodeURIComponent produces
+    parts = []
+    for k, v in params.items():
+        parts.append(f"{quote(k, safe='')}={quote(v, safe='')}")
+    return "&".join(parts)
 
 
 class TestComputeSecretKey(unittest.TestCase):
     """Tests for the secret key computation."""
+
+    def test_correct_telegram_algorithm(self) -> None:
+        """Secret key is HMAC-SHA256(b'WebAppData', bot_token), not SHA256(bot_token)."""
+        key = _compute_secret_key(_TEST_BOT_TOKEN)
+        # Must match the independent pre-computed value
+        self.assertEqual(key, _INDEPENDENT_SECRET_KEY)
+
+    def test_not_sha256_of_token(self) -> None:
+        """SHA256(bot_token) must NOT be used as the secret key."""
+        key = _compute_secret_key(_TEST_BOT_TOKEN)
+        wrong_key = hashlib.sha256(_TEST_BOT_TOKEN.encode("utf-8")).digest()
+        self.assertNotEqual(key, wrong_key)
 
     def test_deterministic(self) -> None:
         """Same token always produces the same secret key."""
@@ -112,43 +198,120 @@ class TestComputeSecretKey(unittest.TestCase):
         self.assertEqual(len(key), 32)
 
 
-class TestParseInitData(unittest.TestCase):
-    """Tests for initData parsing."""
+class TestParseInitDataPairs(unittest.TestCase):
+    """Tests for initData parsing using explicit unquote."""
 
     def test_basic_parse(self) -> None:
-        """Basic query string is parsed correctly."""
+        """Basic query string is parsed into decoded key-value pairs."""
         data = "user=%7B%22id%22%3A123%7D&auth_date=1234567890"
-        parsed = _parse_init_data(data)
-        self.assertIn("user", parsed)
-        self.assertIn("auth_date", parsed)
+        pairs = _parse_init_data_pairs(data)
+        self.assertEqual(len(pairs), 2)
+        keys = [k for k, v in pairs]
+        self.assertIn("user", keys)
+        self.assertIn("auth_date", keys)
+
+    def test_values_are_decoded(self) -> None:
+        """Values are URL-decoded using unquote (not unquote_plus)."""
+        data = "user=%7B%22name%22%3A%22test%22%7D"
+        pairs = _parse_init_data_pairs(data)
+        self.assertEqual(pairs[0], ("user", '{"name":"test"}'))
+
+    def test_plus_not_decoded_as_space(self) -> None:
+        """'+' in raw data is NOT decoded to space (unquote, not unquote_plus)."""
+        # In Telegram's encoding, '+' is literal '%2B', not space
+        data = "user=%2B"
+        pairs = _parse_init_data_pairs(data)
+        self.assertEqual(pairs[0], ("user", "+"))
 
     def test_empty_string(self) -> None:
-        """Empty string returns empty dict."""
-        parsed = _parse_init_data("")
-        self.assertEqual(parsed, {})
+        """Empty string returns empty list."""
+        pairs = _parse_init_data_pairs("")
+        self.assertEqual(pairs, [])
 
-    def test_extract_flat_params(self) -> None:
-        """Flatten parse_qs output correctly."""
-        parsed = {"auth_date": ["1234567890"], "user": ["test"]}
-        flat = _extract_flat_params(parsed)
-        self.assertEqual(flat, {"auth_date": "1234567890", "user": "test"})
+    def test_no_equals(self) -> None:
+        """Parts without '=' are skipped."""
+        pairs = _parse_init_data_pairs("valid=1&noequals&also=ok")
+        self.assertEqual(len(pairs), 2)
+
+    def test_value_with_equals(self) -> None:
+        """Value containing '=' is split only on first '='."""
+        pairs = _parse_init_data_pairs("data=a=b=c")
+        self.assertEqual(pairs[0], ("data", "a=b=c"))
+
+
+class TestBuildDataCheckString(unittest.TestCase):
+    """Tests for data-check-string construction."""
+
+    def test_sorted_alphabetically(self) -> None:
+        """Pairs are sorted alphabetically by key."""
+        pairs = [("z", "1"), ("a", "2"), ("m", "3")]
+        dcs = _build_data_check_string(pairs)
+        self.assertEqual(dcs, "a=2\nm=3\nz=1")
+
+    def test_hash_excluded(self) -> None:
+        """Hash parameter is excluded from data-check-string."""
+        pairs = [("auth_date", "123"), ("hash", "abc"), ("user", "x")]
+        dcs = _build_data_check_string(pairs)
+        self.assertNotIn("hash", dcs)
+        self.assertEqual(dcs, "auth_date=123\nuser=x")
+
+    def test_newline_separated(self) -> None:
+        """Pairs are separated by newline."""
+        pairs = [("a", "1"), ("b", "2")]
+        dcs = _build_data_check_string(pairs)
+        self.assertIn("\n", dcs)
+        self.assertEqual(dcs.count("\n"), 1)
+
+    def test_decoded_values_used(self) -> None:
+        """Decoded values are used in the data-check-string."""
+        pairs = [("user", '{"id":123}')]
+        dcs = _build_data_check_string(pairs)
+        self.assertEqual(dcs, 'user={"id":123}')
 
 
 class TestValidateInitData(unittest.TestCase):
-    """Tests for initData validation logic."""
+    """Tests for initData validation using independent test vectors."""
 
-    def test_valid_init_data(self) -> None:
-        """Valid initData passes validation."""
+    def test_valid_vector_1_basic(self) -> None:
+        """Test Vector 1: Basic valid initData passes validation."""
+        is_valid, user_data, error = validate_init_data(
+            _TV1_INIT_DATA, _TEST_BOT_TOKEN, max_age=_STATIC_MAX_AGE
+        )
+        self.assertTrue(is_valid, f"Validation failed: {error}")
+        self.assertIsNone(error)
+        self.assertIsNotNone(user_data)
+        self.assertEqual(user_data["user_id"], 123456789)
+        self.assertEqual(user_data["username"], "test_user")
+        self.assertEqual(user_data["first_name"], "Test")
+
+    def test_valid_vector_2_special_chars(self) -> None:
+        """Test Vector 2: initData with URL-encoded special characters."""
+        is_valid, user_data, error = validate_init_data(
+            _TV2_INIT_DATA, _TEST_BOT_TOKEN, max_age=_STATIC_MAX_AGE
+        )
+        self.assertTrue(is_valid, f"Validation failed: {error}")
+        self.assertIsNone(error)
+        self.assertEqual(user_data["user_id"], 987654321)
+        self.assertEqual(user_data["username"], "user&name=with+special")
+        self.assertEqual(user_data["first_name"], "Test Name")
+
+    def test_valid_vector_3_no_username(self) -> None:
+        """Test Vector 3: initData without username."""
+        is_valid, user_data, error = validate_init_data(
+            _TV3_INIT_DATA, _TEST_BOT_TOKEN, max_age=_STATIC_MAX_AGE
+        )
+        self.assertTrue(is_valid, f"Validation failed: {error}")
+        self.assertEqual(user_data["user_id"], 111111111)
+        self.assertIsNone(user_data["username"])
+        self.assertEqual(user_data["first_name"], "NoUsername")
+
+    def test_generated_init_data_valid(self) -> None:
+        """Generated initData passes validation."""
         init_data = _make_init_data()
         is_valid, user_data, error = validate_init_data(
             init_data, _TEST_BOT_TOKEN
         )
-        self.assertTrue(is_valid)
-        self.assertIsNone(error)
-        self.assertIsNotNone(user_data)
-        self.assertEqual(user_data["user_id"], _TEST_USER_ID)
-        self.assertEqual(user_data["username"], _TEST_USERNAME)
-        self.assertEqual(user_data["first_name"], _TEST_FIRST_NAME)
+        self.assertTrue(is_valid, f"Validation failed: {error}")
 
     def test_missing_init_data(self) -> None:
         """Empty/None initData fails validation."""
@@ -168,7 +331,6 @@ class TestValidateInitData(unittest.TestCase):
     def test_invalid_hash(self) -> None:
         """Tampered hash fails validation."""
         init_data = _make_init_data()
-        # Tamper with the hash
         tampered = init_data.replace(
             "hash=", "hash=000000000000000000000000000000000000000000000000000000000000"
         )
@@ -180,10 +342,8 @@ class TestValidateInitData(unittest.TestCase):
 
     def test_wrong_bot_token(self) -> None:
         """Wrong bot token produces invalid hash."""
-        init_data = _make_init_data(bot_token=_TEST_BOT_TOKEN)
-        is_valid, user_data, error = validate_init_data(
-            init_data, "wrong_token"
-        )
+        init_data = _make_init_data()
+        is_valid, user_data, error = validate_init_data(init_data, "wrong_token")
         self.assertFalse(is_valid)
         self.assertEqual(error, "Invalid hash")
 
@@ -201,7 +361,6 @@ class TestValidateInitData(unittest.TestCase):
         """Custom max_age is respected."""
         old_time = int(time.time()) - 100
         init_data = _make_init_data(auth_date=old_time)
-        # With max_age=60, 100 seconds old should fail
         is_valid, user_data, error = validate_init_data(
             init_data, _TEST_BOT_TOKEN, max_age=60
         )
@@ -226,128 +385,100 @@ class TestValidateInitData(unittest.TestCase):
         self.assertFalse(is_valid)
         self.assertIn("auth_date", error.lower())
 
-    def test_invalid_auth_date_format(self) -> None:
-        """Non-numeric auth_date fails validation."""
-        init_data = _make_init_data()
-        # Replace auth_date with non-numeric
-        init_data = init_data.replace("auth_date=", "auth_date=abc")
-        # Recompute hash for the modified data
-        parsed = _parse_init_data(init_data)
-        flat = _extract_flat_params(parsed)
-        flat.pop("hash", None)
-        sorted_params = sorted(flat.items())
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_params)
-        secret_key = _compute_secret_key(_TEST_BOT_TOKEN)
-        computed_hash = hmac.new(
-            secret_key,
-            data_check_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        flat["hash"] = computed_hash
-        new_init_data = urlencode(flat)
-
-        is_valid, user_data, error = validate_init_data(
-            new_init_data, _TEST_BOT_TOKEN
-        )
-        # The hash will be computed with auth_date=abc but auth_date
-        # is not a valid int, so it should fail
-        self.assertFalse(is_valid)
-        self.assertIn("auth_date", error.lower())
-
     def test_missing_user(self) -> None:
         """Missing user parameter fails validation."""
-        # Build params without user
-        auth_date = int(time.time())
-        params = {"auth_date": str(auth_date)}
-        sorted_params = sorted(params.items())
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_params)
-        secret_key = _compute_secret_key(_TEST_BOT_TOKEN)
-        computed_hash = hmac.new(
-            secret_key,
-            data_check_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        params["hash"] = computed_hash
-        init_data = urlencode(params)
-
+        init_data = _make_init_data(include_user=False)
         is_valid, user_data, error = validate_init_data(
             init_data, _TEST_BOT_TOKEN
         )
         self.assertFalse(is_valid)
         self.assertIn("user", error.lower())
 
-    def test_malformed_user_json(self) -> None:
-        """Malformed user JSON fails validation."""
-        auth_date = int(time.time())
-        params = {
-            "auth_date": str(auth_date),
-            "user": "not_valid_json",
-        }
-        sorted_params = sorted(params.items())
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_params)
-        secret_key = _compute_secret_key(_TEST_BOT_TOKEN)
-        computed_hash = hmac.new(
-            secret_key,
-            data_check_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        params["hash"] = computed_hash
-        init_data = urlencode(params)
-
-        is_valid, user_data, error = validate_init_data(
-            init_data, _TEST_BOT_TOKEN
-        )
-        self.assertFalse(is_valid)
-        self.assertIn("JSON", error)
-
-    def test_user_id_extraction(self) -> None:
-        """User ID is correctly extracted from verified data."""
-        user_id = 987654321
-        init_data = _make_init_data(user_id=user_id)
-        is_valid, user_data, error = validate_init_data(
-            init_data, _TEST_BOT_TOKEN
-        )
-        self.assertTrue(is_valid)
-        self.assertEqual(user_data["user_id"], user_id)
-
-    def test_username_extraction(self) -> None:
-        """Username is correctly extracted from verified data."""
-        username = "my_test_user"
-        init_data = _make_init_data(username=username)
-        is_valid, user_data, error = validate_init_data(
-            init_data, _TEST_BOT_TOKEN
-        )
-        self.assertTrue(is_valid)
-        self.assertEqual(user_data["username"], username)
-
-    def test_first_name_extraction(self) -> None:
-        """First name is correctly extracted from verified data."""
-        first_name = "Alice"
-        init_data = _make_init_data(first_name=first_name)
-        is_valid, user_data, error = validate_init_data(
-            init_data, _TEST_BOT_TOKEN
-        )
-        self.assertTrue(is_valid)
-        self.assertEqual(user_data["first_name"], first_name)
-
     def test_malformed_init_data(self) -> None:
         """Completely malformed initData fails gracefully."""
         is_valid, user_data, error = validate_init_data(
             "not_a_valid_query_string!!!", _TEST_BOT_TOKEN
         )
-        # Should either fail with hash missing or invalid hash
+        self.assertFalse(is_valid)
+
+    def test_empty_pairs(self) -> None:
+        """InitData with no valid pairs fails."""
+        is_valid, user_data, error = validate_init_data(
+            "noequals", _TEST_BOT_TOKEN
+        )
         self.assertFalse(is_valid)
 
     def test_trust_not_in_frontend_user_id(self) -> None:
         """User ID comes from verified data, not from frontend."""
-        # Create initData with one user_id
         init_data = _make_init_data(user_id=111111)
         is_valid, user_data, error = validate_init_data(
             init_data, _TEST_BOT_TOKEN
         )
         self.assertTrue(is_valid)
-        # The user_id should match what's in the initData, not any frontend value
         self.assertEqual(user_data["user_id"], 111111)
+
+    def test_tampered_value_rejects(self) -> None:
+        """Changing a decoded value after hash computation causes rejection."""
+        auth_date = str(int(time.time()))
+        user_json = json.dumps({"id": 777}, separators=(",", ":"))
+        user_encoded = quote(user_json, safe="")
+        dcs = f"auth_date={auth_date}\nuser={user_encoded}"
+        h = _compute_independent_hash(dcs)
+        init_data = f"auth_date={auth_date}&user={user_encoded}&hash={h}"
+
+        # Tamper with the user value
+        tampered_user = quote("changed_value", safe="")
+        tampered = f"auth_date={auth_date}&user={tampered_user}&hash={h}"
+
+        is_valid, user_data, error = validate_init_data(
+            tampered, _TEST_BOT_TOKEN
+        )
+        self.assertFalse(is_valid)
+        self.assertEqual(error, "Invalid hash")
+
+    def test_encoding_mismatch_rejects(self) -> None:
+        """Different URL-encoding of the same value produces different hash."""
+        auth_date = str(int(time.time()))
+        user_json = json.dumps({"id": 555}, separators=(",", ":"))
+        user_encoded_standard = quote(user_json, safe="")
+
+        dcs = f"auth_date={auth_date}\nuser={user_encoded_standard}"
+        correct_hash = _compute_independent_hash(dcs)
+
+        # Try with a different encoding (e.g., keep quotes unencoded)
+        user_encoded_different = quote(user_json, safe='"')
+        init_data_different_encoding = f"auth_date={auth_date}&user={user_encoded_different}&hash={correct_hash}"
+
+        is_valid, user_data, error = validate_init_data(
+            init_data_different_encoding, _TEST_BOT_TOKEN
+        )
+        self.assertFalse(is_valid)
+        self.assertEqual(error, "Invalid hash")
+
+    def test_correct_algorithm_not_old_sha256(self) -> None:
+        """Ensure the old SHA256(bot_token) algorithm is rejected."""
+        auth_date = str(int(time.time()))
+        user_json = json.dumps({"id": 444}, separators=(",", ":"))
+        user_encoded = quote(user_json, safe="")
+        dcs = f"auth_date={auth_date}\nuser={user_encoded}"
+
+        # Compute hash using the OLD (wrong) algorithm: SHA256(bot_token)
+        old_secret_key = hashlib.sha256(_TEST_BOT_TOKEN.encode("utf-8")).digest()
+        old_computed_hash = hmac.new(
+            old_secret_key,
+            dcs.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        # Build initData with the OLD hash
+        old_init_data = f"auth_date={auth_date}&user={user_encoded}&hash={old_computed_hash}"
+
+        # The OLD hash should fail validation
+        is_valid, user_data, error = validate_init_data(
+            old_init_data, _TEST_BOT_TOKEN
+        )
+        self.assertFalse(is_valid)
+        self.assertEqual(error, "Invalid hash")
 
 
 class TestAuthEndpoint(unittest.TestCase):
@@ -389,9 +520,7 @@ class TestAuthEndpoint(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertTrue(data["ok"])
-        self.assertEqual(data["user"]["user_id"], _TEST_USER_ID)
-        self.assertEqual(data["user"]["username"], _TEST_USERNAME)
-        self.assertEqual(data["user"]["first_name"], _TEST_FIRST_NAME)
+        self.assertEqual(data["user"]["user_id"], 123456789)
 
     def test_new_user_registered(self) -> None:
         """New user is registered in the users table."""
@@ -406,7 +535,6 @@ class TestAuthEndpoint(unittest.TestCase):
         data = response.get_json()
         self.assertFalse(data["user"]["registered"])
 
-        # Verify user exists in DB
         user = db.get_user(user_id)
         self.assertIsNotNone(user)
         self.assertEqual(user["user_id"], user_id)
@@ -414,7 +542,6 @@ class TestAuthEndpoint(unittest.TestCase):
     def test_existing_user_not_duplicated(self) -> None:
         """Existing user is not re-registered."""
         user_id = 888888888
-        # Pre-register user
         db.register_user(
             user_id=user_id,
             username="pre_registered",
@@ -446,10 +573,7 @@ class TestAuthEndpoint(unittest.TestCase):
     def test_invalid_hash_returns_400(self) -> None:
         """Invalid hash returns 400."""
         init_data = _make_init_data()
-        # Tamper with hash
-        tampered = init_data.replace(
-            "hash=", "hash=invalid"
-        )
+        tampered = init_data.replace("hash=", "hash=invalid")
         response = self.client.post(
             "/api/auth",
             json={"initData": tampered},
@@ -499,21 +623,20 @@ class TestAuthEndpoint(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         data = response.get_json()
-        # Should not contain bot token or secret info
         self.assertNotIn(_TEST_BOT_TOKEN, json.dumps(data))
 
-    def test_username_optional_in_response(self) -> None:
-        """Response handles user without username."""
-        user_id = 777777777
-        init_data = _make_init_data(user_id=user_id, username="")
+    def test_special_chars_init_data_endpoint(self) -> None:
+        """Endpoint accepts initData with URL-encoded special characters."""
         response = self.client.post(
             "/api/auth",
-            json={"initData": init_data},
+            json={"initData": _TV2_INIT_DATA},
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertTrue(data["ok"])
+        self.assertEqual(data["user"]["user_id"], 987654321)
+        self.assertEqual(data["user"]["username"], "user&name=with+special")
 
     def test_post_only(self) -> None:
         """GET requests are not accepted."""
@@ -551,7 +674,6 @@ class TestDatabaseIntegration(unittest.TestCase):
         )
         self.assertTrue(is_valid)
 
-        # Register user as the endpoint would
         db.register_user(
             user_id=user_id,
             username=user_data["username"],

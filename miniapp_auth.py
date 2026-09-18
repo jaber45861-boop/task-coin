@@ -9,7 +9,8 @@ Validation follows the official Telegram Bot API specification:
 https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
 Security checks:
-- HMAC-SHA256 hash verification using bot token as secret
+- HMAC-SHA256 secret key derivation: HMAC-SHA256(b"WebAppData", bot_token)
+- HMAC-SHA256 hash verification using the derived secret key
 - auth_date freshness check (configurable max age, default 24 hours)
 - No trust in frontend-sent user_id alone — identity extracted from verified data
 """
@@ -20,7 +21,7 @@ import json
 import logging
 import os
 import time
-from urllib.parse import parse_qs, unquote
+from urllib.parse import unquote
 
 from flask import Flask, jsonify, request
 
@@ -43,26 +44,58 @@ def _get_bot_token() -> str:
 
 
 def _compute_secret_key(bot_token: str) -> bytes:
-    """Compute the secret key: SHA256(bot_token)."""
-    return hashlib.sha256(bot_token.encode("utf-8")).digest()
-
-
-def _parse_init_data(init_data: str) -> dict[str, list[str]]:
     """
-    Parse Telegram Mini App initData query string.
+    Compute the secret key per Telegram Mini App specification.
 
-    The initData is a URL-encoded query string like:
-        user=%7B%22id%22%3A123...%7D&auth_date=1234567890&hash=abc...
+    secret_key = HMAC-SHA256(key=b"WebAppData", message=bot_token).digest()
 
-    Returns a dict of key -> list of values (from parse_qs).
+    This is NOT SHA256(bot_token). The official Telegram algorithm uses
+    HMAC-SHA256 with the fixed key "WebAppData" and the bot token as message.
     """
-    parsed = parse_qs(init_data, keep_blank_values=True)
-    return parsed
+    return hmac.new(
+        b"WebAppData",
+        bot_token.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
 
 
-def _extract_flat_params(parsed: dict[str, list[str]]) -> dict[str, str]:
-    """Flatten parse_qs output (take first value for each key)."""
-    return {k: v[0] for k, v in parsed.items()}
+def _parse_init_data_pairs(init_data: str) -> list[tuple[str, str]]:
+    """
+    Parse Telegram Mini App initData into key-value pairs.
+
+    Uses urllib.parse.unquote (not unquote_plus) to avoid converting
+    '+' to space, matching Telegram's percent-encoding behavior.
+
+    Telegram uses encodeURIComponent for values, which produces %20 for
+    spaces and never uses '+'. So we must NOT decode '+' as space.
+
+    Returns a list of (key, value) tuples with decoded values.
+    """
+    pairs: list[tuple[str, str]] = []
+    for part in init_data.split("&"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            pairs.append((unquote(key), unquote(value)))
+    return pairs
+
+
+def _build_data_check_string(
+    pairs: list[tuple[str, str]],
+    exclude_key: str = "hash",
+) -> str:
+    """
+    Build the data-check-string for Telegram hash verification.
+
+    Sorts pairs alphabetically by key, excludes the hash parameter,
+    and joins as key=value with newline separator.
+
+    The values used here are the decoded values from the raw initData,
+    matching what URLSearchParams produces in JavaScript (Telegram's
+    reference implementation).
+    """
+    filtered = [(k, v) for k, v in pairs if k != exclude_key]
+    filtered.sort(key=lambda x: x[0])
+    return "\n".join(f"{k}={v}" for k, v in filtered)
 
 
 def validate_init_data(
@@ -85,14 +118,20 @@ def validate_init_data(
         return False, None, "Missing initData"
 
     try:
-        parsed = _parse_init_data(init_data)
+        pairs = _parse_init_data_pairs(init_data)
     except Exception:
         return False, None, "Malformed initData"
 
-    flat = _extract_flat_params(parsed)
+    if not pairs:
+        return False, None, "Malformed initData"
 
-    # Extract and remove hash
-    provided_hash = flat.pop("hash", None)
+    # Build a flat dict for field access (last value wins on duplicates)
+    flat: dict[str, str] = {}
+    for k, v in pairs:
+        flat[k] = v
+
+    # Extract and verify hash
+    provided_hash = flat.get("hash")
     if not provided_hash:
         return False, None, "Missing hash parameter"
 
@@ -110,12 +149,10 @@ def validate_init_data(
     if current_time - auth_date > max_age:
         return False, None, "auth_date expired"
 
-    # Build the data-check-string
-    # Sort by key, join key=value with newlines
-    sorted_params = sorted(flat.items())
-    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_params)
+    # Build the data-check-string from decoded key=value pairs
+    data_check_string = _build_data_check_string(pairs)
 
-    # Compute HMAC-SHA256
+    # Compute HMAC-SHA256 using the correct Telegram secret key derivation
     secret_key = _compute_secret_key(bot_token)
     computed_hash = hmac.new(
         secret_key,
@@ -128,12 +165,12 @@ def validate_init_data(
         return False, None, "Invalid hash"
 
     # Extract user identity from the verified data
-    user_json = flat.get("user")
-    if not user_json:
+    user_json_str = flat.get("user")
+    if not user_json_str:
         return False, None, "Missing user parameter"
 
     try:
-        user_data = json.loads(unquote(user_json))
+        user_data = json.loads(user_json_str)
     except (json.JSONDecodeError, TypeError):
         return False, None, "Invalid user JSON"
 
