@@ -25,16 +25,138 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 import db
 from task_completion import VerificationResult, VerificationStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ── Immutable Containers ─────────────────────────────────────────
+
+
+class FrozenDict(Mapping):
+    """Hashable, immutable dict wrapper.
+
+    Prevents accidental mutation of verification data.
+    Supports dict-like read access but rejects all writes.
+    """
+
+    def __init__(self, source: dict[str, Any] | None = None):
+        self._data: dict[str, Any] = (
+            {k: freeze_value(v) for k, v in source.items()}
+            if source
+            else {}
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        return f"FrozenDict({self._data!r})"
+
+    def __eq__(self, other):
+        if isinstance(other, FrozenDict):
+            return self._data == other._data
+        if isinstance(other, dict):
+            return self._data == other
+        return NotImplemented
+
+    def __setitem__(self, key, value):
+        raise TypeError("FrozenDict does not support item assignment")
+
+    def __delitem__(self, key):
+        raise TypeError("FrozenDict does not support item deletion")
+
+    def __or__(self, other):
+        raise TypeError("FrozenDict does not support | operator")
+
+    def __ror__(self, other):
+        raise TypeError("FrozenDict does not support | operator")
+
+    def update(self, *args, **kwargs):
+        raise TypeError("FrozenDict does not support update()")
+
+
+class FrozenList:
+    """Immutable list wrapper.
+
+    Prevents accidental mutation of verification data.
+    """
+
+    def __init__(self, source: list | None = None):
+        self._data: list[Any] = copy.deepcopy(list(source)) if source else []
+
+    def __getitem__(self, index):
+        return self._data[index]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        return f"FrozenList({self._data!r})"
+
+    def __eq__(self, other):
+        if isinstance(other, FrozenList):
+            return self._data == other._data
+        if isinstance(other, list):
+            return self._data == other
+        return NotImplemented
+
+    def __setitem__(self, index, value):
+        raise TypeError("FrozenList does not support item assignment")
+
+    def __delitem__(self, index):
+        raise TypeError("FrozenList does not support item deletion")
+
+    def append(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support append()")
+
+    def extend(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support extend()")
+
+    def pop(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support pop()")
+
+    def insert(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support insert()")
+
+    def remove(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support remove()")
+
+    def clear(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support clear()")
+
+    def sort(self, *args, **kwargs):
+        raise TypeError("FrozenList does not support sort()")
+
+
+def freeze_value(value: Any) -> Any:
+    """Recursively freeze mutable containers in verification data.
+
+    Wraps dicts in FrozenDict and lists in FrozenList.
+    Other values pass through unchanged.
+    """
+    if isinstance(value, dict):
+        return FrozenDict({k: freeze_value(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return FrozenList([freeze_value(item) for item in value])
+    return value
 
 
 # ── Verification Context ──────────────────────────────────────────
@@ -47,17 +169,24 @@ class VerificationContext:
     Contains all information needed to verify a task completion.
     Verifiers receive this and return a VerificationResult.
 
+    All data containers (expected_data, actual_data, task_data) are
+    wrapped in FrozenDict to prevent accidental mutation.
+
     Attributes:
-        user_id:    Telegram user ID.
-        task_id:    Task definition ID.
-        task_type:  The task type string (e.g. "subscribe", "visit").
-        task_data:  Arbitrary task metadata from the tasks table.
+        user_id:       Telegram user ID.
+        task_id:       Task definition ID.
+        task_type:     The task type string (e.g. "subscribe", "visit").
+        expected_data: Task-defined expected verification data (frozen).
+        actual_data:   User/submission-provided actual data (frozen).
+        task_data:     Legacy combined data for backward compatibility (frozen).
     """
 
     user_id: int
     task_id: int
     task_type: str
-    task_data: dict[str, Any] = field(default_factory=dict)
+    expected_data: FrozenDict = field(default_factory=FrozenDict)
+    actual_data: FrozenDict = field(default_factory=FrozenDict)
+    task_data: FrozenDict = field(default_factory=FrozenDict)
 
 
 # ── Verifier Protocol ────────────────────────────────────────────
@@ -142,8 +271,8 @@ class DeterministicTaskVerifier(TaskVerifier):
     def verify(self, context: VerificationContext) -> VerificationResult:
         task_data = context.task_data
 
-        # 1. task_data must be a dict
-        if not isinstance(task_data, dict):
+        # 1. task_data must be a dict-like (FrozenDict or dict)
+        if not isinstance(task_data, (dict, FrozenDict)):
             return VerificationResult(
                 status=VerificationStatus.ERROR,
                 reason="task_data is not a dict",
@@ -188,7 +317,7 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
     This is the main entry point for verification. It:
     1. Validates user and task exist.
     2. Finds the registered verifier for the task type.
-    3. Builds a VerificationContext and calls the verifier.
+    3. Builds a VerificationContext with frozen data and calls the verifier.
     4. Returns the VerificationResult (does NOT call CompletionGate).
 
     Args:
@@ -223,8 +352,7 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
             reason=f"No verifier registered for task type '{task['type']}'",
         )
 
-    # 4. Build context and verify
-    # Parse task_data JSON if present, otherwise empty dict
+    # 4. Parse task_data JSON if present, otherwise empty dict
     raw_task_data = task.get("task_data")
     parsed_task_data: dict[str, Any] = {}
     if raw_task_data:
@@ -233,17 +361,27 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
         except (ValueError, TypeError):
             parsed_task_data = {}
 
-    # Merge task metadata + task-type-specific data into context
+    # 5. Separate expected vs actual data
+    #    expected_data comes from the task definition (admin-set)
+    #    actual_data comes from the user/submission
+    expected_data: dict[str, Any] = {}
+    actual_data: dict[str, Any] = {}
+
+    if "expected" in parsed_task_data:
+        expected_data["expected"] = parsed_task_data["expected"]
+    if "actual" in parsed_task_data:
+        actual_data["actual"] = parsed_task_data["actual"]
+
+    # 6. Build frozen context — only verification-relevant data
+    #    Do NOT include reward, active, created_at, title, description
+    #    unless explicitly required by the verifier contract.
     context = VerificationContext(
         user_id=user_id,
         task_id=task_id,
         task_type=task["type"],
-        task_data={
-            "title": task["title"],
-            "description": task["description"],
-            "reward": task["reward"],
-            **parsed_task_data,
-        },
+        expected_data=freeze_value(expected_data),
+        actual_data=freeze_value(actual_data),
+        task_data=freeze_value(parsed_task_data),
     )
 
     try:

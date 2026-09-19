@@ -106,6 +106,17 @@ class _StateSpyVerifier(TaskVerifier):
         return VerificationResult(status=VerificationStatus.PASSED)
 
 
+class _ContextCaptureVerifier(TaskVerifier):
+    """Captures the context for inspection in boundary tests."""
+
+    def __init__(self):
+        self.last_context: VerificationContext | None = None
+
+    def verify(self, context: VerificationContext) -> VerificationResult:
+        self.last_context = context
+        return VerificationResult(status=VerificationStatus.PASSED)
+
+
 # ── Tests ─────────────────────────────────────────────────────────
 
 
@@ -125,9 +136,10 @@ class TestVerificationContext(unittest.TestCase):
 
     def test_custom_task_data(self):
         """task_data can be passed explicitly."""
+        from task_verifier import FrozenDict
         ctx = VerificationContext(
             user_id=1, task_id=2, task_type="sub",
-            task_data={"title": "Join", "reward": 50},
+            task_data=FrozenDict({"title": "Join", "reward": 50}),
         )
         self.assertEqual(ctx.task_data["title"], "Join")
         self.assertEqual(ctx.task_data["reward"], 50)
@@ -242,7 +254,7 @@ class TestVerifyTask(unittest.TestCase):
     # ── 4. Required verification context ────────────────────────
     def test_context_receives_correct_fields(self):
         """Verifier receives user_id, task_id, task_type, and task_data."""
-        v = _PassVerifier()
+        v = _ContextCaptureVerifier()
         register_verifier("subscribe", v)
         verify_task(1001, self.task_id)
 
@@ -251,10 +263,16 @@ class TestVerifyTask(unittest.TestCase):
         self.assertEqual(ctx.user_id, 1001)
         self.assertEqual(ctx.task_id, self.task_id)
         self.assertEqual(ctx.task_type, "subscribe")
-        self.assertIn("title", ctx.task_data)
-        self.assertIn("description", ctx.task_data)
-        self.assertIn("reward", ctx.task_data)
-        self.assertEqual(ctx.task_data["reward"], 50)
+        # task_data contains only verification-relevant data, not metadata
+        # (title, description, reward are NOT in context)
+        self.assertNotIn("title", ctx.task_data)
+        self.assertNotIn("description", ctx.task_data)
+        self.assertNotIn("reward", ctx.task_data)
+        # expected_data and actual_data are FrozenDicts
+        from task_verifier import FrozenDict
+        self.assertIsInstance(ctx.expected_data, FrozenDict)
+        self.assertIsInstance(ctx.actual_data, FrozenDict)
+        self.assertIsInstance(ctx.task_data, FrozenDict)
 
     # ── 5. Verifier does not mutate task state ──────────────────
     def test_verifier_does_not_mutate_task_state(self):
