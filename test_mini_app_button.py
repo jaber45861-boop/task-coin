@@ -103,9 +103,8 @@ class TestSetupMenuButton(unittest.IsolatedAsyncioTestCase):
     """Tests that setup_menu_button configures the Telegram menu button correctly."""
 
     @patch.dict("os.environ", {"MINI_APP_URL": "https://mini.example.com"})
-    async def test_configures_menu_button_for_each_admin(self) -> None:
-        """set_chat_menu_button should be called for every admin."""
-        from config import ADMINS
+    async def test_set_chat_menu_button_called_exactly_once(self) -> None:
+        """set_chat_menu_button should be called exactly once (global, not per-admin)."""
         from bot import setup_menu_button
 
         mock_app = MagicMock()
@@ -114,7 +113,7 @@ class TestSetupMenuButton(unittest.IsolatedAsyncioTestCase):
 
         await setup_menu_button(mock_app)
 
-        self.assertEqual(mock_app.bot.set_chat_menu_button.call_count, len(ADMINS))
+        self.assertEqual(mock_app.bot.set_chat_menu_button.call_count, 1)
 
     @patch.dict("os.environ", {"MINI_APP_URL": "https://mini.example.com"})
     async def test_menu_button_text_is_open(self) -> None:
@@ -164,9 +163,8 @@ class TestSetupMenuButton(unittest.IsolatedAsyncioTestCase):
         mock_app.bot.set_chat_menu_button.assert_called()
 
     @patch.dict("os.environ", {"MINI_APP_URL": "https://mini.example.com"})
-    async def test_chat_id_matches_admin(self) -> None:
-        """Each set_chat_menu_button call should target an admin's chat_id."""
-        from config import ADMINS
+    async def test_no_chat_id_in_call(self) -> None:
+        """The global set_chat_menu_button call must NOT contain chat_id."""
         from bot import setup_menu_button
 
         mock_app = MagicMock()
@@ -175,12 +173,11 @@ class TestSetupMenuButton(unittest.IsolatedAsyncioTestCase):
 
         await setup_menu_button(mock_app)
 
-        called_ids = set()
-        for call in mock_app.bot.set_chat_menu_button.call_args_list:
-            chat_id = call.kwargs.get("chat_id") or call[1].get("chat_id")
-            called_ids.add(chat_id)
-        for admin_id in ADMINS:
-            self.assertIn(admin_id, called_ids)
+        call_args = mock_app.bot.set_chat_menu_button.call_args
+        # chat_id must not be in kwargs or positional args
+        self.assertNotIn("chat_id", call_args.kwargs)
+        # Positional args: first would be chat_id if provided; only menu_button should be passed
+        self.assertEqual(len(call_args.args), 0)
 
     @patch.dict("os.environ", {"MINI_APP_URL": "https://mini.example.com"})
     async def test_missing_url_raises(self) -> None:

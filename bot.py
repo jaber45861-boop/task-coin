@@ -1259,11 +1259,12 @@ def main() -> None:
 
 
 async def setup_menu_button(application: Application) -> None:
-    """Configure the official Telegram Menu Button (Web App) for each admin.
+    """Configure the official Telegram Menu Button (Web App) globally.
 
-    Uses Bot.set_chat_menu_button to set a MenuButtonWebApp with text "Open"
-    that opens the configured MINI_APP_URL.  Telegram places this button
-    natively in the composer area — no custom keyboard is created.
+    Uses Bot.set_chat_menu_button (without chat_id) to set a MenuButtonWebApp
+    with text "Open" that opens the configured MINI_APP_URL.  Telegram places
+    this button natively in the composer area for all bot users — no custom
+    keyboard is created.
     """
     mini_app_url = get_mini_app_url()
     menu_button = MenuButtonWebApp(
@@ -1271,16 +1272,10 @@ async def setup_menu_button(application: Application) -> None:
         web_app=WebAppInfo(url=mini_app_url),
     )
     bot = application.bot
-    for admin_id in ADMINS:
-        await bot.set_chat_menu_button(
-            chat_id=admin_id,
-            menu_button=menu_button,
-        )
-        logger.info(
-            "Set Mini App menu button for admin %d → %s",
-            admin_id,
-            mini_app_url,
-        )
+    await bot.set_chat_menu_button(
+        menu_button=menu_button,
+    )
+    logger.info("Set global Mini App menu button → %s", mini_app_url)
 
 
 if __name__ == "__main__":
