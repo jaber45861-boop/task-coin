@@ -4,34 +4,28 @@ Task Lifecycle Orchestrator
 Thin orchestration layer that coordinates the approved task lifecycle
 components.  Contains NO business rules of its own.
 
-    TaskStartGate → STARTED
-    TaskAttemptPolicy
-    TaskSubmissionService
-    VerificationContext → TaskVerifier → VerificationResult
-    CompletionBridge → CompletionGate → COMPLETED
+    TaskStartGate.start()
+        ↓
+    STARTED
+        ↓
+    CompletionBridge.complete_after_verification()
+        ↓
+    TaskAttemptPolicy → TaskSubmissionService → VerificationResult
+        ↓  (only if PASSED)
+    CompletionGate → COMPLETED
 
 Public API:
-    TaskLifecycle.start_task(user_id, task_id)
+    TaskLifecycle.start_task(user_id, task_id) -> StartResult
     TaskLifecycle.submit_task(user_id, task_id, actual_data) -> VerificationResult
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from task_components import (
-    CompletionBridge,
-    CompletionGate,
-    StartResult,
-    SubmitResult,
-    TaskAttemptPolicy,
-    TaskStartGate,
-    TaskSubmissionService,
-    TaskVerifier,
-    VerificationContext,
-    VerificationResult,
-)
+from task_start import TaskStartGate, StartResult, StartGateError
+from completion_bridge import CompletionBridge, CompletionBridgeError
+from task_completion import VerificationResult, VerificationStatus
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +43,8 @@ class TaskLifecycle:
         - swallow exceptions or silently retry
     """
 
-    def __init__(
-        self,
-        *,
-        start_gate: TaskStartGate | None = None,
-        attempt_policy: TaskAttemptPolicy | None = None,
-        submission_service: TaskSubmissionService | None = None,
-        verifier: TaskVerifier | None = None,
-        completion_bridge: CompletionBridge | None = None,
-        db_path: str | None = None,
-    ) -> None:
-        self._start_gate = start_gate or TaskStartGate(db_path=db_path)
-        self._attempt_policy = attempt_policy or TaskAttemptPolicy(db_path=db_path)
-        self._submission_service = submission_service or TaskSubmissionService(db_path=db_path)
-        self._verifier = verifier or TaskVerifier()
-        self._completion_bridge = completion_bridge or CompletionBridge(db_path=db_path)
+    def __init__(self) -> None:
+        self._start_gate = TaskStartGate()
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -71,6 +52,7 @@ class TaskLifecycle:
         """Start a task.  Delegates entirely to TaskStartGate.
 
         Returns the StartResult from TaskStartGate without modification.
+        Raises StartGateError on failure (preserving existing semantics).
         """
         return self._start_gate.start(user_id, task_id)
 
@@ -78,45 +60,20 @@ class TaskLifecycle:
         self,
         user_id: int,
         task_id: int,
-        actual_data: dict[str, Any],
-    ) -> SubmitResult:
+        actual_data: dict,
+    ) -> VerificationResult:
         """Submit a task for verification.
 
-        Delegates through the full secure submission lifecycle:
+        Delegates through the full secure submission lifecycle via
+        CompletionBridge.complete_after_verification():
+
             1. TaskAttemptPolicy  – can this user submit?
             2. TaskSubmissionService – validate data, record submission
             3. VerificationContext → TaskVerifier – verify
             4. CompletionBridge → CompletionGate – complete (only on PASSED)
 
-        Returns SubmitResult preserving the original result/error semantics.
+        Returns VerificationResult preserving the original result semantics.
         """
-        # 1. Attempt policy check
-        allowed, reason = self._attempt_policy.check(user_id, task_id)
-        if not allowed:
-            return SubmitResult(success=False, error=reason)
-
-        # 2. Submission validation + recording
-        submitted, reason = self._submission_service.submit(user_id, task_id, actual_data)
-        if not submitted:
-            return SubmitResult(success=False, error=reason)
-
-        # 3. Verification
-        ctx = VerificationContext(
-            user_id=user_id,
-            task_id=task_id,
-            actual_data=actual_data,
-        )
-        try:
-            vr = self._verifier.verify(ctx)
-        except Exception:
-            # Verifier exceptions become ERROR — do NOT swallow
-            vr = VerificationResult.ERROR
-
-        # 4. Completion (only on PASSED)
-        if vr == VerificationResult.PASSED:
-            self._completion_bridge.complete(user_id, task_id)
-
-        return SubmitResult(
-            success=True,
-            verification_result=vr,
+        return CompletionBridge.complete_after_verification(
+            user_id, task_id, actual_data
         )
