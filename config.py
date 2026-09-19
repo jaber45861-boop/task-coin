@@ -14,7 +14,9 @@ Usage:
         ...
 """
 
+import os
 from typing import Dict
+from urllib.parse import urlparse
 
 # ── Admin Configuration ──────────────────────────────────────────────
 # List of Telegram user IDs that have admin privileges.
@@ -88,3 +90,45 @@ def get_channel(slug: str) -> Channel | None:
 def get_required_channels() -> list[Channel]:
     """Return a list of all channels marked as required."""
     return [ch for ch in CHANNELS.values() if ch.required]
+
+
+# ── Mini App URL Configuration ───────────────────────────────────────
+
+def get_mini_app_url() -> str:
+    """Validate and return the MINI_APP_URL environment variable.
+
+    Requirements:
+        - Must be present.
+        - Must be a valid absolute HTTPS URL.
+        - Non-HTTPS URLs are rejected.
+        - No silent fallback to localhost.
+
+    Raises:
+        RuntimeError: If the URL is missing, malformed, or not HTTPS.
+    """
+    raw = os.environ.get("MINI_APP_URL", "").strip()
+
+    if not raw:
+        raise RuntimeError(
+            "MINI_APP_URL environment variable is not set. "
+            "It must be a valid HTTPS URL (e.g. https://example.com)."
+        )
+
+    try:
+        parsed = urlparse(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"MINI_APP_URL is malformed: {raw!r} — {exc}"
+        ) from exc
+
+    if parsed.scheme != "https":
+        raise RuntimeError(
+            f"MINI_APP_URL must use HTTPS. Got: {parsed.scheme!r} from {raw!r}"
+        )
+
+    if not parsed.netloc:
+        raise RuntimeError(
+            f"MINI_APP_URL has no hostname: {raw!r}"
+        )
+
+    return raw

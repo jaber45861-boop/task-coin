@@ -8,7 +8,9 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonWebApp,
     Update,
+    WebAppInfo,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -22,7 +24,7 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
-from config import ADMINS, CHANNELS, Channel, is_admin, get_required_channels
+from config import ADMINS, CHANNELS, Channel, is_admin, get_required_channels, get_mini_app_url
 from subscription import (
     check_subscription_access,
     is_locked,
@@ -1238,8 +1240,47 @@ def main() -> None:
     ), group=5)
     app.add_handler(CommandHandler("admin", admin_command), group=5)
 
+    # Register the Mini App menu button (Open button) via post_init.
+    # We chain it with the admin command menu setup.
+    original_post_init = app.post_init
+
+    async def _combined_post_init(application: Application) -> None:
+        if original_post_init is not None:
+            await original_post_init(application)
+        await setup_menu_button(application)
+
+    app.post_init = _combined_post_init
+
     logger.info("Bot is starting...")
     app.run_polling()
+
+
+# ── Telegram Mini App Menu Button ───────────────────────────────────
+
+
+async def setup_menu_button(application: Application) -> None:
+    """Configure the official Telegram Menu Button (Web App) for each admin.
+
+    Uses Bot.set_chat_menu_button to set a MenuButtonWebApp with text "Open"
+    that opens the configured MINI_APP_URL.  Telegram places this button
+    natively in the composer area — no custom keyboard is created.
+    """
+    mini_app_url = get_mini_app_url()
+    menu_button = MenuButtonWebApp(
+        text="Open",
+        web_app=WebAppInfo(url=mini_app_url),
+    )
+    bot = application.bot
+    for admin_id in ADMINS:
+        await bot.set_chat_menu_button(
+            chat_id=admin_id,
+            menu_button=menu_button,
+        )
+        logger.info(
+            "Set Mini App menu button for admin %d → %s",
+            admin_id,
+            mini_app_url,
+        )
 
 
 if __name__ == "__main__":
