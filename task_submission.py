@@ -40,6 +40,7 @@ import logging
 from dataclasses import dataclass
 
 import db
+from task_attempt import TaskAttemptPolicy
 from task_verifier import (
     FrozenDict,
     VerificationContext,
@@ -112,33 +113,16 @@ class TaskSubmissionService:
             SubmissionError: If pre-validation fails (user/task
                 not found, task inactive, task not started, etc.).
         """
-        # ── 1. Validate user exists ───────────────────────────
-        user = db.get_user(user_id)
-        if user is None:
-            raise SubmissionError(f"User {user_id} not found")
+        # ── 1. Attempt policy gate ────────────────────────────
+        #    Delegates user/task/state validation to the policy.
+        #    The policy is read-only and does not modify any state.
+        attempt_result = TaskAttemptPolicy.can_submit(user_id, task_id)
+        if not attempt_result.allowed:
+            raise SubmissionError(attempt_result.reason)
 
-        # ── 2. Validate task exists ───────────────────────────
+        # ── 2. Fetch task for context building ─────────────────
         task = db.get_task(task_id)
-        if task is None:
-            raise SubmissionError(f"Task {task_id} not found")
-
-        # ── 3. Validate task is active ────────────────────────
-        if not task["active"]:
-            raise SubmissionError(f"Task {task_id} is not active")
-
-        # ── 4. Validate user_task exists and is STARTED ───────
-        user_task = db.get_user_task(user_id, task_id)
-        if user_task is None:
-            raise SubmissionError(
-                f"No user_task record for user={user_id}, task={task_id}"
-            )
-
-        current_status = user_task["status"]
-        if current_status != db.USER_TASK_STATUS_STARTED:
-            raise SubmissionError(
-                f"Task {task_id} is not in started state "
-                f"(current: {current_status})"
-            )
+        assert task is not None  # policy already validated existence
 
         # ── 5. Validate actual_data structure ─────────────────
         if not isinstance(actual_data, dict):
