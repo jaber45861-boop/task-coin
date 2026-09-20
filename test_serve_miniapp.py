@@ -40,7 +40,7 @@ class TestServerConfiguration:
         with open("serve_miniapp.py", "r", encoding="utf-8") as f:
             content = f.read()
         assert 'host = "0.0.0.0"' in content, "Server must bind to 0.0.0.0"
-        assert "app.run(host=host" in content, "Server must pass host to app.run()"
+        assert "waitress.serve" in content, "Server must use waitress.serve()"
 
 
 class TestMiniAppServing:

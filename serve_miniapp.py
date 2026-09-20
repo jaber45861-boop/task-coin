@@ -11,9 +11,12 @@ The server:
 - Listens on 0.0.0.0 (required by WispByte)
 - Serves miniapp/ directory as static files
 - Serves miniapp/index.html as the root page
+- Uses Waitress production WSGI server (not Flask dev server)
 """
 
 import os
+
+import waitress
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
@@ -33,8 +36,18 @@ def static_files(path):
     return send_from_directory(MINIAPP_DIR, path)
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+def run_web_server():
+    """Start the production Waitress WSGI server.
+
+    Reads PORT from the environment (defaults to 5000 for local dev).
+    Binds to 0.0.0.0 as required by WispByte.
+    Uses a fixed thread pool for concurrent request handling.
+    """
     host = "0.0.0.0"
+    port = int(os.environ.get("PORT", 5000))
     print(f"Starting Mini App server on {host}:{port}")
-    app.run(host=host, port=port, debug=False)
+    waitress.serve(app, host=host, port=port, threads=6)
+
+
+if __name__ == "__main__":
+    run_web_server()
