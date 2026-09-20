@@ -125,7 +125,7 @@ const Home = (() => {
                     <span class="section-title">إضافة مهمة</span>
                 </div>
                 <div class="add-task-body">
-                    <span class="add-task-status">قريباً</span>
+                    <button class="add-task-cta" data-testid="add-task-cta" disabled>➕ إضافة مهمة</button>
                 </div>
             </div>
         `;

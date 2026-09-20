@@ -362,14 +362,87 @@ class TestStructuralStates:
         nearby = content[guide_idx:guide_idx + 700]
         assert "قريباً" in nearby
 
-    def test_add_task_coming_soon(self):
-        content = _home_js()
-        idx = content.find("home-add-task")
-        nearby = content[idx:idx + 700]
-        assert "قريباً" in nearby
-
     def test_account_linking_coming_soon(self):
         content = _home_js()
         idx = content.find("home-account-linking")
         nearby = content[idx:idx + 700]
         assert "قريباً" in nearby
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 12. Add Task CTA Button
+# ══════════════════════════════════════════════════════════════════════
+class TestAddTaskCTAButton:
+    """Verify the + إضافة مهمة CTA button exists and is UI-only."""
+
+    def test_cta_button_exists(self):
+        """Add Task section should contain a CTA button element."""
+        content = _home_js()
+        assert "add-task-cta" in content, \
+            "Add Task section should contain a CTA button"
+
+    def test_cta_button_has_testid(self):
+        """CTA button should have a data-testid for testability."""
+        content = _home_js()
+        assert 'data-testid="add-task-cta"' in content, \
+            "CTA button should have data-testid='add-task-cta'"
+
+    def test_cta_button_text_contains_label(self):
+        """CTA button should display '➕ إضافة مهمة'."""
+        content = _home_js()
+        idx = content.find("add-task-cta")
+        nearby = content[idx:idx + 200]
+        assert "➕" in nearby, "CTA button should contain ➕ emoji"
+        assert "إضافة مهمة" in nearby, \
+            "CTA button should contain 'إضافة مهمة' text"
+
+    def test_cta_button_is_disabled(self):
+        """CTA button must be disabled — no business logic yet."""
+        content = _home_js()
+        idx = content.find("add-task-cta")
+        nearby = content[idx:idx + 200]
+        assert "disabled" in nearby, \
+            "CTA button should be disabled (UI-only placeholder)"
+
+    def test_cta_button_is_html_button_element(self):
+        """CTA should be a <button> element for proper semantics."""
+        content = _home_js()
+        assert "add-task-cta" in content
+        # Verify it's inside a <button tag
+        idx = content.find("add-task-cta")
+        preceding = content[max(0, idx - 60):idx]
+        assert "<button" in preceding, \
+            "CTA should be a <button> element"
+
+    def test_no_api_calls_in_home(self):
+        """Home module must not introduce any API calls."""
+        content = _home_js()
+        assert "fetch(" not in content, "Home should not call fetch()"
+        assert "XMLHttpRequest" not in content
+        assert "axios" not in content
+
+    def test_no_task_mutation_in_home(self):
+        """Home module must not contain task creation/mutation logic."""
+        content = _home_js()
+        mutations = [
+            "createTask",
+            "submitTask",
+            "startTask",
+            "completeTask",
+            "deleteTask",
+            "updateTask",
+            "create_task",
+            "submit_task",
+        ]
+        for m in mutations:
+            assert m not in content, \
+                f"Home should not contain task mutation: {m}"
+
+    def test_add_task_section_still_has_header(self):
+        """Add Task section header should remain intact."""
+        content = _home_js()
+        idx = content.find("home-add-task")
+        section = content[idx:idx + 600]
+        assert "add-task-header" in section
+        assert "section-icon" in section
+        assert "section-title" in section
