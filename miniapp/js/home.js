@@ -31,13 +31,37 @@ const Home = (() => {
         section.className = 'home-section home-welcome';
         section.setAttribute('data-testid', 'home-welcome');
 
+        // Get Telegram user data if available
+        const user = typeof TelegramApp !== 'undefined' ? TelegramApp.getUser() : null;
+        const firstName = user?.first_name || null;
+        const username = user?.username || null;
+        const photoUrl = user?.photo_url || null;
+
+        // Build avatar: use photo if available, otherwise placeholder
+        let avatarHtml;
+        if (photoUrl) {
+            avatarHtml = `<img class="avatar-img" src="${photoUrl}" alt="" data-testid="home-avatar-img">`;
+        } else {
+            avatarHtml = `<span class="avatar-placeholder">👤</span>`;
+        }
+
+        // Build name: use first_name if available, otherwise dash placeholder
+        const displayName = firstName || '—';
+
+        // Build username: only show if actually provided by Telegram
+        let usernameHtml = '';
+        if (username) {
+            usernameHtml = `<span class="welcome-username" data-testid="home-username-handle">@${username}</span>`;
+        }
+
         section.innerHTML = `
             <div class="welcome-card">
                 <div class="welcome-avatar" data-testid="home-avatar">
-                    <span class="avatar-placeholder">👤</span>
+                    ${avatarHtml}
                 </div>
                 <div class="welcome-info">
-                    <span class="welcome-name" data-testid="home-username">—</span>
+                    <span class="welcome-name" data-testid="home-username">${displayName}</span>
+                    ${usernameHtml}
                     <span class="welcome-level" data-testid="home-level">المستوى: قريباً</span>
                 </div>
             </div>

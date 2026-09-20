@@ -342,11 +342,10 @@ class TestStructuralStates:
     def test_username_placeholder(self):
         content = _home_js()
         assert "home-username" in content
-        # Should use a dash or placeholder, not a fake name
-        username_idx = content.find("home-username")
-        nearby = content[username_idx:username_idx + 200]
-        assert "—" in nearby or "قريباً" in nearby, \
-            "Username should use a neutral placeholder"
+        # Should have a fallback to dash when first_name is unavailable
+        # The code uses: const displayName = firstName || '—'
+        assert "|| '—'" in content or '|| "—"' in content, \
+            "Username should fallback to '—' when first_name is unavailable"
 
     def test_level_placeholder(self):
         content = _home_js()
@@ -446,3 +445,149 @@ class TestAddTaskCTAButton:
         assert "add-task-header" in section
         assert "section-icon" in section
         assert "section-title" in section
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 13. Profile Summary — Telegram WebApp user integration
+# ══════════════════════════════════════════════════════════════════════
+class TestProfileSummaryTelegramIntegration:
+    """Verify Profile Summary uses Telegram WebApp user data."""
+
+    def test_uses_telegram_app_get_user(self):
+        """Home should call TelegramApp.getUser() to get user data."""
+        content = _home_js()
+        assert "TelegramApp.getUser()" in content, \
+            "Home should call TelegramApp.getUser()"
+
+    def test_first_name_displayed_when_available(self):
+        """Home should use first_name from Telegram user when available."""
+        content = _home_js()
+        assert "first_name" in content, \
+            "Home should reference first_name from Telegram user"
+
+    def test_username_displayed_when_available(self):
+        """Home should display @username only when provided by Telegram."""
+        content = _home_js()
+        assert "username" in content, \
+            "Home should reference username from Telegram user"
+
+    def test_photo_url_used_for_avatar(self):
+        """Home should use photo_url for avatar when available."""
+        content = _home_js()
+        assert "photo_url" in content, \
+            "Home should reference photo_url from Telegram user"
+
+    def test_avatar_img_element_for_photo(self):
+        """When photo_url is available, Home should render an img element."""
+        content = _home_js()
+        assert "avatar-img" in content, \
+            "Home should have avatar-img class for Telegram profile photo"
+
+    def test_avatar_img_has_testid(self):
+        """Avatar img should have data-testid for testability."""
+        content = _home_js()
+        assert 'data-testid="home-avatar-img"' in content, \
+            "Avatar img should have data-testid='home-avatar-img'"
+
+    def test_username_handle_element(self):
+        """Home should have a welcome-username element for @handle."""
+        content = _home_js()
+        assert "welcome-username" in content, \
+            "Home should have welcome-username class"
+
+    def test_username_handle_testid(self):
+        """Username handle should have data-testid for testability."""
+        content = _home_js()
+        assert 'data-testid="home-username-handle"' in content, \
+            "Username handle should have data-testid='home-username-handle'"
+
+    def test_username_prefixed_with_at(self):
+        """Username should be displayed with @ prefix."""
+        content = _home_js()
+        idx = content.find("welcome-username")
+        nearby = content[idx:idx + 100]
+        assert "@" in nearby, \
+            "Username should be prefixed with @"
+
+    def test_fallback_to_dash_when_no_name(self):
+        """When first_name is unavailable, display dash placeholder."""
+        content = _home_js()
+        # The code uses: const displayName = firstName || '—'
+        assert "|| '—'" in content or '|| "—"' in content, \
+            "Home should fallback to '—' when first_name is unavailable"
+
+    def test_no_fabricated_names(self):
+        """Home should not contain fabricated user names."""
+        content = _home_js()
+        # These are fake names that should never appear
+        fake_names = ["أحمد", "محمد", "علي", "خالد", "أحمد"  ]
+        # Only check in the welcome section
+        welcome_idx = content.find("home-welcome")
+        if welcome_idx > 0:
+            welcome_section = content[welcome_idx:welcome_idx + 800]
+            for name in fake_names:
+                # The name should not appear as hardcoded text
+                # (it's OK if it appears in variable names or comments)
+                assert f">{name}<" not in welcome_section, \
+                    f"Found fabricated name '{name}' in welcome section"
+
+    def test_no_fabricated_usernames(self):
+        """Home should not contain fabricated Telegram usernames."""
+        content = _home_js()
+        fake_usernames = ["@user123", "@test_user", "@admin"]
+        welcome_idx = content.find("home-welcome")
+        if welcome_idx > 0:
+            welcome_section = content[welcome_idx:welcome_idx + 800]
+            for username in fake_usernames:
+                assert username not in welcome_section, \
+                    f"Found fabricated username '{username}' in welcome section"
+
+    def test_no_fabricated_avatar_urls(self):
+        """Home should not contain fabricated avatar URLs."""
+        content = _home_js()
+        fake_urls = [
+            "https://example.com/avatar",
+            "https://t.me/i/userpic",
+            "https://ui-avatars.com",
+        ]
+        for url in fake_urls:
+            assert url not in content, \
+                f"Found fabricated avatar URL '{url}' in home.js"
+
+    def test_telegram_user_data_sourced_safely(self):
+        """User data should come from TelegramApp.getUser(), not DOM/QS."""
+        content = _home_js()
+        # Should NOT parse query strings or DOM for user data
+        assert "URLSearchParams" not in content, \
+            "Home should not parse URL query strings for user data"
+        assert "querySelector" not in content or "querySelectorAll" not in content, \
+            "Home should not use querySelector for user data"
+        # Should use TelegramApp.getUser()
+        assert "TelegramApp.getUser()" in content, \
+            "Home must use TelegramApp.getUser() for trusted user data"
+
+    def test_no_bot_token_exposed(self):
+        """Home should not expose bot tokens or secrets."""
+        content = _home_js()
+        assert "bot_token" not in content.lower(), \
+            "Home should not expose bot tokens"
+        assert "initData" not in content, \
+            "Home should not expose initData to UI"
+
+    def test_avatar_img_has_empty_alt(self):
+        """Avatar img should have empty alt attribute (decorative)."""
+        content = _home_js()
+        assert 'alt=""' in content, \
+            "Avatar img should have empty alt (decorative image)"
+
+    def test_css_has_avatar_img_style(self):
+        """CSS should have avatar-img style for profile photos."""
+        css = _css()
+        assert ".avatar-img" in css, \
+            "CSS should define .avatar-img style"
+
+    def test_css_has_welcome_username_style(self):
+        """CSS should have welcome-username style for @handle."""
+        css = _css()
+        assert ".welcome-username" in css, \
+            "CSS should define .welcome-username style"
