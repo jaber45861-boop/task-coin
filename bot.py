@@ -2,6 +2,7 @@ import os
 import random
 import re
 import logging
+import threading
 from dotenv import load_dotenv
 from telegram import (
     BotCommandScopeChat,
@@ -1250,6 +1251,36 @@ def main() -> None:
         await setup_menu_button(application)
 
     app.post_init = _combined_post_init
+
+    # ── Start Mini App web-server in a daemon thread ──────────────────
+    from serve_miniapp import run_web_server
+
+    web_server_error: Exception | None = None
+
+    def _start_web_server() -> None:
+        nonlocal web_server_error
+        try:
+            run_web_server()
+        except Exception as exc:
+            web_server_error = exc
+            logger.error("Mini App web-server thread failed: %s", exc)
+
+    web_thread = threading.Thread(
+        target=_start_web_server,
+        name="miniapp-web-server",
+        daemon=True,
+    )
+    web_thread.start()
+    logger.info(
+        "Mini App web-server thread started (daemon, name=%s)",
+        web_thread.name,
+    )
+
+    if web_server_error is not None:
+        logger.warning(
+            "Mini App web-server failed during startup: %s",
+            web_server_error,
+        )
 
     logger.info("Bot is starting...")
     app.run_polling()
