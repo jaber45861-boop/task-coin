@@ -122,10 +122,12 @@ class TestMiniAppPages:
         with open("miniapp/index.html", "r", encoding="utf-8") as f:
             return f.read()
 
-    def test_home_page_template_exists(self):
-        """Verify home page template exists."""
+    def test_home_page_is_dynamic(self):
+        """Verify home page is rendered dynamically by home.js (no static template)."""
         html = self._read_html()
-        assert 'id="page-home"' in html, "Home page template not found"
+        assert 'id="page-home"' not in html, \
+            "Home should be dynamic, not a static template"
+        assert 'home.js' in html, "home.js script must be loaded"
 
     def test_tasks_page_template_exists(self):
         """Verify tasks page template exists."""

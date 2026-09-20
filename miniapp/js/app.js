@@ -50,28 +50,37 @@ const App = (() => {
     }
 
     /**
-     * Render a page from template
+     * Render a page from template or dynamic component.
+     * The 'home' page is built by the Home module;
+     * other pages use HTML <template> cloning.
      */
     function renderPage(page) {
-        const template = document.getElementById(`page-${page}`);
-        
-        if (!template) {
-            console.error(`Page template not found: ${page}`);
-            return;
-        }
-
         // Clear current content
         contentEl.innerHTML = '';
 
-        // Clone and append template content
-        const pageContent = template.content.cloneNode(true);
-        contentEl.appendChild(pageContent);
+        let pageEl;
+
+        if (page === 'home' && typeof Home !== 'undefined') {
+            pageEl = Home.render();
+        } else {
+            const template = document.getElementById(`page-${page}`);
+
+            if (!template) {
+                console.error(`Page template not found: ${page}`);
+                return;
+            }
+
+            const fragment = template.content.cloneNode(true);
+            pageEl = fragment.querySelector('.page');
+            if (!pageEl) {
+                pageEl = fragment;
+            }
+        }
+
+        contentEl.appendChild(pageEl);
 
         // Add enter animation
-        const pageEl = contentEl.querySelector('.page');
-        if (pageEl) {
-            pageEl.classList.add('page-enter');
-        }
+        pageEl.classList.add('page-enter');
 
         currentPage = page;
     }

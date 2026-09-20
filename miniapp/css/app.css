@@ -251,3 +251,163 @@ body {
         padding-bottom: env(safe-area-inset-bottom);
     }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   Home Page Styles
+   ══════════════════════════════════════════════════════════════ */
+
+.home-section {
+    margin-bottom: 12px;
+}
+
+/* Welcome / Profile Summary */
+.welcome-card {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px;
+    background-color: var(--bg-color);
+    border-radius: 14px;
+}
+
+.welcome-avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    background-color: var(--bg-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.avatar-placeholder {
+    font-size: 28px;
+    line-height: 1;
+}
+
+.welcome-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+.welcome-name {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-color);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.welcome-level {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+/* Balance / Reward Summary */
+.balance-card {
+    padding: 16px;
+    background-color: var(--bg-color);
+    border-radius: 14px;
+}
+
+.balance-row {
+    display: flex;
+    gap: 12px;
+}
+
+.balance-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 12px 8px;
+    background-color: var(--bg-secondary);
+    border-radius: 10px;
+}
+
+.balance-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.balance-value {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.balance-empty {
+    color: var(--text-secondary);
+    font-weight: 400;
+}
+
+/* Generic section card */
+.section-card {
+    padding: 16px;
+    background-color: var(--bg-color);
+    border-radius: 14px;
+}
+
+.section-icon {
+    font-size: 20px;
+    line-height: 1;
+}
+
+.section-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+/* Daily Check-in */
+.checkin-header,
+.guide-header,
+.add-task-header,
+.account-linking-header,
+.hot-tasks-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.checkin-body,
+.guide-body,
+.add-task-body,
+.account-linking-body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 12px;
+    background-color: var(--bg-secondary);
+    border-radius: 10px;
+}
+
+.checkin-status,
+.guide-status,
+.add-task-status,
+.account-linking-status {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+/* Hot Tasks */
+.hot-tasks-body {
+    min-height: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 12px;
+    background-color: var(--bg-secondary);
+    border-radius: 10px;
+}
+
+.hot-tasks-empty {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
