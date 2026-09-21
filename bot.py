@@ -83,8 +83,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ── Referral attribution (capture before anti-bot flow) ──────────
     user = update.effective_user
     user_id = user.id
-    username = user.username
-    first_name = user.first_name
+    # Coerce to SQLite-safe types at the trust boundary.
+    # Telegram provides str | None; reject any non-string at runtime.
+    username = str(user.username) if user.username else None
+    first_name = str(user.first_name) if user.first_name else None
 
     # Extract referral payload if present
     referred_by = None
