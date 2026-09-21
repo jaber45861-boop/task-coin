@@ -181,7 +181,7 @@ class TestPostShutdownClosesServer:
         # Call post_shutdown to verify it closes the server
         import asyncio
         post_shutdown = mock_app.post_shutdown
-        asyncio.get_event_loop().run_until_complete(post_shutdown(mock_app))
+        asyncio.run(post_shutdown(mock_app))
         mock_server.close.assert_called_once()
 
     @patch("threading.Thread")
@@ -205,7 +205,7 @@ class TestPostShutdownClosesServer:
         import asyncio
         post_shutdown = mock_app.post_shutdown
         # Must not raise
-        asyncio.get_event_loop().run_until_complete(post_shutdown(mock_app))
+        asyncio.run(post_shutdown(mock_app))
 
 
 class TestStartupFailurePropagates:
