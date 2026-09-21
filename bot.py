@@ -31,13 +31,6 @@ from subscription import (
     lock_user,
     unlock_user,
 )
-import asyncio
-import sys
-import threading
-
-from flask import Flask, send_from_directory
-from waitress import create_server
-
 import db
 
 load_dotenv()
@@ -83,10 +76,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ── Referral attribution (capture before anti-bot flow) ──────────
     user = update.effective_user
     user_id = user.id
-    # Coerce to SQLite-safe types at the trust boundary.
-    # Telegram provides str | None; reject any non-string at runtime.
-    username = str(user.username) if user.username else None
-    first_name = str(user.first_name) if user.first_name else None
+    username = user.username
+    first_name = user.first_name
 
     # Extract referral payload if present
     referred_by = None
@@ -1121,31 +1112,6 @@ async def admin_panel_callback(
         logger.info("Channels listed by admin %d via panel", user_id)
 
 
-# ── Mini App Flask Application ───────────────────────────────────
-
-
-def create_mini_app():
-    """Create the Flask application for serving the Mini App static files.
-
-    Returns a Flask app configured to serve miniapp/index.html at the root
-    and all static assets under /<path>.
-    """
-    mini_app = Flask(__name__)
-    miniapp_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "miniapp"
-    )
-
-    @mini_app.route("/")
-    def mini_app_index():
-        return send_from_directory(miniapp_dir, "index.html")
-
-    @mini_app.route("/<path:path>")
-    def mini_app_static(path):
-        return send_from_directory(miniapp_dir, path)
-
-    return mini_app
-
-
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1285,76 +1251,8 @@ def main() -> None:
 
     app.post_init = _combined_post_init
 
-    # ── Single-Entry Architecture (WispByte) ──────────────────────
-    # The HTTP server runs in the main thread as the primary process
-    # that WispByte's reverse proxy routes to. The Telegram bot runs
-    # in a background thread using the low-level PTB lifecycle.
-    #
-    # This replaces the previous `app.run_polling()` call which only
-    # ran the Telegram bot and left no HTTP listener for WispByte.
-
-    stop_event = threading.Event()
-
-    def _run_telegram_bot() -> None:
-        """Run the Telegram bot in a background thread.
-
-        Uses the low-level PTB lifecycle (initialize → start →
-        polling → stop → shutdown) with a dedicated asyncio event loop
-        so it does not interfere with the main thread's HTTP server.
-        """
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def _lifecycle() -> None:
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Telegram bot polling started (background thread)")
-
-            # Block until the main thread signals shutdown.
-            while not stop_event.is_set():
-                await asyncio.sleep(0.5)
-
-            logger.info("Telegram bot stopping...")
-            await app.updater.stop_polling()
-            await app.stop()
-            await app.shutdown()
-
-        try:
-            loop.run_until_complete(_lifecycle())
-        except Exception:
-            logger.exception("Telegram bot background thread error")
-        finally:
-            loop.close()
-
-    bot_thread = threading.Thread(
-        target=_run_telegram_bot,
-        name="telegram-bot",
-    )
-    bot_thread.start()
-
-    # Start the Waitress HTTP server in the main thread.
-    # This is the process that WispByte's reverse proxy routes to.
-    port = int(os.environ.get("PORT", 5000))
-    host = "0.0.0.0"
-    mini_app = create_mini_app()
-
-    logger.info("Starting Mini App server on %s:%d", host, port)
-    try:
-        server = create_server(mini_app, host=host, port=port)
-        server.run()
-    except OSError as exc:
-        logger.error("Failed to bind HTTP server on %s:%d: %s", host, port, exc)
-        stop_event.set()
-        bot_thread.join(timeout=10)
-        sys.exit(1)
-
-    # Waitress exited (SIGTERM/SIGINT) — shut down the Telegram bot.
-    logger.info("HTTP server stopped. Shutting down Telegram bot...")
-    stop_event.set()
-    bot_thread.join(timeout=10)
-    if bot_thread.is_alive():
-        logger.warning("Telegram bot thread did not stop within timeout")
+    logger.info("Bot is starting...")
+    app.run_polling()
 
 
 # ── Telegram Mini App Menu Button ───────────────────────────────────
