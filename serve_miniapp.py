@@ -36,17 +36,40 @@ def static_files(path):
     return send_from_directory(MINIAPP_DIR, path)
 
 
+def create_miniapp_server():
+    """Create and bind a Waitress server without starting the event loop.
+
+    Returns the ``waitress.server.TcpWSGIServer`` instance.  The socket is
+    bound and validated at this point — if the PORT is unavailable an
+    ``OSError`` is raised immediately, giving the caller deterministic
+    startup-error reporting.
+
+    Call ``server.run()`` in a background thread to start accepting
+    requests, and ``server.close()`` for a clean shutdown.
+    """
+    host = "0.0.0.0"
+    port = int(os.environ.get("PORT", 5000))
+    server = waitress.create_server(app, host=host, port=port, threads=6)
+    return server
+
+
 def run_web_server():
-    """Start the production Waitress WSGI server.
+    """Start the production Waitress WSGI server (blocking).
 
     Reads PORT from the environment (defaults to 5000 for local dev).
     Binds to 0.0.0.0 as required by WispByte.
     Uses a fixed thread pool for concurrent request handling.
+
+    Used for standalone execution (``python serve_miniapp.py``).
+    When integrating into the Telegram bot process, prefer
+    :func:`create_miniapp_server` + ``server.run()`` in a daemon thread
+    so that ``server.close()`` is available for clean shutdown.
     """
-    host = "0.0.0.0"
-    port = int(os.environ.get("PORT", 5000))
+    server = create_miniapp_server()
+    host = server.effective_host
+    port = server.effective_port
     print(f"Starting Mini App server on {host}:{port}")
-    waitress.serve(app, host=host, port=port, threads=6)
+    server.run()
 
 
 if __name__ == "__main__":

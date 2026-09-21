@@ -1253,34 +1253,51 @@ def main() -> None:
     app.post_init = _combined_post_init
 
     # ── Start Mini App web-server in a daemon thread ──────────────────
-    from serve_miniapp import run_web_server
+    # Use create_miniapp_server() so the port is bound and validated
+    # *before* the thread starts.  This gives deterministic startup-error
+    # reporting — if PORT is unavailable, main() fails immediately.
+    #
+    # Signal safety: asyncore.loop() (called by server.run()) does NOT
+    # install process signal handlers in this Python version, and even if
+    # it did, signal.signal() raises ValueError from non-main threads.
+    # PTB remains the sole owner of SIGINT/SIGTERM handling.
+    from serve_miniapp import create_miniapp_server
 
-    web_server_error: Exception | None = None
+    try:
+        mini_app_server = create_miniapp_server()
+    except OSError as exc:
+        logger.error("Mini App server creation failed: %s", exc)
+        raise
 
-    def _start_web_server() -> None:
-        nonlocal web_server_error
+    logger.info(
+        "Mini App server bound on %s:%s",
+        mini_app_server.effective_host,
+        mini_app_server.effective_port,
+    )
+
+    def _run_web_server() -> None:
         try:
-            run_web_server()
+            mini_app_server.run()
         except Exception as exc:
-            web_server_error = exc
             logger.error("Mini App web-server thread failed: %s", exc)
 
     web_thread = threading.Thread(
-        target=_start_web_server,
+        target=_run_web_server,
         name="miniapp-web-server",
         daemon=True,
     )
     web_thread.start()
-    logger.info(
-        "Mini App web-server thread started (daemon, name=%s)",
-        web_thread.name,
-    )
+    logger.info("Mini App web-server thread started (daemon)")
 
-    if web_server_error is not None:
-        logger.warning(
-            "Mini App web-server failed during startup: %s",
-            web_server_error,
-        )
+    # ── Clean shutdown: close the web server when PTB stops ──────────
+    async def _shutdown_mini_app(application) -> None:
+        try:
+            mini_app_server.close()
+            logger.info("Mini App web server closed")
+        except Exception as exc:
+            logger.error("Error closing Mini App web server: %s", exc)
+
+    app.post_shutdown = _shutdown_mini_app
 
     logger.info("Bot is starting...")
     app.run_polling()
