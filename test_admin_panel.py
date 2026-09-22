@@ -677,6 +677,12 @@ class TestExistingFunctionalityIntact(unittest.IsolatedAsyncioTestCase):
     async def test_anti_bot_still_works(self, _mock: MagicMock) -> None:
         """The /start anti-bot conversation still works."""
         from bot import start
+        import db as _db
+
+        # Persist a language so /start goes straight to the Anti-Bot step.
+        _db.init_db()
+        _db.register_user(_TEST_ADMIN_ID, None, None)
+        _db.set_user_language(_TEST_ADMIN_ID, "ar")
 
         update = _make_update(user_id=_TEST_ADMIN_ID, text="/start")
         ctx = _make_context()

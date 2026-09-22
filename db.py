@@ -47,6 +47,12 @@ def get_connection(db_path: str | None = None):
         conn.close()
 
 
+# ── Supported user languages ────────────────────────────────────────────
+# Persisted per user in users.language.  The value is constrained to
+# exactly these codes by is_supported_language() / set_user_language().
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("ar", "en", "ru", "fa")
+
+
 def init_db(db_path: str | None = None) -> None:
     """Initialize all database tables (channels + users)."""
     with get_connection(db_path) as conn:
@@ -74,10 +80,16 @@ def init_db(db_path: str | None = None) -> None:
                 username TEXT,
                 first_name TEXT,
                 referred_by INTEGER,
+                language TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (referred_by) REFERENCES users(user_id)
             )
         """)
+        # Migration: add language column for pre-existing DBs
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN language TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # ── Task definitions table ─────────────────────────────────
         conn.execute("""
@@ -486,6 +498,61 @@ def get_user(user_id: int) -> dict | None:
     except sqlite3.OperationalError:
         # users table does not exist — treat as no user found
         return None
+
+
+def is_supported_language(language: object) -> bool:
+    """True when *language* is one of the supported language codes."""
+    return isinstance(language, str) and language in SUPPORTED_LANGUAGES
+
+
+def get_user_language(user_id: int) -> str | None:
+    """Return the persisted language for a user, or None.
+
+    A missing table, a missing user row, a NULL value, and an unsupported
+    stored value are all safely treated as "no language selected".
+    """
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT language FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        # users table does not exist — treat as no language
+        return None
+
+    if not row:
+        return None
+    language = row["language"]
+    return language if is_supported_language(language) else None
+
+
+def set_user_language(user_id: int, language: str) -> bool:
+    """Persist *language* for an existing user.  Returns True on success.
+
+    - Unsupported codes are rejected without writing anything.
+    - Unknown users are rejected without creating rows (user creation
+      stays exclusively with register_user, so referral attribution and
+      the self-referral guard are unaffected).
+    - Repeated calls with the same value are idempotent.
+    """
+    if not is_supported_language(language):
+        return False
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT user_id FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return False  # unknown user — never create rows here
+            conn.execute(
+                "UPDATE users SET language = ? WHERE user_id = ?",
+                (language, user_id),
+            )
+            return True
+    except sqlite3.OperationalError:
+        return False
 
 
 def get_referrer(user_id: int) -> dict | None:

@@ -61,6 +61,46 @@ ADDCHANNEL_TITLE = 21
 REMOVECHANNEL_SELECT = 30
 REMOVECHANNEL_CONFIRM = 31
 
+# ── Language selection (first step of /start) ────────────────────────
+# Asked once, before the Anti-Bot step, when no language is persisted.
+# Values are constrained to db.SUPPORTED_LANGUAGES: ar, en, ru, fa.
+LANGUAGE_SELECT = 2
+LANGUAGE_PROMPT = (
+    "🌐 اختر اللغة\n"
+    "Choose your language\n"
+    "Выберите язык\n"
+    "زبان خود را انتخاب کنید"
+)
+LANGUAGE_BUTTONS: tuple[tuple[str, str], ...] = (
+    ("ar", "🇪🇬 العربية"),
+    ("en", "🇬🇧 English"),
+    ("ru", "🇷🇺 Русский"),
+    ("fa", "🇮🇷 فارسی"),
+)
+LANGUAGE_CALLBACK_ANY = r"^lang:"
+
+
+def _language_code(data: object) -> str | None:
+    """Extract a supported code from ``lang:<code>`` callback data.
+
+    Returns None for anything that is not exactly one of ar/en/ru/fa, so
+    invalid or malformed callback data is rejected safely.
+    """
+    if not isinstance(data, str) or not data.startswith("lang:"):
+        return None
+    code = data[len("lang:"):]
+    return code if db.is_supported_language(code) else None
+
+
+def _language_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard with the four supported languages."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(label, callback_data=f"lang:{code}")]
+            for code, label in LANGUAGE_BUTTONS
+        ]
+    )
+
 
 async def _send_math_question(message) -> tuple[str, int]:
     """Generate a math question and return (question_text, answer)."""
@@ -76,7 +116,7 @@ async def _send_math_question(message) -> tuple[str, int]:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Send a simple math question as anti-bot step.
+    """Start the /start flow: language gate first, then Anti-Bot.
     
     Also captures referral payload from deep link if present.
     """
@@ -102,13 +142,100 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         referred_by=referred_by,
     )
 
-    # ── Anti-bot challenge ──────────────────────────────────────────
-    question, correct = await _send_math_question(update.message)
+    # ── Language gate: asked once, before the Anti-Bot step ────────────
+    # First-time users pick a language and the normal flow stops here;
+    # users with a persisted language continue untouched.
+    if db.get_user_language(user_id) is None:
+        await update.message.reply_text(
+            LANGUAGE_PROMPT, reply_markup=_language_keyboard()
+        )
+        return LANGUAGE_SELECT
+
+    # ── Existing flow (anti-bot challenge) ─────────────────────────
+    return await _begin_anti_bot(update.message, context)
+
+
+async def _begin_anti_bot(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Shared /start continuation: send the Anti-Bot challenge.
+
+    Used both by ``start`` (language already persisted) and by the
+    language callback after the choice is saved, so the /start flow is
+    never duplicated.  Anti-Bot rules are unchanged.
+    """
+    question, correct = await _send_math_question(message)
     context.user_data["anti_bot_answer"] = correct
     context.user_data["anti_bot_attempts"] = 0
 
-    await update.message.reply_text(question)
+    await message.reply_text(question)
     return ANTI_BOT
+
+
+async def language_selected(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle a language button press while selection is pending.
+
+    Persists the choice for the pressing user only, then resumes the
+    existing /start flow from the Anti-Bot step.  Safe on repeated
+    presses and on invalid/stale callback data.
+    """
+    query = update.callback_query
+    code = _language_code(query.data)
+    if code is None:
+        await query.answer("⚠️ لغة غير صالحة", show_alert=False)
+        return LANGUAGE_SELECT
+
+    await query.answer()
+    if query.message is None:
+        # Nothing to reply the challenge to — keep selection pending.
+        return LANGUAGE_SELECT
+    if not db.set_user_language(query.from_user.id, code):
+        # Unknown user row (stale state) — fail safely, stay here.
+        return LANGUAGE_SELECT
+
+    # Drop the keyboard so the choice cannot be re-pressed casually.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass  # stale/already-edited message — persisted state is correct
+
+    # Resume the existing /start flow from the correct point.
+    return await _begin_anti_bot(query.message, context)
+
+
+async def language_prompt_again(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Stray text while selection is pending → re-show the prompt."""
+    await update.message.reply_text(
+        LANGUAGE_PROMPT, reply_markup=_language_keyboard()
+    )
+    return LANGUAGE_SELECT
+
+
+async def language_callback_fallback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Safely answer stale or out-of-date language callbacks.
+
+    Fires only when the conversation is *not* awaiting a language choice
+    (same handler group, right after the conversation, so exactly one of
+    them handles each update).  Never changes persisted state: an
+    already-persisted language is left untouched (idempotent) and
+    invalid codes are refused without touching anything.
+    """
+    query = update.callback_query
+    code = _language_code(query.data)
+    if code is None:
+        await query.answer("⚠️ لغة غير صالحة", show_alert=False)
+        return
+    if db.get_user_language(query.from_user.id):
+        await query.answer("✅")  # already chosen — idempotent no-op
+        return
+    # Valid button but no /start selection in progress (stale/restarted).
+    await query.answer(
+        "يرجى إرسال /start للبدء من جديد", show_alert=False
+    )
 
 
 async def _blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1360,6 +1487,14 @@ def main() -> None:
             ANTI_BOT_BLOCKED: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _blocked),
             ],
+            LANGUAGE_SELECT: [
+                CallbackQueryHandler(
+                    language_selected, pattern=LANGUAGE_CALLBACK_ANY
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, language_prompt_again
+                ),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -1380,6 +1515,17 @@ def main() -> None:
 
     # 2. Anti-bot conversation (entry: /start).
     app.add_handler(conv_handler, group=1)
+
+    # 2b. Stale/invalid language callbacks.  Same group, right after the
+    #     conversation, so exactly one of them fires per update: the
+    #     conversation consumes presses made while it awaits a choice,
+    #     this handler safely answers presses made at any other time.
+    app.add_handler(
+        CallbackQueryHandler(
+            language_callback_fallback, pattern=LANGUAGE_CALLBACK_ANY
+        ),
+        group=1,
+    )
 
     # 3. Subscription gate for non-command messages.
     #    Same group as the ConversationHandler so only one fires per

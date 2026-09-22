@@ -56,11 +56,23 @@ def _set_correct_answer(ctx: MagicMock, answer: int = 10) -> None:
     ctx.user_data["anti_bot_answer"] = answer
 
 
+def _persist_language(user_id: int, language: str = "ar") -> None:
+    """Persist a language so /start skips the language-selection step."""
+    import db
+
+    db.init_db()
+    db.register_user(user_id, None, None)
+    db.set_user_language(user_id, language)
+
+
 # ── Tests: /start initialises anti-bot ────────────────────────────────
 
 
 class TestStartInit(unittest.IsolatedAsyncioTestCase):
     """Tests that /start sets up the anti-bot question."""
+
+    def setUp(self) -> None:
+        _persist_language(_TEST_USER_ID)
 
     async def test_start_returns_anti_bot_state(self) -> None:
         """start() should return ANTI_BOT state."""
@@ -419,6 +431,7 @@ class TestStartThenAnswerFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         CHANNELS.clear()
         unlock_user(_TEST_USER_ID)
+        _persist_language(_TEST_USER_ID)
 
     async def test_full_correct_flow(self) -> None:
         """start → correct answer → passes."""
