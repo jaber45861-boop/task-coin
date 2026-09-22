@@ -8,7 +8,8 @@ the required-channel configuration and user referral data.
 import sqlite3
 import os
 import logging
-from typing import Optional
+import threading
+from typing import Iterator, Optional
 from contextlib import contextmanager
 
 from config import Channel, CHANNELS
@@ -27,6 +28,23 @@ ALLOWED_USER_TASK_STATUSES = {
 
 DB_PATH = os.environ.get("TASKCOIN_DB_PATH", "task_coin.db")
 
+# How long a connection waits for a lock before SQLite raises SQLITE_BUSY.
+# Applied to every connection at the connection layer (no retry loops).
+BUSY_TIMEOUT_MS = 5000
+
+
+def _configure_connection(conn: sqlite3.Connection) -> None:
+    """Apply the repository's standard connection settings.
+
+    Centralized so every connection — regular helper scopes and the
+    ``transaction()`` primitive alike — gets identical guarantees:
+    row factory, WAL journal mode, foreign keys, busy timeout.
+    """
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+
 
 @contextmanager
 def get_connection(db_path: str | None = None):
@@ -34,9 +52,7 @@ def get_connection(db_path: str | None = None):
     if db_path is None:
         db_path = DB_PATH
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    _configure_connection(conn)
     try:
         yield conn
         conn.commit()
@@ -44,6 +60,81 @@ def get_connection(db_path: str | None = None):
         conn.rollback()
         raise
     finally:
+        conn.close()
+
+
+class NestedTransactionError(RuntimeError):
+    """Raised when ``transaction()`` is entered while already active.
+
+    Nested (savepoint-style) transactions are deliberately not supported;
+    the repository rejects them explicitly instead of pretending that a
+    nested BEGIN is valid.
+    """
+
+
+# Per-thread "am I already inside transaction() on this thread?" flag so a
+# same-thread nested entry is rejected explicitly instead of deadlocking
+# against the helper's own write lock.  Threads stay fully independent.
+_transaction_state = threading.local()
+
+
+@contextmanager
+def transaction(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
+    """Run a block of work inside an atomic ``BEGIN IMMEDIATE`` transaction.
+
+    Generic infrastructure only: it knows nothing about wallets, ledgers,
+    withdrawals, tasks or Telegram.  Future services pass the yielded
+    connection to any component that accepts a caller-owned connection
+    (e.g. ``LedgerService(connection=conn)``).
+
+    Semantics:
+
+    - this helper *owns* the connection it opens: it configures it exactly
+      like ``get_connection()``, begins the transaction, commits on success,
+      rolls back on any exception, and closes it exactly once — it never
+      touches caller-owned connections
+    - the transaction starts with ``BEGIN IMMEDIATE`` so the write lock is
+      established before any read/modify/write sequence
+    - exceptions are never swallowed: the original exception is re-raised
+      after rollback, and no application operation is ever retried
+    - re-entering ``transaction()`` on a thread where it is already active
+      raises :class:`NestedTransactionError` (no implicit nested BEGINs,
+      no savepoints)
+
+    Args:
+        db_path: database file; defaults to ``DB_PATH``.
+
+    Yields:
+        The open connection, already inside the transaction.  Values
+        assigned inside the ``with`` block become the caller's result by
+        ordinary Python assignment.
+
+    Raises:
+        NestedTransactionError: on same-thread nested entry.
+    """
+    if getattr(_transaction_state, "active", False):
+        raise NestedTransactionError(
+            "transaction() is already active on this thread; "
+            "nested transactions are not supported"
+        )
+    if db_path is None:
+        db_path = DB_PATH
+    # isolation_level=None switches off sqlite3's implicit BEGIN/COMMIT so
+    # this helper — and only this helper — controls transaction boundaries.
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        _configure_connection(conn)
+        _transaction_state.active = True
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        _transaction_state.active = False
         conn.close()
 
 
