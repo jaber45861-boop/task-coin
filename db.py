@@ -124,6 +124,127 @@ def init_db(db_path: str | None = None) -> None:
             )
         """)
 
+        # ── Wallet / ledger / withdrawal schema (MT-1) ─────────────
+        # Additive migration only: no existing table or row is touched.
+        # Money is stored as INTEGER units only — no REAL, no floats:
+        #     1 USDT = 100,000,000 wallet units
+        #     1 EGP  = 100 minor units
+        # USDT is the wallet currency; EGP is display/conversion only.
+
+        # One wallet row per user; created lazily by future wallet logic
+        # (no backfill of existing users here).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id INTEGER PRIMARY KEY,
+                available_units INTEGER NOT NULL DEFAULT 0
+                    CHECK (available_units >= 0),
+                held_units INTEGER NOT NULL DEFAULT 0
+                    CHECK (held_units >= 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # Append-only ledger.  entry_type fully determines both deltas
+        # (machine-checked below), and duplicates are blocked per
+        # (reference_type, reference_id, entry_type) and per idempotency key.
+        # Append-only write discipline itself is enforced by the future
+        # Ledger service — the schema intentionally adds no triggers.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                entry_type TEXT NOT NULL CHECK (entry_type IN (
+                    'credit', 'debit', 'hold', 'release', 'settlement')),
+                amount_units INTEGER NOT NULL CHECK (amount_units > 0),
+                available_delta INTEGER NOT NULL,
+                held_delta INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USDT'
+                    CHECK (currency = 'USDT'),
+                reference_type TEXT NOT NULL CHECK (reference_type IN (
+                    'withdrawal', 'task', 'referral', 'deposit',
+                    'admin_credit', 'adjustment')),
+                reference_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                actor_user_id INTEGER,
+                rate_usdt_egp TEXT,
+                metadata TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (actor_user_id) REFERENCES users(user_id),
+                CHECK (
+                    (entry_type = 'credit'
+                        AND available_delta = amount_units
+                        AND held_delta = 0)
+                    OR (entry_type = 'debit'
+                        AND available_delta = -amount_units
+                        AND held_delta = 0)
+                    OR (entry_type = 'hold'
+                        AND available_delta = -amount_units
+                        AND held_delta = amount_units)
+                    OR (entry_type = 'release'
+                        AND available_delta = amount_units
+                        AND held_delta = -amount_units)
+                    OR (entry_type = 'settlement'
+                        AND available_delta = 0
+                        AND held_delta = -amount_units)
+                ),
+                UNIQUE (reference_type, reference_id, entry_type)
+            )
+        """)
+        # Idempotency: one ledger entry per external event key.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_ledger_idempotency_key
+            ON ledger (idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+        """)
+        # Audit/history access path per user, newest first.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ledger_user
+            ON ledger (user_id, id DESC)
+        """)
+
+        # Withdrawal requests: amounts in integer minor units, rates pinned
+        # as canonical TEXT decimal strings (never REAL).  rate_usdt_egp may
+        # be NULL for Vodafone Cash exactly as the existing withdrawal rules
+        # define it; wallet_rate_usdt_egp is always required.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                request_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL CHECK (method IN (
+                    'vodafone_cash', 'usdt_bep20')),
+                amount_egp_minor INTEGER NOT NULL
+                    CHECK (amount_egp_minor > 0),
+                fee_egp_minor INTEGER NOT NULL CHECK (fee_egp_minor >= 0),
+                amount_native_minor INTEGER NOT NULL
+                    CHECK (amount_native_minor > 0),
+                fee_native_minor INTEGER NOT NULL
+                    CHECK (fee_native_minor >= 0),
+                native_unit TEXT NOT NULL CHECK (native_unit IN ('EGP', 'USDT')),
+                rate_usdt_egp TEXT,
+                wallet_rate_usdt_egp TEXT NOT NULL,
+                rate_captured_at TIMESTAMP NOT NULL,
+                rate_provider TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'pending', 'rejected', 'completed')),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        # Cooldown lookup (rule: one request per user per 24 hours).
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_withdrawals_user_created
+            ON withdrawal_requests (user_id, created_at DESC)
+        """)
+        # At most one pending (open hold) withdrawal per user.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_withdrawals_one_pending
+            ON withdrawal_requests (user_id)
+            WHERE status = 'pending'
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
