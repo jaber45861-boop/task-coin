@@ -591,3 +591,189 @@ class TestProfileSummaryTelegramIntegration:
         css = _css()
         assert ".welcome-username" in css, \
             "CSS should define .welcome-username style"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 14. Home Dark/Black theme with Red neon accents
+# ══════════════════════════════════════════════════════════════════
+class TestHomeDarkNeonTheme:
+    """Verify the Home UI uses a dark/black background with red neon accents."""
+
+    def _home_theme(self) -> str:
+        """Return the Home-theme portion of the stylesheet."""
+        css = _css()
+        idx = css.find(".page-home")
+        return css[idx:] if idx >= 0 else ""
+
+    def test_home_bg_variable_is_black(self):
+        """Home background variable must be a near-black colour."""
+        css = _css()
+        assert re.search(r"--home-bg:\s*#0a0a0a", css), \
+            "--home-bg must be #0a0a0a (dark/black)"
+
+    def test_page_home_uses_dark_background(self):
+        """.page-home must paint the dark background."""
+        theme = self._home_theme()
+        assert ".page-home" in theme
+        assert "background-color: var(--home-bg)" in theme, \
+            ".page-home should use the dark --home-bg background"
+
+    def test_red_neon_variables_defined(self):
+        """Red neon accent variables must be defined."""
+        css = _css()
+        assert "--neon-red" in css, "CSS must define --neon-red accent"
+        assert "--neon-red-glow" in css, "CSS must define --neon-red-glow"
+
+    def test_home_cards_have_neon_border_and_glow(self):
+        """Home cards must have a red neon border + glow shadow."""
+        theme = self._home_theme()
+        idx = theme.find(".page-home .welcome-card")
+        assert idx >= 0, "Home cards must be styled within .page-home"
+        block = theme[idx:idx + 500]
+        assert "neon-red-border" in block, \
+            "Home cards should use the red neon border"
+        assert "box-shadow" in block and "neon-red-glow" in block, \
+            "Home cards should glow with red neon shadow"
+
+    def test_home_section_icons_are_red(self):
+        """Section icons inside Home should be red neon."""
+        theme = self._home_theme()
+        idx = theme.find(".page-home .section-icon")
+        assert idx >= 0, ".page-home .section-icon must exist"
+        nearby = theme[idx:idx + 200]
+        assert "--neon-red" in nearby
+
+    def test_other_pages_not_restyled(self):
+        """Theme rules must be scoped to .page-home (Home only)."""
+        css = _css()
+        theme = self._home_theme()
+        # The dark background override must only appear under .page-home
+        for rule in re.findall(r"([^{}]+)\{[^}]*--home-bg[^}]*\}", theme):
+            assert ".page-home" in rule or ":root" in rule or "--home-bg" in rule
+
+
+# ══════════════════════════════════════════════════════════════════
+# 15. Withdraw (RED + up arrow) and Charge (GREEN + down arrow) buttons
+# ══════════════════════════════════════════════════════════════════
+class TestActionButtonsTheme:
+    """Verify السحب is red with an up arrow, الشحن is green with a down arrow."""
+
+    def test_withdraw_button_is_red(self):
+        """#btn-withdraw must use a red gradient background."""
+        css = _css()
+        idx = css.find("#btn-withdraw")
+        assert idx >= 0, "CSS must style #btn-withdraw"
+        block = css[idx:idx + 400]
+        assert "linear-gradient" in block, \
+            "Withdraw button should use a gradient fill"
+        assert "#ff5252" in block and "#d50000" in block, \
+            "Withdraw button must be RED"
+
+    def test_charge_button_is_green(self):
+        """#btn-charge must use a green gradient background."""
+        css = _css()
+        idx = css.find("#btn-charge")
+        assert idx >= 0, "CSS must style #btn-charge"
+        block = css[idx:idx + 400]
+        assert "linear-gradient" in block, \
+            "Charge button should use a gradient fill"
+        assert "#4dff9f" in block and "#009e4f" in block, \
+            "Charge button must be GREEN"
+
+    def test_withdraw_button_has_up_arrow(self):
+        """السحب button must render an up arrow ▲▲ near its label."""
+        html = _html()
+        idx = html.find('id="btn-withdraw"')
+        assert idx >= 0
+        block = html[idx:idx + 300]
+        assert "⬆" in block, \
+            "Withdraw button must contain an up arrow (⬆)"
+        assert "السحب" in block, "Withdraw button must keep its label"
+
+    def test_charge_button_has_down_arrow(self):
+        """الشحن button must render a down arrow near its label."""
+        html = _html()
+        idx = html.find('id="btn-charge"')
+        assert idx >= 0
+        block = html[idx:idx + 300]
+        assert "⬇" in block, \
+            "Charge button must contain a down arrow (⬇)"
+        assert "الشحن" in block, "Charge button must keep its label"
+
+    def test_arrows_are_decorative_spans(self):
+        """Arrows should live in .btn-arrow spans (aria-hidden)."""
+        html = _html()
+        assert 'class="btn-arrow"' in html
+        assert html.count('class="btn-arrow"') == 2, \
+            "Exactly two arrow spans expected (withdraw + charge)"
+
+    def test_button_action_ids_unchanged(self):
+        """data-action wiring must be preserved (no logic change)."""
+        html = _html()
+        assert 'data-action="charge"' in html
+        assert 'data-action="withdraw"' in html
+
+
+# ══════════════════════════════════════════════════════════════════
+# 16. Constraints — RTL, responsive, no branding, structure unchanged
+# ══════════════════════════════════════════════════════════════════
+class TestThemeConstraints:
+    """Verify RTL, mobile responsiveness, no external branding, stable structure."""
+
+    def test_rtl_preserved(self):
+        html = _html()
+        assert 'dir="rtl"' in html, "RTL direction must be preserved"
+        assert 'lang="ar"' in html, "Arabic language must be preserved"
+
+    def test_viewport_preserved(self):
+        html = _html()
+        assert "width=device-width" in html, \
+            "Mobile viewport meta tag must be preserved"
+
+    def test_responsive_media_queries_preserved(self):
+        css = _css()
+        assert "@media" in css, \
+            "Responsive media queries must remain in the stylesheet"
+
+    def test_no_external_branding(self):
+        """No Vodafone Cash or any external branding in Mini App files."""
+        banned = ["vodafone", "فودافون", "vodafone cash", "فودافون كاش"]
+        for path in [
+            "miniapp/index.html",
+            "miniapp/css/app.css",
+            "miniapp/js/home.js",
+            "miniapp/js/header.js",
+        ]:
+            content = _read(path).lower()
+            for word in banned:
+                assert word not in content, \
+                    f"External branding '{word}' found in {path}"
+
+    def test_home_section_order_unchanged(self):
+        """The 7 Home sections must keep their original render order."""
+        content = _home_js()
+        order = re.findall(r"page\.appendChild\(_build(\w+)\(\)\)", content)
+        assert order == [
+            "WelcomeSection",
+            "BalanceSection",
+            "DailyCheckinSection",
+            "OfficialGuideSection",
+            "AddTaskSection",
+            "AccountLinkingSection",
+            "HotTasksSection",
+        ], f"Home section order changed: {order}"
+
+    def test_home_js_content_unchanged_by_theme(self):
+        """Theme work must not inject logic into home.js."""
+        content = _home_js()
+        assert "fetch(" not in content
+        assert "style=" not in content, \
+            "Inline styles belong in CSS, not home.js"
+
+    def test_no_backend_files_reference_theme(self):
+        """Backend/task-logic modules must not be touched by the theme."""
+        for path in ["task_verifier.py", "task_completion.py", "db.py"]:
+            if os.path.exists(path):
+                content = _read(path).lower()
+                assert "neon" not in content and "page-home" not in content, \
+                    f"Theme references leaked into backend file {path}"

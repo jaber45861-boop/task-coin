@@ -460,3 +460,122 @@ body {
     font-size: 14px;
     color: var(--text-secondary);
 }
+
+/* ══════════════════════════════════════════════════════════════
+   Home UI Theme — Dark/Black background with Red neon accents
+   Scoped to .page-home only — other pages stay unchanged.
+   ══════════════════════════════════════════════════════════════ */
+
+:root {
+    --home-bg: #0a0a0a;
+    --home-card-bg: #141414;
+    --home-card-inner-bg: #1d1d1d;
+    --home-text: #f2f2f2;
+    --home-text-secondary: #9a9a9a;
+    --neon-red: #ff2d2d;
+    --neon-red-border: rgba(255, 45, 45, 0.55);
+    --neon-red-glow: rgba(255, 45, 45, 0.35);
+    --neon-green: #00e676;
+    --neon-green-glow: rgba(0, 230, 118, 0.40);
+}
+
+/* Home page background — dark/black */
+.page-home {
+    background-color: var(--home-bg);
+    color: var(--home-text);
+}
+
+/* Home cards — near-black with red neon outline + glow */
+.page-home .welcome-card,
+.page-home .balance-card,
+.page-home .section-card {
+    background-color: var(--home-card-bg);
+    border: 1px solid var(--neon-red-border);
+    box-shadow: 0 0 10px var(--neon-red-glow), inset 0 0 8px rgba(255, 45, 45, 0.05);
+}
+
+/* Inner tiles — dark with subtle red tint */
+.page-home .balance-item,
+.page-home .add-task-body,
+.page-home .account-linking-body,
+.page-home .hot-tasks-body {
+    background-color: var(--home-card-inner-bg);
+    border: 1px solid rgba(255, 45, 45, 0.22);
+}
+
+.page-home .checkin-body,
+.page-home .guide-body {
+    background-color: rgba(255, 45, 45, 0.07);
+    border: 1px solid rgba(255, 45, 45, 0.35);
+}
+
+/* Avatar ring — red neon */
+.page-home .welcome-avatar {
+    background-color: var(--home-card-inner-bg);
+    border: 2px solid var(--neon-red);
+    box-shadow: 0 0 8px var(--neon-red-glow);
+}
+
+/* Home text colors */
+.page-home .welcome-name,
+.page-home .section-title,
+.page-home .balance-value {
+    color: var(--home-text);
+}
+
+.page-home .section-icon {
+    color: var(--neon-red);
+}
+
+.page-home .welcome-username,
+.page-home .balance-label,
+.page-home .balance-empty,
+.page-home .checkin-status,
+.page-home .guide-status,
+.page-home .account-linking-status,
+.page-home .hot-tasks-empty {
+    color: var(--home-text-secondary);
+}
+
+/* Level badge — green pill (matches reference) */
+.page-home .welcome-level {
+    align-self: flex-start;
+    color: var(--neon-green);
+    background-color: rgba(0, 230, 118, 0.10);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-weight: 600;
+}
+
+/* Disabled Add-Task CTA on dark background */
+.page-home .add-task-cta:disabled {
+    background-color: #242424;
+    color: #7a7a7a;
+    border: 1px solid rgba(255, 45, 45, 0.25);
+    opacity: 1;
+}
+
+/* ── Action buttons ──────────────────────────────────────────
+   Withdraw = RED with up arrow ▲ / Charge = GREEN with down arrow ▼ */
+#btn-withdraw,
+.header-btn.header-btn-withdraw {
+    background: linear-gradient(180deg, #ff5252 0%, #d50000 100%);
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(255, 45, 45, 0.55);
+}
+
+#btn-charge,
+.header-btn.header-btn-charge {
+    background: linear-gradient(180deg, #4dff9f 0%, #009e4f 100%);
+    color: #ffffff;
+    box-shadow: 0 0 12px var(--neon-green-glow);
+}
+
+.btn-arrow {
+    display: inline-block;
+    margin-inline-end: 4px;
+    font-size: 14px;
+    line-height: 1;
+    vertical-align: -1px;
+}
