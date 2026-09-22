@@ -3,7 +3,7 @@ Tests for Task Coin Mini App Shell
 
 Verifies:
 - Mini App loads correctly
-- Header renders الشحن and السحب
+- Old header action buttons are gone (moved into the Wallet page)
 - Bottom navigation renders الرئيسية, المهام, حسابي
 - Active navigation state changes correctly
 - No existing backend tests are broken
@@ -38,31 +38,31 @@ class TestMiniAppStructure:
 
 
 class TestMiniAppHeader:
-    """Test the header component renders correctly."""
+    """Test the header component: old action buttons fully removed."""
 
     def _read_html(self):
         with open("miniapp/index.html", "r", encoding="utf-8") as f:
             return f.read()
 
-    def test_header_renders_charge_button(self):
-        """Verify الشحن button exists in header."""
+    def test_header_does_not_render_charge_button(self):
+        """Old الشحن button must be gone from the header."""
         html = self._read_html()
-        assert "الشحن" in html, "Header should contain الشحن button"
+        assert "الشحن" not in html, "Header must not render the old الشحن button"
 
-    def test_header_renders_withdraw_button(self):
-        """Verify السحب button exists in header."""
+    def test_header_does_not_render_withdraw_button(self):
+        """Old السحب button must be gone from the header."""
         html = self._read_html()
-        assert "السحب" in html, "Header should contain السحب button"
+        assert "السحب" not in html, "Header must not render the old السحب button"
 
-    def test_header_has_charge_button_id(self):
-        """Verify charge button has correct ID."""
+    def test_header_has_no_charge_button_id(self):
+        """The btn-charge element must no longer exist."""
         html = self._read_html()
-        assert 'id="btn-charge"' in html, "Charge button should have id='btn-charge'"
+        assert 'id="btn-charge"' not in html, "Old charge button still present"
 
-    def test_header_has_withdraw_button_id(self):
-        """Verify withdraw button has correct ID."""
+    def test_header_has_no_withdraw_button_id(self):
+        """The btn-withdraw element must no longer exist."""
         html = self._read_html()
-        assert 'id="btn-withdraw"' in html, "Withdraw button should have id='btn-withdraw'"
+        assert 'id="btn-withdraw"' not in html, "Old withdraw button still present"
 
     def test_header_is_semantic(self):
         """Verify header uses semantic HTML."""

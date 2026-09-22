@@ -33,6 +33,22 @@ const Home = (() => {
 
         // Get Telegram user data if available
         const user = typeof TelegramApp !== 'undefined' ? TelegramApp.getUser() : null;
+
+        // Wallet balance shown beside the profile (same shared data
+        // source as the Wallet page — neutral placeholder while no
+        // backend wallet API exists; never a hard-coded amount).
+        const balance = typeof WalletData !== 'undefined'
+            ? WalletData.getBalance()
+            : { availableUnits: null, egpDisplayMinor: null };
+        const usdtText = typeof WalletData !== 'undefined'
+            ? WalletData.formatUsdt(balance.availableUnits)
+            : '—';
+        const egpText = typeof WalletData !== 'undefined'
+            ? WalletData.formatEgp(balance.egpDisplayMinor)
+            : '—';
+
+        // Shared inline-SVG wallet icon (defined by wallet.js).
+        const walletIcon = typeof WalletIcon !== 'undefined' ? WalletIcon : '👛';
         const firstName = user?.first_name || null;
         const username = user?.username || null;
         const photoUrl = user?.photo_url || null;
@@ -63,9 +79,25 @@ const Home = (() => {
                     <span class="welcome-name" data-testid="home-username">${displayName}</span>
                     ${usernameHtml}
                     <span class="welcome-level" data-testid="home-level">المستوى: قريباً</span>
+                    <div class="welcome-balance" data-testid="home-wallet-balance">
+                        <span class="welcome-balance-usdt" data-testid="home-wallet-usdt">${usdtText} USDT</span>
+                        <span class="welcome-balance-egp" data-testid="home-wallet-egp">≈ ${egpText} EGP</span>
+                    </div>
                 </div>
+                <button type="button" class="wallet-button" data-testid="home-wallet-button">
+                    <span class="wallet-button-icon" aria-hidden="true">${walletIcon}</span>
+                    <span class="wallet-button-label">المحفظة</span>
+                </button>
             </div>
         `;
+
+        // The circular wallet button opens the Wallet page through the
+        // existing navigation router (haptic feedback included there).
+        const walletButton = section.querySelector('[data-testid="home-wallet-button"]');
+        walletButton.addEventListener('click', () => {
+            Navigation.navigateTo('wallet');
+        });
+
         return section;
     }
 

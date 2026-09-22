@@ -29,17 +29,13 @@ const App = (() => {
 
     /**
      * Handle header button actions
+     *
+     * The old header action bar was removed in favour of the Wallet
+     * page (MT-UI-03); Header.init remains wired as the
+     * generic header action bus.
      */
     function handleHeaderAction(action) {
-        // Placeholder for future charge/withdraw functionality
         console.log('Header action:', action);
-        
-        // For now, just show a placeholder
-        if (action === 'charge') {
-            showPlaceholder('الشحن');
-        } else if (action === 'withdraw') {
-            showPlaceholder('السحب');
-        }
     }
 
     /**
@@ -50,9 +46,10 @@ const App = (() => {
     }
 
     /**
-     * Render a page from template or dynamic component.
-     * The 'home' page is built by the Home module;
-     * other pages use HTML <template> cloning.
+     * Render a page from a dynamic component or template.
+     * The 'home' page is built by the Home module and the 'wallet'
+     * page by the Wallet module; other pages use HTML <template>
+     * cloning — same routing pattern as before.
      */
     function renderPage(page) {
         // Clear current content
@@ -62,6 +59,8 @@ const App = (() => {
 
         if (page === 'home' && typeof Home !== 'undefined') {
             pageEl = Home.render();
+        } else if (page === 'wallet' && typeof Wallet !== 'undefined') {
+            pageEl = Wallet.render();
         } else {
             const template = document.getElementById(`page-${page}`);
 
@@ -87,24 +86,6 @@ const App = (() => {
         // Presentational only: let CSS scope page-specific chrome
         // (header action buttons are shown on Home only).
         document.body.dataset.page = page;
-    }
-
-    /**
-     * Show a placeholder message (for header actions)
-     */
-    function showPlaceholder(action) {
-        const template = document.getElementById('page-home');
-        const placeholder = template.content.cloneNode(true);
-        
-        const pageEl = placeholder.querySelector('.page');
-        if (pageEl) {
-            pageEl.querySelector('h2').textContent = action;
-            pageEl.querySelector('.placeholder-text').textContent = 
-                `${action} - قريباً`;
-        }
-
-        contentEl.innerHTML = '';
-        contentEl.appendChild(placeholder);
     }
 
     /**

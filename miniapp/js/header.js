@@ -1,6 +1,8 @@
 /**
  * Header Component
- * Handles the top action buttons (الشحن/السحب)
+ * Generic header action bus.  The old top action buttons were removed
+ * in favour of the Wallet page (MT-UI-03); the component keeps its
+ * action wiring so future header actions have one home.
  */
 const Header = (() => {
     let onActionCallback = null;
@@ -10,17 +12,6 @@ const Header = (() => {
      */
     function init(callback) {
         onActionCallback = callback;
-        
-        const chargeBtn = document.getElementById('btn-charge');
-        const withdrawBtn = document.getElementById('btn-withdraw');
-
-        if (chargeBtn) {
-            chargeBtn.addEventListener('click', () => handleAction('charge'));
-        }
-
-        if (withdrawBtn) {
-            withdrawBtn.addEventListener('click', () => handleAction('withdraw'));
-        }
     }
 
     /**

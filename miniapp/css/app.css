@@ -74,39 +74,18 @@ body {
     z-index: 100;
 }
 
-.header-actions {
-    display: flex;
-    gap: 12px;
-    padding: 0 16px;
-    width: 100%;
-    max-width: 400px;
-    justify-content: center;
-}
-
-.header-btn {
-    flex: 1;
-    max-width: 150px;
-    padding: 10px 20px;
-    border: none;
-    border-radius: 12px;
-    background-color: var(--accent-color);
-    color: #ffffff;
-    font-size: 16px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity 0.2s, transform 0.1s;
-    -webkit-tap-highlight-color: transparent;
-}
-
-.header-btn:active {
-    opacity: 0.8;
-    transform: scale(0.98);
+/* The header action bar was removed (MT-UI-03): those actions now
+   live inside the Wallet page. Collapse the now-empty header so page
+   content starts at the top of the screen. */
+.app-header:empty {
+    display: none;
 }
 
 /* Main Content */
 .app-content {
     flex: 1;
-    margin-top: calc(var(--header-height) + var(--safe-area-top));
+    margin-top: 0;
+    padding-top: var(--safe-area-top);
     margin-bottom: calc(var(--nav-height) + var(--safe-area-bottom));
     overflow-y: auto;
     overflow-x: hidden;
@@ -207,16 +186,6 @@ body {
 }
 
 /* Responsive Adjustments */
-@media (min-width: 400px) {
-    .header-actions {
-        justify-content: center;
-    }
-    
-    .header-btn {
-        max-width: 180px;
-    }
-}
-
 @media (min-width: 500px) {
     .page {
         padding: 24px;
@@ -477,6 +446,7 @@ body {
     --neon-red-glow: rgba(255, 45, 45, 0.35);
     --neon-green: #00e676;
     --neon-green-glow: rgba(0, 230, 118, 0.40);
+    --home-gold: #ffd166;
 }
 
 /* Home page background — dark/black */
@@ -557,16 +527,15 @@ body {
 }
 
 /* ── Action buttons ──────────────────────────────────────────
-   Withdraw = RED with up arrow ▲ / Charge = GREEN with down arrow ▼ */
-#btn-withdraw,
-.header-btn.header-btn-withdraw {
+   Withdraw (السحب) = RED with up arrow /
+   Deposit (الإيداع) = GREEN with down arrow */
+.wallet-action-withdraw {
     background: linear-gradient(180deg, #ff5252 0%, #d50000 100%);
     color: #ffffff;
     box-shadow: 0 0 12px rgba(255, 45, 45, 0.55);
 }
 
-#btn-charge,
-.header-btn.header-btn-charge {
+.wallet-action-deposit {
     background: linear-gradient(180deg, #4dff9f 0%, #009e4f 100%);
     color: #ffffff;
     box-shadow: 0 0 12px var(--neon-green-glow);
@@ -582,11 +551,12 @@ body {
 
 /* ══════════════════════════════════════════════════════════════
    Unified Tasks & Account theme — same dark/black + red neon as
-   Home. Withdraw/Charge buttons belong to Home only: the header
-   action bar is hidden on the Tasks and Account pages.
+   Home. The old header action bar was removed (MT-UI-03); the empty
+   header is collapsed globally via .app-header:empty, and the rules
+   below keep off-Home pages explicitly offset-free.
    ══════════════════════════════════════════════════════════════ */
 
-/* Hide the header action buttons (السحب / الشحن) off Home */
+/* Hide the (now empty) header on Tasks and Account pages */
 body[data-page="tasks"] .app-header,
 body[data-page="profile"] .app-header {
     display: none;
@@ -622,4 +592,447 @@ body[data-page="profile"] .app-content {
 .page-tasks .placeholder-text,
 .page-profile .placeholder-text {
     color: var(--home-text-secondary);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MT-UI-03 — Wallet UI (State B) + Home wallet button (State A)
+   Same black / neon-red / green visual system as Home.
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Home: circular wallet button beside the profile ──────────── */
+.wallet-button {
+    width: 52px;
+    height: 52px;
+    flex-shrink: 0;
+    padding: 0;
+    border-radius: 50%;
+    background-color: #0d0d0d;
+    border: 2px solid var(--neon-red);
+    box-shadow: 0 0 10px var(--neon-red-glow);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.1s, box-shadow 0.2s;
+}
+
+.wallet-button:active {
+    transform: scale(0.94);
+    box-shadow: 0 0 16px rgba(255, 45, 45, 0.6);
+}
+
+.wallet-button:focus-visible {
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
+}
+
+.wallet-button-icon {
+    display: block;
+    width: 24px;
+    height: 24px;
+    line-height: 0;
+}
+
+.wallet-icon-svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.wallet-button-label {
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--home-text);
+}
+
+/* ── Home: balance block under the level pill ─────────────────── */
+.welcome-balance {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    margin-top: 2px;
+    padding: 6px 10px;
+    background-color: rgba(0, 230, 118, 0.08);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+    border-radius: 10px;
+    min-width: 0;
+}
+
+.welcome-balance-usdt {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--home-text);
+    direction: ltr;
+    unicode-bidi: isolate;
+    white-space: nowrap;
+}
+
+.welcome-balance-egp {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--home-gold);
+    direction: ltr;
+    unicode-bidi: isolate;
+    white-space: nowrap;
+}
+
+/* ── Wallet page: dark background + red neon system ───────────── */
+.page-wallet {
+    background-color: var(--home-bg);
+    color: var(--home-text);
+}
+
+/* Header: back ‹ on the LEFT, title centered, wallet icon on the
+   RIGHT — forced with direction:ltr so the RTL page keeps the
+   approved layout while the DOM order stays semantic. */
+.wallet-header {
+    direction: ltr;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 48px;
+    margin-bottom: 14px;
+}
+
+.wallet-back {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--home-text);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 0.15s, transform 0.1s;
+}
+
+.wallet-back svg {
+    width: 26px;
+    height: 26px;
+}
+
+.wallet-back:active {
+    background-color: rgba(255, 45, 45, 0.18);
+    transform: scale(0.94);
+}
+
+.wallet-back:focus-visible {
+    outline: 2px solid var(--neon-red);
+    outline-offset: 2px;
+}
+
+.wallet-title {
+    flex: 1;
+    margin: 0;
+    text-align: center;
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--home-text);
+}
+
+.wallet-header-icon {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    line-height: 0;
+}
+
+/* ── Current balance card (رصيدك الحالي) ──────────────────────── */
+.wallet-balance-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 16px;
+    padding: 22px 14px;
+    background-color: var(--home-card-bg);
+    border: 1px solid var(--neon-red-border);
+    border-radius: 16px;
+    box-shadow: 0 0 14px var(--neon-red-glow),
+                inset 0 0 10px rgba(255, 45, 45, 0.05);
+}
+
+.wallet-balance-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--home-text);
+}
+
+.wallet-balance-amount {
+    direction: ltr;
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 8px;
+}
+
+.wallet-balance-value {
+    font-size: 30px;
+    font-weight: 800;
+    color: #ffffff;
+    letter-spacing: 0.5px;
+}
+
+.wallet-balance-currency {
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--neon-green);
+}
+
+.wallet-balance-egp {
+    direction: ltr;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--home-gold);
+}
+
+/* ── Withdraw / Deposit actions ───────────────────────────────── */
+.wallet-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.wallet-action-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.wallet-action {
+    width: 100%;
+    min-height: 64px;
+    padding: 10px 8px;
+    border: none;
+    border-radius: 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    color: #ffffff;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.1s, filter 0.2s;
+}
+
+.wallet-action .btn-arrow {
+    margin: 0;
+    font-size: 22px;
+    line-height: 1;
+    vertical-align: baseline;
+}
+
+.wallet-action-label {
+    font-size: 20px;
+    font-weight: 800;
+}
+
+.wallet-action:active {
+    transform: scale(0.97);
+    filter: brightness(1.08);
+}
+
+.wallet-action:focus-visible {
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
+}
+
+.wallet-action-caption {
+    font-size: 13px;
+    color: var(--home-text-secondary);
+    text-align: center;
+}
+
+/* ── Transaction history (سجل المعاملات) ──────────────────────── */
+.wallet-history {
+    padding: 16px;
+    background-color: var(--home-card-bg);
+    border: 1px solid var(--neon-red-border);
+    border-radius: 16px;
+    box-shadow: 0 0 14px var(--neon-red-glow),
+                inset 0 0 10px rgba(255, 45, 45, 0.05);
+}
+
+.wallet-history-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.wallet-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.wallet-history-empty {
+    display: block;
+    text-align: center;
+    padding: 24px 12px;
+    font-size: 14px;
+    color: var(--home-text-secondary);
+    background-color: rgba(255, 45, 45, 0.05);
+    border: 1px dashed rgba(255, 45, 45, 0.3);
+    border-radius: 12px;
+}
+
+.wallet-history-more {
+    width: 100%;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background-color: var(--home-card-inner-bg);
+    border: 1px solid rgba(255, 45, 45, 0.3);
+    border-radius: 12px;
+    color: var(--home-text);
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.1s, box-shadow 0.2s;
+}
+
+.wallet-history-more:active {
+    transform: scale(0.98);
+    box-shadow: 0 0 10px var(--neon-red-glow);
+}
+
+.wallet-history-more:focus-visible {
+    outline: 2px solid var(--neon-red);
+    outline-offset: 2px;
+}
+
+.wallet-history-more-icon,
+.wallet-history-chevron {
+    display: flex;
+    line-height: 0;
+    flex-shrink: 0;
+}
+
+.wallet-history-more-icon svg,
+.wallet-history-chevron svg {
+    width: 20px;
+    height: 20px;
+}
+
+.wallet-history-chevron {
+    color: var(--home-text-secondary);
+}
+
+/* ── Transaction row (future-ready; fed by WalletData) ────────── */
+.wallet-tx-row {
+    direction: ltr;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background-color: var(--home-card-inner-bg);
+    border: 1px solid rgba(255, 45, 45, 0.22);
+    border-radius: 12px;
+}
+
+.wallet-tx-icon {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: #ffffff;
+    font-size: 15px;
+}
+
+.wallet-tx-icon .wallet-tx-glyph {
+    margin: 0;
+    font-size: 15px;
+    vertical-align: baseline;
+}
+
+.wallet-tx-icon--withdraw {
+    background: linear-gradient(180deg, #ff5252 0%, #d50000 100%);
+    box-shadow: 0 0 8px rgba(255, 45, 45, 0.5);
+}
+
+.wallet-tx-icon--deposit {
+    background: linear-gradient(180deg, #4dff9f 0%, #009e4f 100%);
+    box-shadow: 0 0 8px var(--neon-green-glow);
+}
+
+.wallet-tx-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.wallet-tx-type {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--home-text);
+}
+
+.wallet-tx-date {
+    font-size: 12px;
+    color: var(--home-text-secondary);
+}
+
+.wallet-tx-figures {
+    margin-left: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    text-align: right;
+}
+
+.wallet-tx-amount {
+    font-size: 14px;
+    font-weight: 800;
+    direction: ltr;
+}
+
+.wallet-tx-amount--withdraw {
+    color: #ff6b6b;
+}
+
+.wallet-tx-amount--deposit {
+    color: var(--neon-green);
+}
+
+.wallet-tx-status {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--neon-green);
+}
+
+.wallet-tx-chevron {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--home-text-secondary);
+    line-height: 0;
+}
+
+.wallet-tx-chevron svg {
+    width: 18px;
+    height: 18px;
 }

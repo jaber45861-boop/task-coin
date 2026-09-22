@@ -8,17 +8,11 @@
     <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-    <!-- Top Header / Action Area -->
-    <header id="app-header" class="app-header">
-        <div class="header-actions">
-            <button id="btn-charge" class="header-btn header-btn-charge" data-action="charge">
-                <span class="btn-arrow" aria-hidden="true">⬇</span> الشحن
-            </button>
-            <button id="btn-withdraw" class="header-btn header-btn-withdraw" data-action="withdraw">
-                <span class="btn-arrow" aria-hidden="true">⬆</span> السحب
-            </button>
-        </div>
-    </header>
+    <!-- Top Header / Action Area
+         The old header action buttons were removed (MT-UI-03):
+         withdraw/deposit actions now live inside the Wallet page, which
+         opens from the circular wallet icon on Home. -->
+    <header id="app-header" class="app-header"></header>
 
     <!-- Main Content Area -->
     <main id="app-content" class="app-content">
@@ -69,6 +63,8 @@
     <script src="js/telegram.js"></script>
     <script src="js/header.js"></script>
     <script src="js/navigation.js"></script>
+    <script src="js/wallet-data.js"></script>
+    <script src="js/wallet.js"></script>
     <script src="js/home.js"></script>
     <script src="js/app.js"></script>
 </body>

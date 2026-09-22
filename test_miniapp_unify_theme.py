@@ -2,9 +2,9 @@
 Tests for the unified Tasks & Account UI theme (UNIFY micro-task).
 
 Verifies:
-- Withdraw (السحب) / Charge (الشحن) buttons are NOT visible on the
-  Tasks (المهام) and Account (حسابي) pages
-- They remain present and visible on Home (الرئيسية)
+- The old Withdraw (السحب) / Charge (الشحن) header buttons are gone
+  from the Home header entirely (moved into the Wallet page —
+  MT-UI-03), so they cannot appear on Tasks or Account either
 - Tasks & Account use the same dark/black + red-neon theme as Home
 - Red active states are applied (bottom navigation)
 - Page content/order is unchanged; RTL + mobile responsive preserved
@@ -66,7 +66,7 @@ def _rule_block(selector: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 class TestActionButtonsScopedToHome:
-    """Header action buttons must be hidden on Tasks & Account."""
+    """The header action bar is gone; its hiding rules stay valid."""
 
     def test_header_hidden_on_tasks_page(self):
         """CSS hides the header action bar when Tasks is active."""
@@ -126,14 +126,15 @@ class TestActionButtonsScopedToHome:
             assert banned not in tpl, \
                 f"Found '{banned}' inside the Account template"
 
-    def test_header_still_contains_both_buttons_for_home(self):
-        """Home keeps both action buttons in the header."""
+    def test_header_contains_no_action_buttons(self):
+        """The header must no longer contain either old action button
+        (they moved into the Wallet page — MT-UI-03)."""
         header = _header()
-        assert 'id="btn-withdraw"' in header, \
-            "Header must keep the withdraw button (Home)"
-        assert 'id="btn-charge"' in header, \
-            "Header must keep the charge button (Home)"
-        assert "السحب" in header and "الشحن" in header
+        assert 'id="btn-withdraw"' not in header, \
+            "Header must not keep the old withdraw button"
+        assert 'id="btn-charge"' not in header, \
+            "Header must not keep the old charge button"
+        assert "السحب" not in header and "الشحن" not in header
 
     def test_app_reflects_active_page_on_body(self):
         """app.js exposes the active page so CSS can scope the header."""
@@ -211,15 +212,16 @@ class TestUnifiedTheme:
         assert "--nav-active-color: #ff2d2d" in block, \
             "Active navigation state must be red (dark theme)"
 
-    def test_home_action_button_colors_retained(self):
-        """Unification must not drop Home's red/green buttons."""
+    def test_action_button_colors_retained(self):
+        """Unification must not drop the red/green action gradients
+        (now living on the Wallet page buttons)."""
         css = _css()
-        w = css[css.find("#btn-withdraw"):]
+        w = css[css.find(".wallet-action-withdraw"):]
         assert "#ff5252" in w[:400] and "#d50000" in w[:400], \
             "Withdraw must stay RED"
-        c = css[css.find("#btn-charge"):]
+        c = css[css.find(".wallet-action-deposit"):]
         assert "#4dff9f" in c[:400] and "#009e4f" in c[:400], \
-            "Charge must stay GREEN"
+            "Deposit must stay GREEN"
 
 
 # ══════════════════════════════════════════════════════════════════

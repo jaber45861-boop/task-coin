@@ -5,7 +5,7 @@ Verifies:
 - Home renders successfully
 - Home is the active default section
 - All 7 required Home sections exist
-- Header remains unchanged
+- Old header withdraw/charge buttons are removed (MT-UI-03)
 - Bottom navigation remains unchanged
 - No fake numeric balances are rendered
 - No fake task/reward data is rendered
@@ -158,27 +158,36 @@ class TestHomeArabicLabels:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 5. Header remains unchanged
+# 5. Old header withdraw/charge buttons removed (MT-UI-03)
 # ══════════════════════════════════════════════════════════════════════
 
-class TestHeaderUnchanged:
-    """Verify header still has الشحن and السحب."""
+class TestHeaderButtonsRemoved:
+    """The old header withdrawal/charge buttons must be fully gone."""
 
-    def test_header_has_charge(self):
+    def test_header_has_no_charge(self):
         html = _html()
-        assert "الشحن" in html
+        assert "الشحن" not in html, \
+            "Old charge button must be removed from Home markup"
 
-    def test_header_has_withdraw(self):
+    def test_header_has_no_withdraw(self):
         html = _html()
-        assert "السحب" in html
+        assert "السحب" not in html, \
+            "Old withdraw button must be removed from Home markup"
 
-    def test_header_charge_button_id(self):
+    def test_header_no_charge_button_id(self):
         html = _html()
-        assert 'id="btn-charge"' in html
+        assert 'id="btn-charge"' not in html, \
+            "btn-charge element must be removed"
 
-    def test_header_withdraw_button_id(self):
+    def test_header_no_withdraw_button_id(self):
         html = _html()
-        assert 'id="btn-withdraw"' in html
+        assert 'id="btn-withdraw"' not in html, \
+            "btn-withdraw element must be removed"
+
+    def test_header_actions_container_removed(self):
+        html = _html()
+        assert 'class="header-actions"' not in html, \
+            "Old header action bar container must be removed"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -652,72 +661,73 @@ class TestHomeDarkNeonTheme:
         """
         css = _css()
         theme = self._home_theme()
-        allowed = (".page-home", ".page-tasks", ".page-profile", ":root")
+        allowed = (".page-home", ".page-tasks", ".page-profile",
+                   ".page-wallet", ":root")
         for rule in re.findall(r"([^{}]+)\{[^}]*--home-bg[^}]*\}", theme):
             assert any(a in rule for a in allowed), \
                 f"Unexpected selector using --home-bg: {rule!r}"
 
 
 # ══════════════════════════════════════════════════════════════════
-# 15. Withdraw (RED + up arrow) and Charge (GREEN + down arrow) buttons
+# 15. Withdraw (RED + up arrow) / Deposit (GREEN + down arrow) — Wallet
 # ══════════════════════════════════════════════════════════════════
-class TestActionButtonsTheme:
-    """Verify السحب is red with an up arrow, الشحن is green with a down arrow."""
+class TestWalletActionButtonsTheme:
+    """Verify السحب is red with an up arrow, الإيداع is green with a
+    down arrow — now inside the Wallet page (MT-UI-03)."""
 
     def test_withdraw_button_is_red(self):
-        """#btn-withdraw must use a red gradient background."""
+        """The Wallet withdraw action must use a red gradient background."""
         css = _css()
-        idx = css.find("#btn-withdraw")
-        assert idx >= 0, "CSS must style #btn-withdraw"
+        idx = css.find(".wallet-action-withdraw")
+        assert idx >= 0, "CSS must style .wallet-action-withdraw"
         block = css[idx:idx + 400]
         assert "linear-gradient" in block, \
             "Withdraw button should use a gradient fill"
         assert "#ff5252" in block and "#d50000" in block, \
             "Withdraw button must be RED"
 
-    def test_charge_button_is_green(self):
-        """#btn-charge must use a green gradient background."""
+    def test_deposit_button_is_green(self):
+        """The Wallet deposit action must use a green gradient background."""
         css = _css()
-        idx = css.find("#btn-charge")
-        assert idx >= 0, "CSS must style #btn-charge"
+        idx = css.find(".wallet-action-deposit")
+        assert idx >= 0, "CSS must style .wallet-action-deposit"
         block = css[idx:idx + 400]
         assert "linear-gradient" in block, \
-            "Charge button should use a gradient fill"
+            "Deposit button should use a gradient fill"
         assert "#4dff9f" in block and "#009e4f" in block, \
-            "Charge button must be GREEN"
+            "Deposit button must be GREEN"
 
     def test_withdraw_button_has_up_arrow(self):
-        """السحب button must render an up arrow ▲▲ near its label."""
-        html = _html()
-        idx = html.find('id="btn-withdraw"')
+        """السحب button must render an up arrow (⬆) near its label."""
+        content = _read("miniapp/js/wallet.js")
+        idx = content.find("wallet-action-withdraw")
         assert idx >= 0
-        block = html[idx:idx + 300]
+        block = content[idx:idx + 300]
         assert "⬆" in block, \
             "Withdraw button must contain an up arrow (⬆)"
         assert "السحب" in block, "Withdraw button must keep its label"
 
-    def test_charge_button_has_down_arrow(self):
-        """الشحن button must render a down arrow near its label."""
-        html = _html()
-        idx = html.find('id="btn-charge"')
+    def test_deposit_button_has_down_arrow(self):
+        """الإيداع button must render a down arrow (⬇) near its label."""
+        content = _read("miniapp/js/wallet.js")
+        idx = content.find("wallet-action-deposit")
         assert idx >= 0
-        block = html[idx:idx + 300]
+        block = content[idx:idx + 300]
         assert "⬇" in block, \
-            "Charge button must contain a down arrow (⬇)"
-        assert "الشحن" in block, "Charge button must keep its label"
+            "Deposit button must contain a down arrow (⬇)"
+        assert "الإيداع" in block, "Deposit button must keep its label"
 
     def test_arrows_are_decorative_spans(self):
         """Arrows should live in .btn-arrow spans (aria-hidden)."""
-        html = _html()
-        assert 'class="btn-arrow"' in html
-        assert html.count('class="btn-arrow"') == 2, \
-            "Exactly two arrow spans expected (withdraw + charge)"
+        content = _read("miniapp/js/wallet.js")
+        assert content.count('class="btn-arrow"') == 2, \
+            "Exactly two action arrow spans expected (withdraw + deposit)"
 
-    def test_button_action_ids_unchanged(self):
-        """data-action wiring must be preserved (no logic change)."""
-        html = _html()
-        assert 'data-action="charge"' in html
-        assert 'data-action="withdraw"' in html
+    def test_button_action_wiring_preserved(self):
+        """data-action wiring kept on the Wallet action buttons."""
+        content = _read("miniapp/js/wallet.js")
+        assert 'data-action="deposit"' in content
+        assert 'data-action="withdraw"' in content
 
 
 # ══════════════════════════════════════════════════════════════════

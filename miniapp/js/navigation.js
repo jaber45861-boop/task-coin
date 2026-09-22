@@ -33,10 +33,15 @@ const Navigation = (() => {
             window.Telegram.WebApp.HapticFeedback.impactOccurred('light');
         }
 
+        // The Wallet page is opened from the Home wallet icon — it is
+        // NOT a bottom-navigation tab, so the Home tab stays active
+        // while the Wallet page is open (approved design).
+        const activeTab = page === 'wallet' ? 'home' : page;
+
         // Update active state
         const navItems = document.querySelectorAll('.nav-item');
         navItems.forEach(item => {
-            item.classList.toggle('active', item.dataset.page === page);
+            item.classList.toggle('active', item.dataset.page === activeTab);
         });
 
         currentPage = page;
