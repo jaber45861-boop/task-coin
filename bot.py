@@ -31,6 +31,13 @@ from subscription import (
     lock_user,
     unlock_user,
 )
+import asyncio
+import signal
+import threading
+
+from flask import Flask, send_from_directory
+from waitress import create_server
+
 import db
 
 load_dotenv()
@@ -1112,6 +1119,223 @@ async def admin_panel_callback(
         logger.info("Channels listed by admin %d via panel", user_id)
 
 
+# ── WispByte single-entry runtime ─────────────────────────────────
+# WispByte starts the project with `python bot.py` only — it does not run
+# the Procfile. This process must therefore serve the Mini App over HTTP
+# (0.0.0.0:$PORT, Waitress) *and* keep the Telegram bot polling, without
+# a second server or process manager.
+
+_SINGLE_ENTRY_RUNNING = False
+
+
+def create_mini_app() -> Flask:
+    """Create the Flask application that serves the Mini App static files.
+
+    Serves ``miniapp/index.html`` at ``/`` and all static assets (CSS, JS,
+    images) under ``/<path>``.
+    """
+    mini_app = Flask(__name__)
+    miniapp_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "miniapp"
+    )
+
+    @mini_app.route("/")
+    def mini_app_index():
+        """Serve the Mini App entry point."""
+        return send_from_directory(miniapp_dir, "index.html")
+
+    @mini_app.route("/<path:path>")
+    def mini_app_static(path):
+        """Serve static assets (CSS, JS, images, etc.)."""
+        return send_from_directory(miniapp_dir, path)
+
+    return mini_app
+
+
+def create_mini_app_server(host: str = "0.0.0.0", port: "int | None" = None):
+    """Create and bind the Waitress production WSGI server for the Mini App.
+
+    Reads ``PORT`` from the environment (default ``5000``) unless *port* is
+    given, and binds ``0.0.0.0`` as required by WispByte. The socket is bound
+    during creation, so an ``OSError`` (e.g. address already in use) is
+    raised immediately — deterministic startup-error reporting before any
+    Telegram resource is created. Use ``server.run()`` to start accepting
+    requests and ``server.close()`` for a clean shutdown.
+    """
+    if port is None:
+        port = int(os.environ.get("PORT", 5000))
+    return create_server(create_mini_app(), host=host, port=port)
+
+
+def _handle_shutdown_signal(signum, frame) -> None:
+    """Turn OS shutdown signals into a graceful single-entry shutdown.
+
+    Raised on the main thread while ``server.run()`` is executing. Waitress
+    catches ``KeyboardInterrupt``/``SystemExit`` and stops accepting requests,
+    which lands in ``run_single_entry()``'s teardown: the Telegram lifecycle
+    is stopped and the HTTP socket is closed, in that order.
+    """
+    logger.info(
+        "Shutdown signal received (%s) — stopping Mini App HTTP server and Telegram bot",
+        signum,
+    )
+    raise KeyboardInterrupt
+
+
+async def _stop_telegram_application(application: Application) -> None:
+    """Stop the Telegram application in ``run_polling``'s teardown order.
+
+    Mirrors ``Application.__run``: ``updater.stop`` → ``stop`` → ``post_stop``
+    → ``shutdown`` → ``post_shutdown``, each step guarded so a failure in one
+    step never prevents the others — no PTB resources are left hanging.
+    """
+    try:
+        if application.updater is not None and application.updater.running:
+            await application.updater.stop()
+    except Exception:
+        logger.exception("Error while stopping Telegram updater")
+    try:
+        if application.running:
+            await application.stop()
+            if application.post_stop:
+                await application.post_stop(application)
+    except Exception:
+        logger.exception("Error while stopping Telegram application")
+    try:
+        await application.shutdown()
+        if application.post_shutdown:
+            await application.post_shutdown(application)
+    except Exception:
+        logger.exception("Error while shutting down Telegram application")
+
+
+def _run_telegram_bot(application: Application, stop_event: threading.Event) -> None:
+    """Run the Telegram bot in a controlled background execution context.
+
+    Mirrors ``Application.run_polling``'s internal lifecycle on a dedicated
+    event loop:
+
+    ``initialize → post_init → updater.start_polling → start`` … wait for
+    *stop_event* … ``updater.stop → stop → post_stop → shutdown → post_shutdown``
+
+    Polling errors are forwarded to the application's registered error
+    handlers via the same ``error_callback`` wrapper ``run_polling`` installs.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _error_callback(exc: TelegramError) -> None:
+        application.create_task(application.process_error(error=exc, update=None))
+
+    async def _lifecycle() -> None:
+        try:
+            await application.initialize()
+            if application.post_init:
+                await application.post_init(application)
+            await application.updater.start_polling(
+                error_callback=_error_callback,
+            )
+            await application.start()
+            logger.info("Telegram bot polling started (background thread)")
+            while not stop_event.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            logger.info("Telegram bot stopping...")
+            await _stop_telegram_application(application)
+
+    try:
+        loop.run_until_complete(_lifecycle())
+    except Exception:
+        logger.exception("Telegram bot background thread error")
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+def run_single_entry(application: Application) -> None:
+    """Run the Mini App HTTP server and the Telegram bot from this process.
+
+    WispByte's Startup Command is ``python bot.py`` and it does not execute
+    the Procfile, so this one process provides both:
+
+    * **HTTP** — Waitress serves the Mini App on ``0.0.0.0:$PORT`` in the
+      main thread; this is the listener WispByte's reverse proxy routes to.
+    * **Telegram** — polling runs in a background thread with PTB's full
+      lifecycle, stopped cleanly via *stop_event*.
+
+    The HTTP listener is bound **before** any Telegram resource is created:
+    if the bind fails, ``OSError`` propagates immediately (logged clearly)
+    and nothing else has been started. Exactly one HTTP server is created
+    per process — a concurrent second call raises ``RuntimeError``.
+    """
+    global _SINGLE_ENTRY_RUNNING
+    if _SINGLE_ENTRY_RUNNING:
+        raise RuntimeError(
+            "Mini App HTTP server is already running — duplicate startup prevented"
+        )
+    _SINGLE_ENTRY_RUNNING = True
+    try:
+        # 1. Bind the HTTP listener first: fail fast, fail clearly.
+        try:
+            server = create_mini_app_server()
+        except OSError as exc:
+            logger.error(
+                "Mini App HTTP server failed to bind on 0.0.0.0:%s — %s",
+                os.environ.get("PORT", "5000"),
+                exc,
+            )
+            raise
+        logger.info(
+            "Mini App server bound on %s:%s",
+            server.effective_host,
+            server.effective_port,
+        )
+
+        # 2. Telegram bot: controlled background execution context.
+        stop_event = threading.Event()
+        bot_thread = threading.Thread(
+            target=_run_telegram_bot,
+            args=(application, stop_event),
+            name="telegram-bot",
+        )
+
+        # 3. Graceful OS-signal handling while the main thread serves HTTP.
+        previous_handlers: dict = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGABRT):
+                previous_handlers[sig] = signal.signal(sig, _handle_shutdown_signal)
+
+        thread_started = False
+        try:
+            bot_thread.start()
+            thread_started = True
+            # Waitress owns the main thread until a shutdown signal arrives;
+            # its run() converts KeyboardInterrupt/SystemExit into a clean
+            # return, landing in the teardown below.
+            server.run()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            # Ordered shutdown: Telegram first, then the HTTP listener.
+            logger.info("HTTP server stopped. Shutting down Telegram bot...")
+            stop_event.set()
+            if thread_started:
+                bot_thread.join(timeout=10)
+                if bot_thread.is_alive():
+                    logger.warning(
+                        "Telegram bot thread did not stop within timeout"
+                    )
+            try:
+                server.close()
+            except Exception:
+                logger.exception("Error while closing the Mini App HTTP server")
+    finally:
+        _SINGLE_ENTRY_RUNNING = False
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1252,7 +1476,10 @@ def main() -> None:
     app.post_init = _combined_post_init
 
     logger.info("Bot is starting...")
-    app.run_polling()
+    # WispByte runs only `python bot.py` — no Procfile, no second process.
+    # This process serves the Mini App HTTP on 0.0.0.0:$PORT (Waitress, main
+    # thread) while Telegram polling runs in a controlled background thread.
+    run_single_entry(app)
 
 
 # ── Telegram Mini App Menu Button ───────────────────────────────────
