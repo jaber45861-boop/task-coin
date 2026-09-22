@@ -83,6 +83,10 @@ const App = (() => {
         pageEl.classList.add('page-enter');
 
         currentPage = page;
+
+        // Presentational only: let CSS scope page-specific chrome
+        // (header action buttons are shown on Home only).
+        document.body.dataset.page = page;
     }
 
     /**

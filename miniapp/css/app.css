@@ -10,7 +10,7 @@
     --accent-color: #0088cc;
     --header-bg: #ffffff;
     --nav-bg: #ffffff;
-    --nav-active-color: #0088cc;
+    --nav-active-color: #ff2d2d;
     --nav-inactive-color: #888888;
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
@@ -27,7 +27,7 @@ body.dark {
     --border-color: #3a3a3a;
     --header-bg: #1a1a1a;
     --nav-bg: #1a1a1a;
-    --nav-active-color: #4ca5e0;
+    --nav-active-color: #ff2d2d;
     --nav-inactive-color: #888888;
 }
 
@@ -578,4 +578,48 @@ body {
     font-size: 14px;
     line-height: 1;
     vertical-align: -1px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Unified Tasks & Account theme — same dark/black + red neon as
+   Home. Withdraw/Charge buttons belong to Home only: the header
+   action bar is hidden on the Tasks and Account pages.
+   ══════════════════════════════════════════════════════════════ */
+
+/* Hide the header action buttons (السحب / الشحن) off Home */
+body[data-page="tasks"] .app-header,
+body[data-page="profile"] .app-header {
+    display: none;
+}
+
+/* Compensate the removed header offset on those pages */
+body[data-page="tasks"] .app-content,
+body[data-page="profile"] .app-content {
+    margin-top: 0;
+}
+
+/* Dark/black page background — same as Home */
+.page-tasks,
+.page-profile {
+    background-color: var(--home-bg);
+    color: var(--home-text);
+}
+
+.page-tasks .page-header h2,
+.page-profile .page-header h2 {
+    color: var(--home-text);
+}
+
+/* Cards — same neon border + glow as Home */
+.page-tasks .page-content,
+.page-profile .page-content {
+    background-color: var(--home-card-bg);
+    border: 1px solid var(--neon-red-border);
+    box-shadow: 0 0 10px var(--neon-red-glow), inset 0 0 8px rgba(255, 45, 45, 0.05);
+    border-radius: 14px;
+}
+
+.page-tasks .placeholder-text,
+.page-profile .placeholder-text {
+    color: var(--home-text-secondary);
 }

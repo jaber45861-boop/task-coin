@@ -643,13 +643,19 @@ class TestHomeDarkNeonTheme:
         nearby = theme[idx:idx + 200]
         assert "--neon-red" in nearby
 
-    def test_other_pages_not_restyled(self):
-        """Theme rules must be scoped to .page-home (Home only)."""
+    def test_theme_scoped_to_the_three_pages(self):
+        """Dark theme may only target Home/Tasks/Account (+ theme vars).
+
+        Tasks & Account were unified with the Home theme by the
+        UNIFY TASKS & ACCOUNT UI micro-task; no other selector may
+        use the dark background.
+        """
         css = _css()
         theme = self._home_theme()
-        # The dark background override must only appear under .page-home
+        allowed = (".page-home", ".page-tasks", ".page-profile", ":root")
         for rule in re.findall(r"([^{}]+)\{[^}]*--home-bg[^}]*\}", theme):
-            assert ".page-home" in rule or ":root" in rule or "--home-bg" in rule
+            assert any(a in rule for a in allowed), \
+                f"Unexpected selector using --home-bg: {rule!r}"
 
 
 # ══════════════════════════════════════════════════════════════════
