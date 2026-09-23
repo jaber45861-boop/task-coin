@@ -1259,9 +1259,14 @@ def create_mini_app() -> Flask:
     """Create the Flask application that serves the Mini App static files.
 
     Serves ``miniapp/index.html`` at ``/`` and all static assets (CSS, JS,
-    images) under ``/<path>``.
+    images) under ``/<path>``.  The production Task pipeline endpoints
+    (MT-TASK-03) are registered here so the WispByte single-entry
+    process serves the Tasks page API as well.
     """
+    from task_routes import tasks_bp
+
     mini_app = Flask(__name__)
+    mini_app.register_blueprint(tasks_bp)
     miniapp_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "miniapp"
     )

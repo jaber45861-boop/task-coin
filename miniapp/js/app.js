@@ -47,9 +47,10 @@ const App = (() => {
 
     /**
      * Render a page from a dynamic component or template.
-     * The 'home' page is built by the Home module and the 'wallet'
-     * page by the Wallet module; other pages use HTML <template>
-     * cloning — same routing pattern as before.
+     * The 'home' page is built by the Home module, the 'wallet'
+     * page by the Wallet module and the 'tasks' page by the Tasks
+     * module (MT-TASK-03, real API data); other pages use HTML
+     * <template> cloning — same routing pattern as before.
      */
     function renderPage(page) {
         // Clear current content
@@ -61,6 +62,8 @@ const App = (() => {
             pageEl = Home.render();
         } else if (page === 'wallet' && typeof Wallet !== 'undefined') {
             pageEl = Wallet.render();
+        } else if (page === 'tasks' && typeof Tasks !== 'undefined') {
+            pageEl = Tasks.render();
         } else {
             const template = document.getElementById(`page-${page}`);
 

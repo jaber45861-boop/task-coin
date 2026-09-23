@@ -1110,3 +1110,220 @@ body[data-page="profile"] .app-content {
 .social-connect-btn[hidden] {
     display: none;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   MT-TASK-03 — Tasks page (real API data)
+   Same black / neon-red / gold visual system as Home & Wallet.
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Loading / empty / error states ──────────────────────────── */
+.tasks-state {
+    text-align: center;
+    padding: 32px 12px;
+    font-size: 15px;
+    color: var(--home-text-secondary);
+}
+
+.tasks-error-text {
+    display: block;
+    color: #ff8a80;
+    margin-bottom: 14px;
+    line-height: 1.7;
+}
+
+.tasks-retry-btn {
+    min-height: 40px;
+    padding: 8px 18px;
+    border-radius: 10px;
+    background-color: #0d0d0d;
+    border: 1px solid var(--neon-red);
+    box-shadow: 0 0 10px var(--neon-red-glow);
+    color: var(--home-text);
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: box-shadow 0.2s, transform 0.1s;
+}
+
+.tasks-retry-btn:active {
+    transform: scale(0.96);
+}
+
+.tasks-retry-btn:focus-visible {
+    outline: 2px solid var(--neon-red);
+    outline-offset: 2px;
+}
+
+/* ── Inline notice (success / error, Arabic) ─────────────────── */
+.tasks-notice {
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.7;
+}
+
+.tasks-notice-error {
+    background-color: rgba(255, 45, 45, 0.10);
+    border: 1px solid var(--neon-red-border);
+    color: #ff8a80;
+}
+
+.tasks-notice-success {
+    background-color: rgba(0, 230, 118, 0.08);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+    color: var(--neon-green);
+}
+
+/* ── Task list & cards ───────────────────────────────────────── */
+.tasks-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.task-card {
+    background-color: var(--home-card-inner-bg);
+    border: 1px solid rgba(255, 45, 45, 0.22);
+    border-radius: 14px;
+    padding: 14px;
+}
+
+.task-card-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.task-title {
+    color: var(--home-text);
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1.5;
+}
+
+.task-status {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 3px 10px;
+    white-space: nowrap;
+}
+
+.task-status-available {
+    color: var(--home-gold);
+    background-color: rgba(255, 209, 102, 0.10);
+    border: 1px solid rgba(255, 209, 102, 0.45);
+}
+
+.task-status-started {
+    color: var(--neon-red);
+    background-color: rgba(255, 45, 45, 0.10);
+    border: 1px solid var(--neon-red-border);
+}
+
+.task-status-completed {
+    color: var(--neon-green);
+    background-color: rgba(0, 230, 118, 0.10);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+}
+
+.task-description {
+    color: var(--home-text-secondary);
+    font-size: 13px;
+    line-height: 1.7;
+    margin: 8px 0 10px;
+}
+
+.task-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.task-type-badge {
+    font-size: 12px;
+    color: var(--home-text-secondary);
+    background-color: rgba(255, 45, 45, 0.07);
+    border: 1px solid rgba(255, 45, 45, 0.35);
+    border-radius: 999px;
+    padding: 3px 10px;
+}
+
+.task-reward {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--home-gold);
+}
+
+/* ── Card actions ────────────────────────────────────────────── */
+.task-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.task-action-btn {
+    flex: 1;
+    min-width: 120px;
+    min-height: 40px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: #0d0d0d;
+    border: 1px solid var(--neon-red);
+    box-shadow: 0 0 10px var(--neon-red-glow);
+    color: var(--home-text);
+    font-size: 13px;
+    font-weight: 700;
+    text-decoration: none;
+    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: box-shadow 0.2s, transform 0.1s;
+}
+
+.task-action-btn:hover {
+    box-shadow: 0 0 14px rgba(255, 45, 45, 0.55);
+}
+
+.task-action-btn:active {
+    transform: scale(0.97);
+}
+
+.task-action-btn:focus-visible {
+    outline: 2px solid var(--neon-red);
+    outline-offset: 2px;
+}
+
+.task-action-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.task-join-btn {
+    border-color: var(--home-text-secondary);
+    box-shadow: none;
+}
+
+.task-done-label {
+    flex: 1;
+    min-height: 40px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 10px;
+    background-color: rgba(0, 230, 118, 0.08);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+    color: var(--neon-green);
+    font-size: 13px;
+    font-weight: 700;
+}
