@@ -3,3 +3,8 @@ python-dotenv
 pytest==8.3.4
 flask
 waitress
+# cryptography provides Fernet (AES-128-CBC + HMAC-SHA256), the standard
+# authenticated-encryption primitive used to encrypt stored OAuth access/
+# refresh tokens at rest (SA-YT-01).  Added explicitly so token secrets
+# are never written to SQLite in plaintext — no home-made crypto.
+cryptography==50.0.1

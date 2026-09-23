@@ -16,7 +16,13 @@ The server:
 import os
 from flask import Flask, send_from_directory
 
+from social_routes import social_bp
+
 app = Flask(__name__)
+
+# API routes live in their own module so this file remains the static
+# file server it was designed to be (SA-YT-01 account linking).
+app.register_blueprint(social_bp)
 
 MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp")
 

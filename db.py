@@ -336,6 +336,44 @@ def init_db(db_path: str | None = None) -> None:
             WHERE status = 'pending'
         """)
 
+        # ── Linked social accounts (SA-YT-01) ────────────────────────
+        # Additive migration only: a brand-new table — no existing table
+        # or row is touched.  The stable provider identity (YouTube: the
+        # channel id) is the link identity, never a display name.
+        # OAuth tokens live here only in encrypted form (see
+        # social_accounts.TokenCipher); no client secrets, no passwords.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS social_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                status TEXT NOT NULL DEFAULT 'linked'
+                    CHECK (status IN ('linked', 'revoked')),
+                access_token_encrypted TEXT,
+                refresh_token_encrypted TEXT,
+                token_expires_at TIMESTAMP,
+                scopes TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_verified_at TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        # A YouTube channel belongs to at most one Telegram account.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_social_accounts_provider_user
+            ON social_accounts (provider, provider_user_id)
+        """)
+        # One active link per (user, provider): no duplicate YouTube links.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_social_accounts_user_provider
+            ON social_accounts (user_id, provider)
+            WHERE status = 'linked'
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 

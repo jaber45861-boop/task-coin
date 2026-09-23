@@ -201,8 +201,14 @@ const Home = (() => {
                     <span class="section-icon">🔗</span>
                     <span class="section-title">ربط الحسابات</span>
                 </div>
+                <!-- YouTube linking (SA-YT-01): OAuth connect + state -->
                 <div class="account-linking-body">
-                    <span class="account-linking-status">قريباً</span>
+                    <span class="account-linking-status">منصات أخرى قريباً</span>
+                    <div class="social-account-row" data-testid="social-youtube-row">
+                        <span class="social-account-provider" data-testid="social-youtube-provider">YouTube</span>
+                        <span class="account-linking-status social-account-state" data-testid="social-youtube-state">غير مرتبط</span>
+                        <button type="button" class="social-connect-btn" data-testid="social-youtube-connect">ربط YouTube</button>
+                    </div>
                 </div>
             </div>
         `;

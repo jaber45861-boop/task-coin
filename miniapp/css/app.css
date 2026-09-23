@@ -1036,3 +1036,77 @@ body[data-page="profile"] .app-content {
     width: 18px;
     height: 18px;
 }
+
+/* ── Account linking: YouTube (SA-YT-01) ─────────────────────────────
+   Same black / neon-red / green visual system as Home. */
+
+.account-linking-body {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 14px 12px;
+}
+
+.social-account-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.social-account-provider {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.social-account-state {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: end;
+}
+
+.social-account-state.is-linked {
+    color: var(--neon-green);
+    font-weight: 700;
+}
+
+.social-connect-btn {
+    flex-shrink: 0;
+    min-height: 40px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: #0d0d0d;
+    border: 1px solid var(--neon-red);
+    box-shadow: 0 0 10px var(--neon-red-glow);
+    color: var(--text-color);
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: box-shadow 0.2s, transform 0.1s;
+}
+
+.social-connect-btn:hover {
+    box-shadow: 0 0 14px rgba(255, 45, 45, 0.55);
+}
+
+.social-connect-btn:active {
+    transform: scale(0.96);
+}
+
+.social-connect-btn:focus-visible {
+    outline: 2px solid var(--neon-red);
+    outline-offset: 2px;
+}
+
+.social-connect-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.social-connect-btn[hidden] {
+    display: none;
+}
