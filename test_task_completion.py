@@ -9,16 +9,19 @@ Run:
 
 import os
 import tempfile
+import threading
 import unittest
 
 from config import CHANNELS
 import db
+from completion_bridge import CompletionBridge
 from task_completion import (
     CompletionGate,
     CompletionGateError,
     VerificationResult,
     VerificationStatus,
 )
+from task_verifier import TaskVerifier, clear_verifiers, register_verifier
 
 
 class TestVerificationContract(unittest.TestCase):
@@ -272,6 +275,127 @@ class TestCompletionGate(unittest.TestCase):
                 1001, self.task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
             )
         self.assertIn("CompletionGate", str(ctx.exception))
+
+
+class _AlwaysPassVerifier(TaskVerifier):
+    """Test verifier: always PASSED (registered only inside tests)."""
+
+    def verify(self, context) -> VerificationResult:
+        return VerificationResult(status=VerificationStatus.PASSED)
+
+
+class TestConcurrentCompletion(unittest.TestCase):
+    """Concurrency: simultaneous completions transition exactly once.
+
+    The CompletionGate validates and transitions inside db.transaction()
+    (BEGIN IMMEDIATE), so racing successful attempts serialize: exactly
+    one moves started → completed, the others receive the existing
+    failure/error behavior — never a second completion.
+    """
+
+    def setUp(self):
+        self.test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self._original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        db.init_db(self.test_db_path)
+        db.register_user(1001, "alice", "Alice")
+        self.task_id = db.create_task(
+            title="Join Channel",
+            description="Subscribe",
+            task_type="subscribe",
+            reward=50,
+            db_path=self.test_db_path,
+        )
+        clear_verifiers()
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        clear_verifiers()
+        CHANNELS.clear()
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ("-wal", "-shm"):
+            p = self.test_db_path + suffix
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def _start_task(self) -> None:
+        db.create_user_task(1001, self.task_id, self.test_db_path)
+        db.update_user_task_status(
+            1001, self.task_id, db.USER_TASK_STATUS_STARTED, self.test_db_path
+        )
+
+    def test_two_simultaneous_completions_exactly_one_wins(self):
+        """Two racing CompletionGate calls: one wins, one is rejected."""
+        self._start_task()
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        messages: list[str] = []
+
+        def attempt() -> None:
+            barrier.wait()
+            try:
+                ok = CompletionGate().complete(
+                    1001, self.task_id,
+                    VerificationResult(status=VerificationStatus.PASSED),
+                )
+                outcomes.append("success" if ok else "rejected")
+            except CompletionGateError as exc:
+                outcomes.append("rejected")
+                messages.append(str(exc))
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(len(outcomes), 2, f"outcomes={outcomes}")
+        self.assertEqual(outcomes.count("success"), 1, f"outcomes={outcomes}")
+        self.assertEqual(outcomes.count("rejected"), 1, f"outcomes={outcomes}")
+        # Loser got the existing rejection vocabulary (terminal state)
+        self.assertIn("completed", messages[0])
+        # Final state correct, single completion, no corruption
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertEqual(row["status"], db.USER_TASK_STATUS_COMPLETED)
+        self.assertIsNotNone(row["completed_at"])
+
+    def test_two_simultaneous_submissions_single_completion(self):
+        """Two racing full submissions: one PASSED, one non-passed."""
+        self._start_task()
+        register_verifier("subscribe", _AlwaysPassVerifier())
+        barrier = threading.Barrier(2)
+        results: list[VerificationResult] = []
+
+        def attempt() -> None:
+            barrier.wait()
+            results.append(
+                CompletionBridge.complete_after_verification(
+                    1001, self.task_id, {"actual": "x"}
+                )
+            )
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        # Both attempts produced a VerificationResult (never a crash)
+        self.assertEqual(len(results), 2, f"results={results}")
+        passed = [r for r in results if r.status == VerificationStatus.PASSED]
+        self.assertEqual(len(passed), 1, f"results={results}")
+        # The loser received existing failure/error behavior
+        losers = [r for r in results if r.status != VerificationStatus.PASSED]
+        self.assertEqual(len(losers), 1)
+        self.assertIn(losers[0].status,
+                      (VerificationStatus.FAILED, VerificationStatus.ERROR))
+        # Exactly one completion; final state correct
+        row = db.get_user_task(1001, self.task_id, self.test_db_path)
+        self.assertEqual(row["status"], db.USER_TASK_STATUS_COMPLETED)
+        self.assertIsNotNone(row["completed_at"])
 
 
 if __name__ == "__main__":

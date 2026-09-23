@@ -407,3 +407,26 @@ def verify_task(user_id: int, task_id: int) -> VerificationResult:
         )
 
     return result
+
+
+# ── Built-in verifier registration (registration only) ─────────────
+#
+# The channel task verifier (first production task family) registers
+# itself when its module executes.  Importing it here means
+# `import task_verifier` is sufficient for the registry to resolve
+# channel_subscription → ChannelTaskVerifier.
+#
+# Circular-import safety: channel_task_verifier imports this module
+# first.  When *it* triggered this module's import, the module below is
+# only partially initialised at this point, so the name import below
+# raises ImportError and registration is completed by
+# channel_task_verifier's own module bottom instead.
+try:
+    from channel_task_verifier import (  # noqa: E402,F401
+        CHANNEL_TASK_TYPE as _CHANNEL_TASK_TYPE,
+        ChannelTaskVerifier as _ChannelTaskVerifier,
+    )
+
+    register_verifier(_CHANNEL_TASK_TYPE, _ChannelTaskVerifier())
+except ImportError:  # pragma: no cover - partially-initialised cycle
+    pass

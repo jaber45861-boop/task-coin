@@ -74,7 +74,9 @@ class TaskStartGate:
     - Validates user and task exist.
     - Validates task is active.
     - Validates user_task is in 'available' status.
-    - Transitions to 'started' via db.update_user_task_status.
+    - Transitions to 'started' inside db.transaction() (BEGIN IMMEDIATE)
+      so the validate-then-transition sequence is atomic and concurrent
+      starts of the same user/task cannot race (TOCTOU-safe).
     - Does NOT verify, complete, award rewards, or modify referrals.
     """
 
@@ -92,50 +94,81 @@ class TaskStartGate:
             StartGateError: If any pre-condition fails (user/task not found,
                 task inactive, invalid state).
         """
-        # 1. User must exist
-        user = db.get_user(user_id)
-        if user is None:
-            raise StartGateError(f"User {user_id} not found")
+        # The whole read/modify/write sequence runs inside one existing
+        # db.transaction() — BEGIN IMMEDIATE takes the write lock before
+        # any validation read, so concurrent starts for the same
+        # user/task serialize: exactly one observes 'available' and the
+        # rest are rejected with the usual errors.
+        with db.transaction() as conn:
+            # 1. User must exist
+            user = db.get_user(user_id)
+            if user is None:
+                raise StartGateError(f"User {user_id} not found")
 
-        # 2. Task must exist
-        task = db.get_task(task_id)
-        if task is None:
-            raise StartGateError(f"Task {task_id} not found")
+            # 2. Task must exist
+            task = db.get_task(task_id)
+            if task is None:
+                raise StartGateError(f"Task {task_id} not found")
 
-        # 3. Task must be active
-        if not task["active"]:
-            raise StartGateError(f"Task {task_id} is not active")
+            # 3. Task must be active
+            if not task["active"]:
+                raise StartGateError(f"Task {task_id} is not active")
 
-        # 4. Check current user_task state
-        user_task = db.get_user_task(user_id, task_id)
+            # 4. Check current user_task state (inside the transaction,
+            #    so no other writer can change it before the transition)
+            user_task = db.get_user_task(user_id, task_id)
 
-        if user_task is not None:
-            current_status = user_task["status"]
+            if user_task is not None:
+                current_status = user_task["status"]
 
-            # Already completed → reject
-            if current_status == db.USER_TASK_STATUS_COMPLETED:
-                raise StartGateError(
-                    f"Task {task_id} already completed for user {user_id}"
+                # Already completed → reject
+                if current_status == db.USER_TASK_STATUS_COMPLETED:
+                    raise StartGateError(
+                        f"Task {task_id} already completed for user {user_id}"
+                    )
+
+                # Already started → reject (idempotent, no mutation)
+                if current_status == db.USER_TASK_STATUS_STARTED:
+                    raise StartGateError(
+                        f"Task {task_id} already started for user {user_id}"
+                    )
+
+                # available → started (guarded compare-and-set below)
+                cursor = conn.execute(
+                    "UPDATE user_tasks "
+                    "SET status = ?, started_at = CURRENT_TIMESTAMP "
+                    "WHERE user_id = ? AND task_id = ? AND status = ?",
+                    (
+                        db.USER_TASK_STATUS_STARTED,
+                        user_id,
+                        task_id,
+                        db.USER_TASK_STATUS_AVAILABLE,
+                    ),
                 )
+                if cursor.rowcount != 1:
+                    # Unreachable while BEGIN IMMEDIATE serializes
+                    # writers — re-read so the caller still gets the
+                    # exact existing error vocabulary.
+                    latest = db.get_user_task(user_id, task_id)
+                    latest_status = latest["status"] if latest else None
+                    if latest_status == db.USER_TASK_STATUS_COMPLETED:
+                        raise StartGateError(
+                            f"Task {task_id} already completed for user {user_id}"
+                        )
+                    raise StartGateError(
+                        f"Task {task_id} already started for user {user_id}"
+                    )
 
-            # Already started → reject (idempotent, no mutation)
-            if current_status == db.USER_TASK_STATUS_STARTED:
-                raise StartGateError(
-                    f"Task {task_id} already started for user {user_id}"
+            else:
+                # No user_task row exists → create it directly in the
+                # 'started' state (user/task existence was validated
+                # above inside this same transaction).
+                conn.execute(
+                    "INSERT INTO user_tasks "
+                    "(user_id, task_id, status, started_at) "
+                    "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (user_id, task_id, db.USER_TASK_STATUS_STARTED),
                 )
-
-            # available → started (falls through to transition below)
-
-        else:
-            # No user_task row exists → create one first
-            db.create_user_task(user_id, task_id)
-
-        # 5. Transition available → started
-        db.update_user_task_status(
-            user_id,
-            task_id,
-            db.USER_TASK_STATUS_STARTED,
-        )
 
         logger.info("Task started via gate: user=%d task=%d", user_id, task_id)
         return StartResult(

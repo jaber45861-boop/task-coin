@@ -25,6 +25,7 @@ Run:
 
 import os
 import tempfile
+import threading
 import unittest
 
 
@@ -401,6 +402,76 @@ class TestTaskStartGate(unittest.TestCase):
             db.update_user_task_status(
                 1001, task_id, db.USER_TASK_STATUS_COMPLETED, self.test_db_path
             )
+
+
+class TestConcurrentStart(unittest.TestCase):
+    """Concurrency: simultaneous starts transition exactly once.
+
+    The TaskStartGate validates and transitions inside db.transaction()
+    (BEGIN IMMEDIATE), so two racing starts serialize: exactly one wins,
+    the loser gets the existing StartGateError rejection, and no state
+    is corrupted.
+    """
+
+    def setUp(self):
+        self.test_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.test_db_path = self.test_db.name
+        self.test_db.close()
+        self._original_db_path = db.DB_PATH
+        db.DB_PATH = self.test_db_path
+        db.init_db(self.test_db_path)
+        db.register_user(1001, "alice", "Alice")
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        CHANNELS.clear()
+        if os.path.exists(self.test_db_path):
+            os.unlink(self.test_db_path)
+        for suffix in ("-wal", "-shm"):
+            p = self.test_db_path + suffix
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def test_two_simultaneous_starts_exactly_one_success(self):
+        """Two racing starts: one success, one rejection, no corruption."""
+        task_id = db.create_task(
+            title="Join Channel",
+            description="Subscribe",
+            task_type="subscribe",
+            reward=50,
+            db_path=self.test_db_path,
+        )
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        messages: list[str] = []
+
+        def attempt() -> None:
+            barrier.wait()
+            try:
+                result = TaskStartGate().start(1001, task_id)
+                outcomes.append("success" if result.success else "rejected")
+            except StartGateError as exc:
+                outcomes.append("rejected")
+                messages.append(str(exc))
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        # Both attempts finished
+        self.assertEqual(len(outcomes), 2, f"outcomes={outcomes}")
+        # Exactly one successful available → started transition
+        self.assertEqual(outcomes.count("success"), 1, f"outcomes={outcomes}")
+        self.assertEqual(outcomes.count("rejected"), 1, f"outcomes={outcomes}")
+        # The loser received the existing rejection vocabulary
+        self.assertIn("already started", messages[0])
+        # Final state is correct and not corrupted
+        utask = db.get_user_task(1001, task_id, self.test_db_path)
+        self.assertEqual(utask["status"], db.USER_TASK_STATUS_STARTED)
+        self.assertIsNotNone(utask["started_at"])
+        self.assertIsNone(utask["completed_at"])
 
 
 if __name__ == "__main__":

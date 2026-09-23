@@ -69,7 +69,9 @@ class CompletionGate:
     - Validates user and task exist.
     - Validates user_task exists and is in 'started' status.
     - Requires a passed VerificationResult.
-    - Transitions to 'completed' via db.update_user_task_status.
+    - Transitions to 'completed' inside db.transaction() (BEGIN IMMEDIATE)
+      so the validate-then-transition sequence is atomic: exactly one
+      concurrent attempt can move started → completed.
     - Does NOT grant rewards or modify referral/wallet state.
     """
 
@@ -99,38 +101,62 @@ class CompletionGate:
                 f"{verification.reason or 'no reason provided'}"
             )
 
-        # 2. User must exist
-        user = db.get_user(user_id)
-        if user is None:
-            raise CompletionGateError(f"User {user_id} not found")
+        # Validation and the transition run inside one existing
+        # db.transaction() — BEGIN IMMEDIATE takes the write lock first,
+        # so concurrent successful submissions for the same user/task
+        # serialize: exactly one observes 'started' and completes; every
+        # other attempt is rejected with the existing error vocabulary
+        # instead of performing a second completion.
+        with db.transaction() as conn:
+            # 2. User must exist
+            user = db.get_user(user_id)
+            if user is None:
+                raise CompletionGateError(f"User {user_id} not found")
 
-        # 3. Task must exist
-        task = db.get_task(task_id)
-        if task is None:
-            raise CompletionGateError(f"Task {task_id} not found")
+            # 3. Task must exist
+            task = db.get_task(task_id)
+            if task is None:
+                raise CompletionGateError(f"Task {task_id} not found")
 
-        # 4. user_task must exist
-        user_task = db.get_user_task(user_id, task_id)
-        if user_task is None:
-            raise CompletionGateError(
-                f"No user_task record for user={user_id}, task={task_id}"
+            # 4. user_task must exist
+            user_task = db.get_user_task(user_id, task_id)
+            if user_task is None:
+                raise CompletionGateError(
+                    f"No user_task record for user={user_id}, task={task_id}"
+                )
+
+            # 5. Must be in 'started' status
+            current_status = user_task["status"]
+            if current_status != db.USER_TASK_STATUS_STARTED:
+                raise CompletionGateError(
+                    f"Cannot complete: current status is '{current_status}', "
+                    f"expected '{db.USER_TASK_STATUS_STARTED}'"
+                )
+
+            # 6. Atomic started → completed (guarded compare-and-set on
+            #    the transaction's own connection; 'completed' stays
+            #    terminal and no reward/wallet/ledger state is touched)
+            cursor = conn.execute(
+                "UPDATE user_tasks "
+                "SET status = ?, completed_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ? AND task_id = ? AND status = ?",
+                (
+                    db.USER_TASK_STATUS_COMPLETED,
+                    user_id,
+                    task_id,
+                    db.USER_TASK_STATUS_STARTED,
+                ),
             )
-
-        # 5. Must be in 'started' status
-        current_status = user_task["status"]
-        if current_status != db.USER_TASK_STATUS_STARTED:
-            raise CompletionGateError(
-                f"Cannot complete: current status is '{current_status}', "
-                f"expected '{db.USER_TASK_STATUS_STARTED}'"
-            )
-
-        # 6. Transition to completed (via internal guard)
-        db.update_user_task_status(
-            user_id,
-            task_id,
-            db.USER_TASK_STATUS_COMPLETED,
-            _allow_completion=True,
-        )
+            if cursor.rowcount != 1:
+                # Unreachable while BEGIN IMMEDIATE serializes writers —
+                # re-read so the caller still gets the exact existing
+                # error vocabulary.
+                latest = db.get_user_task(user_id, task_id)
+                latest_status = latest["status"] if latest else None
+                raise CompletionGateError(
+                    f"Cannot complete: current status is '{latest_status}', "
+                    f"expected '{db.USER_TASK_STATUS_STARTED}'"
+                )
 
         logger.info(
             "Task completed via gate: user=%d task=%d",
