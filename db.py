@@ -20,6 +20,25 @@ logger = logging.getLogger(__name__)
 USER_TASK_STATUS_AVAILABLE = "available"
 USER_TASK_STATUS_STARTED = "started"
 USER_TASK_STATUS_COMPLETED = "completed"
+
+# Task repeat policy (MT-TASK-04).  "one_time" tasks are terminal for a
+# user; "repeatable" tasks may start a new cycle after repeat_hours.
+REPEAT_POLICY_ONE_TIME = "one_time"
+REPEAT_POLICY_REPEATABLE = "repeatable"
+REPEAT_POLICIES = (REPEAT_POLICY_ONE_TIME, REPEAT_POLICY_REPEATABLE)
+
+# Submission-level states (MT-TASK-04).  These describe a verification
+# attempt and are deliberately separate from the user_tasks lifecycle.
+SUBMISSION_STATUS_SUBMITTED = "submitted"
+SUBMISSION_STATUS_PASSED = "passed"
+SUBMISSION_STATUS_FAILED = "failed"
+SUBMISSION_STATUS_ERROR = "error"
+SUBMISSION_STATUSES = (
+    SUBMISSION_STATUS_SUBMITTED,
+    SUBMISSION_STATUS_PASSED,
+    SUBMISSION_STATUS_FAILED,
+    SUBMISSION_STATUS_ERROR,
+)
 ALLOWED_USER_TASK_STATUSES = {
     USER_TASK_STATUS_AVAILABLE,
     USER_TASK_STATUS_STARTED,
@@ -192,12 +211,35 @@ def init_db(db_path: str | None = None) -> None:
                 reward INTEGER NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
                 task_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                repeat_policy TEXT NOT NULL DEFAULT 'one_time',
+                repeat_hours INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CHECK (repeat_policy IN ('one_time', 'repeatable')),
+                CHECK (
+                    (repeat_policy = 'one_time' AND repeat_hours IS NULL)
+                    OR (repeat_policy = 'repeatable'
+                        AND repeat_hours IS NOT NULL AND repeat_hours >= 1)
+                )
             )
         """)
         # Migration: add task_data column if missing (pre-existing DBs)
         try:
             conn.execute("ALTER TABLE tasks ADD COLUMN task_data TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: repeat-policy columns for pre-existing DBs (MT-TASK-04).
+        # Existing rows receive the safe defaults: one_time + NULL hours.
+        # Cross-column validation for migrated tables is enforced by the
+        # application layer (db.create_task / db.update_task).
+        try:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN repeat_policy TEXT "
+                "NOT NULL DEFAULT 'one_time'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN repeat_hours INTEGER")
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -213,6 +255,40 @@ def init_db(db_path: str | None = None) -> None:
                 FOREIGN KEY (user_id) REFERENCES users(user_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id)
             )
+        """)
+
+        # ── Task submissions / attempts table (MT-TASK-04) ──────────
+        # Auditable history of verification attempts.  Deliberately
+        # separate from user_tasks (which keeps only the current cycle):
+        #   status: submitted → passed | failed | error  (terminal)
+        #   (user_id, task_id) is the user_tasks identity; together with
+        #   idempotency_key it forms the database-enforced uniqueness
+        #   unit so a repeated key can never create a second record.
+        # Timestamps follow the repository convention (TIMESTAMP /
+        # CURRENT_TIMESTAMP, UTC); no REAL columns anywhere.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_submissions (
+                submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'submitted'
+                    CHECK (status IN
+                        ('submitted', 'passed', 'failed', 'error')),
+                idempotency_key TEXT NOT NULL,
+                verification_reason TEXT,
+                submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (task_id) REFERENCES tasks(id),
+                UNIQUE (user_id, task_id, idempotency_key)
+            )
+        """)
+        # History lookups per user/task, oldest first.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_submissions_user_task
+            ON task_submissions (user_id, task_id, submission_id)
         """)
 
         # ── Wallet / ledger / withdrawal schema (MT-1) ─────────────
@@ -438,13 +514,45 @@ def get_channel_from_db(slug: str, db_path: str | None = None) -> Optional[Chann
 # ── Task Definitions ──────────────────────────────────────────────
 
 
+def validate_repeat_policy(repeat_policy, repeat_hours) -> tuple[str, int | None]:
+    """Validate and normalize a task repeat-policy pair (MT-TASK-04).
+
+    Rules (server-side only — never client-provided):
+        - repeat_policy must be 'one_time' or 'repeatable'
+        - one_time does not use repeat_hours (must be None)
+        - repeatable requires an integer repeat_hours >= 1
+        - floats, booleans, negatives and zero are rejected
+
+    Returns the normalized (repeat_policy, repeat_hours) pair.
+    Raises ValueError for any invalid combination.
+    """
+    if repeat_policy is None:
+        repeat_policy = REPEAT_POLICY_ONE_TIME
+    if not isinstance(repeat_policy, str) or repeat_policy not in REPEAT_POLICIES:
+        raise ValueError(f"invalid repeat_policy: {repeat_policy!r}")
+    if repeat_hours is not None:
+        if isinstance(repeat_hours, bool) or not isinstance(repeat_hours, int):
+            raise ValueError("repeat_hours must be an integer")
+    if repeat_policy == REPEAT_POLICY_ONE_TIME:
+        if repeat_hours is not None:
+            raise ValueError("repeat_hours is only valid for repeatable tasks")
+    else:
+        if repeat_hours is None or repeat_hours < 1:
+            raise ValueError("repeatable tasks require repeat_hours >= 1")
+    return repeat_policy, repeat_hours
+
+
 def create_task(title: str, description: str, task_type: str, reward: int,
                 active: bool = True, db_path: str | None = None,
-                task_data: str | None = None) -> int:
+                task_data: str | None = None,
+                repeat_policy: str = REPEAT_POLICY_ONE_TIME,
+                repeat_hours: int | None = None) -> int:
     """Create a new task definition. Returns the new task ID.
 
     Args:
         task_data: Optional JSON string with task-specific verification data.
+        repeat_policy: 'one_time' (default) or 'repeatable'.
+        repeat_hours: Required integer >= 1 for repeatable tasks only.
     """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
@@ -454,11 +562,18 @@ def create_task(title: str, description: str, task_type: str, reward: int,
         raise ValueError("type cannot be empty")
     if reward < 0:
         raise ValueError("reward cannot be negative")
+    repeat_policy, repeat_hours = validate_repeat_policy(
+        repeat_policy, repeat_hours
+    )
 
     with get_connection(db_path) as conn:
         cursor = conn.execute(
-            "INSERT INTO tasks (title, description, type, reward, active, task_data) VALUES (?, ?, ?, ?, ?, ?)",
-            (title.strip(), description.strip(), task_type.strip(), reward, int(active), task_data)
+            "INSERT INTO tasks "
+            "(title, description, type, reward, active, task_data, "
+            " repeat_policy, repeat_hours) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (title.strip(), description.strip(), task_type.strip(), reward,
+             int(active), task_data, repeat_policy, repeat_hours)
         )
         task_id = cursor.lastrowid
         logger.info("Task created: id=%d title=%s", task_id, title)
@@ -469,7 +584,8 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
     """Get a task by ID."""
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks WHERE id = ?",
+            "SELECT id, title, description, type, reward, active, task_data, "
+            "repeat_policy, repeat_hours, created_at FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
         if row:
@@ -481,6 +597,8 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
                 "reward": row["reward"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
+                "repeat_policy": row["repeat_policy"],
+                "repeat_hours": row["repeat_hours"],
                 "created_at": row["created_at"],
             }
         return None
@@ -489,14 +607,16 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
 def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[dict]:
     """List all tasks, optionally filtering to active only."""
     with get_connection(db_path) as conn:
+        columns = (
+            "id, title, description, type, reward, active, task_data, "
+            "repeat_policy, repeat_hours, created_at"
+        )
         if active_only:
             cursor = conn.execute(
-                "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks WHERE active = 1"
+                f"SELECT {columns} FROM tasks WHERE active = 1"
             )
         else:
-            cursor = conn.execute(
-                "SELECT id, title, description, type, reward, active, task_data, created_at FROM tasks"
-            )
+            cursor = conn.execute(f"SELECT {columns} FROM tasks")
         return [
             {
                 "id": row["id"],
@@ -506,6 +626,8 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
                 "reward": row["reward"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
+                "repeat_policy": row["repeat_policy"],
+                "repeat_hours": row["repeat_hours"],
                 "created_at": row["created_at"],
             }
             for row in cursor.fetchall()
@@ -514,8 +636,15 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
 
 def update_task(task_id: int, title: str | None = None, description: str | None = None,
                 task_type: str | None = None, reward: int | None = None,
-                active: bool | None = None, db_path: str | None = None) -> bool:
-    """Update a task. Returns True if the task existed and was updated."""
+                active: bool | None = None, db_path: str | None = None,
+                repeat_policy: str | None = None,
+                repeat_hours: int | None = None) -> bool:
+    """Update a task. Returns True if the task existed and was updated.
+
+    ``repeat_policy`` / ``repeat_hours`` are validated as a merged pair
+    with the current row, so a partially-specified repeat change (e.g.
+    switching to repeatable without hours) is rejected.
+    """
     if title is not None and (not title or not title.strip()):
         raise ValueError("title cannot be empty")
     if description is not None and (not description or not description.strip()):
@@ -542,6 +671,23 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
     if active is not None:
         fields.append("active = ?")
         values.append(int(active))
+    if repeat_policy is not None or repeat_hours is not None:
+        current = get_task(task_id, db_path)
+        base_policy = (
+            repeat_policy if repeat_policy is not None
+            else (current["repeat_policy"] if current else REPEAT_POLICY_ONE_TIME)
+        )
+        base_hours = (
+            repeat_hours if repeat_hours is not None
+            else (current["repeat_hours"] if current else None)
+        )
+        base_policy, base_hours = validate_repeat_policy(
+            base_policy, base_hours
+        )
+        fields.append("repeat_policy = ?")
+        values.append(base_policy)
+        fields.append("repeat_hours = ?")
+        values.append(base_hours)
 
     if not fields:
         return False

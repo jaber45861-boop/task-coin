@@ -26,6 +26,7 @@ import logging
 from task_start import TaskStartGate, StartResult, StartGateError
 from completion_bridge import CompletionBridge, CompletionBridgeError
 from task_completion import VerificationResult, VerificationStatus
+from task_submission import TaskSubmissionService
 
 logger = logging.getLogger(__name__)
 
@@ -61,19 +62,28 @@ class TaskLifecycle:
         user_id: int,
         task_id: int,
         actual_data: dict,
+        idempotency_key: str | None = None,
     ) -> VerificationResult:
         """Submit a task for verification.
 
         Delegates through the full secure submission lifecycle via
         CompletionBridge.complete_after_verification():
 
+            0. Idempotent replay (MT-TASK-04) — a repeated
+               (user, task, idempotency_key) returns the ORIGINAL
+               persisted result without re-verifying or re-completing.
             1. TaskAttemptPolicy  – can this user submit?
-            2. TaskSubmissionService – validate data, record submission
+            2. TaskSubmissionService – claim record, validate, verify
             3. VerificationContext → TaskVerifier – verify
             4. CompletionBridge → CompletionGate – complete (only on PASSED)
 
         Returns VerificationResult preserving the original result semantics.
         """
+        replay = TaskSubmissionService.replay_result(
+            user_id, task_id, idempotency_key
+        )
+        if replay is not None:
+            return replay
         return CompletionBridge.complete_after_verification(
-            user_id, task_id, actual_data
+            user_id, task_id, actual_data, idempotency_key
         )

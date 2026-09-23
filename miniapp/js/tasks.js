@@ -36,6 +36,7 @@ const Tasks = (() => {
         invalid_submission: 'بيانات الإرسال غير صالحة',
         verification_failed: 'لم يتم تأكيد الإنجاز، تأكد من اشتراكك ثم أعد المحاولة',
         verification_error: 'تعذر التحقق حالياً، حاول مرة أخرى لاحقاً',
+        submission_in_progress: 'جارٍ التحقق من محاولة سابقة، حاول بعد قليل',
         server_error: 'حدث خطأ غير متوقع، حاول مرة أخرى',
         network: 'تعذر الاتصال بالخادم، حاول مرة أخرى'
     };
@@ -74,6 +75,20 @@ const Tasks = (() => {
         if (window.Telegram?.WebApp?.HapticFeedback) {
             window.Telegram.WebApp.HapticFeedback.impactOccurred('light');
         }
+    }
+
+    /**
+     * Idempotency key for one submission attempt (MT-TASK-04).
+     * Fresh per user action; the backend dedupes an identical
+     * retried request by this header — it carries no identity or
+     * business data.
+     */
+    function _idempotencyKey() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+            return window.crypto.randomUUID();
+        }
+        return 'k' + Date.now().toString(36)
+            + Math.random().toString(36).slice(2, 12);
     }
 
     function _node(testid) {
@@ -355,11 +370,13 @@ const Tasks = (() => {
         let data = null;
         let ok = false;
         try {
+            const headers = _headers();
+            headers['Idempotency-Key'] = _idempotencyKey();
             // No payload: the server-side task definition is authoritative
             // and verification data is checked by the backend pipeline.
             const response = await fetch(`/api/tasks/${task.id}/submit`, {
                 method: 'POST',
-                headers: _headers()
+                headers: headers
             });
             data = await _parse(response);
             ok = response.ok && data && data.ok === true;

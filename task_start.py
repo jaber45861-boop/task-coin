@@ -18,6 +18,10 @@ Responsibilities:
     - Validate task is active.
     - Validate user hasn't already started or completed this task.
     - Transition user_tasks from available → started.
+    - MT-TASK-04: for a *repeatable* task whose cooldown has elapsed
+      (read-only check via TaskAttemptPolicy.is_repeat_ready), start a
+      new cycle: completed → started.  The state machine gains no new
+      state; previous cycles remain historical in task_submissions.
 
 NOT responsible for:
     - Verifying the task.
@@ -32,6 +36,7 @@ import logging
 from dataclasses import dataclass
 
 import db
+from task_attempt import TaskAttemptPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +126,58 @@ class TaskStartGate:
             if user_task is not None:
                 current_status = user_task["status"]
 
-                # Already completed → reject
+                # Completed → terminal for one_time tasks; for a
+                # repeatable task, a new cycle may start once the
+                # cooldown has elapsed (eligibility is computed from
+                # the persisted completed_at timestamp — server time,
+                # never client input; MT-TASK-04).
                 if current_status == db.USER_TASK_STATUS_COMPLETED:
+                    if TaskAttemptPolicy.is_repeat_ready(
+                        user_id, task_id,
+                        task=task, user_task=user_task,
+                    ):
+                        # completed → started (guarded compare-and-set).
+                        # completed_at is cleared for the NEW cycle;
+                        # the finished cycle's history stays in
+                        # task_submissions (never erased here).
+                        cursor = conn.execute(
+                            "UPDATE user_tasks "
+                            "SET status = ?, "
+                            "    started_at = CURRENT_TIMESTAMP, "
+                            "    completed_at = NULL "
+                            "WHERE user_id = ? AND task_id = ? "
+                            "AND status = ?",
+                            (
+                                db.USER_TASK_STATUS_STARTED,
+                                user_id,
+                                task_id,
+                                db.USER_TASK_STATUS_COMPLETED,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            # Lost a race — report with the existing
+                            # error vocabulary.
+                            latest = db.get_user_task(user_id, task_id)
+                            latest_status = latest["status"] if latest else None
+                            if latest_status == db.USER_TASK_STATUS_STARTED:
+                                raise StartGateError(
+                                    f"Task {task_id} already started for user {user_id}"
+                                )
+                            raise StartGateError(
+                                f"Task {task_id} already completed for user {user_id}"
+                            )
+                        logger.info(
+                            "Repeatable task cycle started via gate: "
+                            "user=%d task=%d",
+                            user_id, task_id,
+                        )
+                        return StartResult(
+                            success=True,
+                            message=f"Task {task_id} started for user {user_id}",
+                            status=db.USER_TASK_STATUS_STARTED,
+                        )
+
+                    # one_time (or cooldown not elapsed) → terminal
                     raise StartGateError(
                         f"Task {task_id} already completed for user {user_id}"
                     )

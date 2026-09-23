@@ -16,6 +16,12 @@ Endpoints (all under ``/api/tasks``):
                                           → ChannelTaskVerifier →
                                           CompletionGate on PASSED only)
 
+Idempotency (MT-TASK-04): the submit endpoint accepts the standard
+``Idempotency-Key`` header.  The key is validated here and enforced by
+the database — a repeated key returns the original submission result
+without re-verifying.  When the header is absent the server generates
+a key, so every submission is still uniquely identified.
+
 Security rules enforced here:
 
 - every endpoint authenticates the Telegram Mini App user via the
@@ -59,6 +65,10 @@ tasks_bp = Blueprint("tasks", __name__)
 INIT_DATA_HEADER = "X-Telegram-Init-Data"
 # Also accepted as a query parameter, mirroring the social routes.
 INIT_DATA_QUERY = "init_data"
+# Standard idempotency header for submissions (MT-TASK-04).
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+MAX_IDEMPOTENCY_KEY_LENGTH = 128
+_IDEMPOTENCY_KEY_CHARS = set("-_.,:")
 
 # Only these task statuses exist (terminal "completed" included).
 _STATUS_AVAILABLE = db.USER_TASK_STATUS_AVAILABLE
@@ -78,6 +88,8 @@ _MSG_ALREADY_COMPLETED = "لقد أكملت هذه المهمة مسبقاً"
 _MSG_NOT_STARTED = "يجب بدء المهمة أولاً"
 _MSG_INVALID_STATE = "لا يمكن تنفيذ هذا الإجراء في الوقت الحالي"
 _MSG_INVALID_SUBMISSION = "بيانات الإرسال غير صالحة"
+_MSG_INVALID_IDEMPOTENCY_KEY = "مفتاح الطلب غير صالح"
+_MSG_SUBMISSION_IN_PROGRESS = "جارٍ التحقق من محاولة سابقة، حاول بعد قليل"
 _MSG_VERIFICATION_FAILED = (
     "لم يتم تأكيد إنجاز المهمة، تأكد من اشتراكك ثم أعد المحاولة"
 )
@@ -187,6 +199,14 @@ def _pipeline_state_error(reason: str):
     lowered = reason.lower()
     if "forbidden fields" in lowered or "actual_data must be a dict" in lowered:
         return _error("invalid_submission", _MSG_INVALID_SUBMISSION, 400)
+    if "invalid idempotency key" in lowered:
+        return _error(
+            "invalid_idempotency_key", _MSG_INVALID_IDEMPOTENCY_KEY, 400
+        )
+    if "in progress" in lowered:
+        return _error(
+            "submission_in_progress", _MSG_SUBMISSION_IN_PROGRESS, 409
+        )
     if "no user_task record" in lowered:
         return _error("task_not_available", _MSG_NOT_AVAILABLE, 409)
     if "not found" in lowered:
@@ -361,8 +381,31 @@ def submit_task(task_id: int):
     else:
         return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
 
+    # Optional standard idempotency header (MT-TASK-04): validated
+    # here, enforced by the database; absent → server-generated key.
+    idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key:
+            idempotency_key = None
+        elif (
+            len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH
+            or not all(
+                c.isalnum() or c in _IDEMPOTENCY_KEY_CHARS
+                for c in idempotency_key
+            )
+        ):
+            return _error(
+                "invalid_idempotency_key",
+                _MSG_INVALID_IDEMPOTENCY_KEY,
+                400,
+            )
+
     try:
-        result = TaskLifecycle().submit_task(user_id, task_id, actual_data)
+        result = TaskLifecycle().submit_task(
+            user_id, task_id, actual_data,
+            idempotency_key=idempotency_key,
+        )
     except Exception:
         logger.exception(
             "Submit failed unexpectedly: user=%s task=%s", user_id, task_id
