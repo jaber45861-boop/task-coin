@@ -15,7 +15,8 @@ Service:
 - verifier called once for a new key; NOT called again on replay
 - FAILED does not complete, ERROR does not complete, PASSED completes
 - submission records remain after completion (audit trail survives)
-- no wallet mutation, no ledger mutation (PART 16)
+- PASSED completion credits wallet + ledger exactly once with the
+  server-defined reward (MT-REWARD-01); FAILED/ERROR never touch them
 
 Run:
     python3 -m pytest test_task_submission_store.py -v
@@ -41,6 +42,7 @@ from task_verifier import (
     clear_verifiers,
     register_verifier,
 )
+from wallet import USDT_SCALE
 
 USER = 7
 OTHER_USER = 8
@@ -545,7 +547,10 @@ class TestOutcomeMatrix:
         assert record.status == "passed"
         assert TaskSubmissionStore.count_attempts(USER, tid) == 1
 
-    def test_no_wallet_or_ledger_mutation(self, path, verifier):
+    def test_completion_credits_exactly_once(self, path, verifier):
+        """MT-REWARD-01: a PASSED completion settles the reward — exactly
+        one wallet row and one ledger credit, equal to the task's
+        server-defined reward; the route/lifecycle add nothing else."""
         tid = _task()
         assert _wallet_ledger_counts(USER) == (0, 0)
         lifecycle = TaskLifecycle()
@@ -554,8 +559,28 @@ class TestOutcomeMatrix:
             USER, tid, {"actual": "secret123"}, idempotency_key="fin"
         )
         assert db.get_user_task(USER, tid)["status"] == "completed"
-        assert _wallet_ledger_counts(USER) == (0, 0), \
-            "completion must never touch wallet/ledger (PART 16)"
+        assert _wallet_ledger_counts(USER) == (1, 1), \
+            "exactly one wallet row and one ledger entry per completion"
+        with db.get_connection() as conn:
+            wallet_row = conn.execute(
+                "SELECT available_units, held_units FROM wallets "
+                "WHERE user_id = ?",
+                (USER,),
+            ).fetchone()
+            entry = conn.execute(
+                "SELECT entry_type, amount_units, available_delta, "
+                "       held_delta, reference_type "
+                "FROM ledger WHERE user_id = ?",
+                (USER,),
+            ).fetchone()
+        reward_units = 100 * USDT_SCALE   # _task() reward=100
+        assert wallet_row["available_units"] == reward_units
+        assert wallet_row["held_units"] == 0
+        assert entry["entry_type"] == "credit"
+        assert entry["amount_units"] == reward_units
+        assert entry["available_delta"] == reward_units  # == wallet delta
+        assert entry["held_delta"] == 0
+        assert entry["reference_type"] == "task"
 
     def test_bridge_replay_returns_without_gate_rerun(
         self, path, verifier

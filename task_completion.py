@@ -5,10 +5,15 @@ Single entry point for completing tasks.  The gate enforces:
 
 1. A VerificationResult must be provided (verification contract).
 2. Only the gate can transition user_tasks from started → completed.
-3. No rewards, referral changes, or wallet modifications occur here.
+3. MT-REWARD-01: the task reward is credited atomically WITH the
+   transition — wallet credit + ledger entry run inside the same
+   db.transaction() via TaskRewardService, so completion and money
+   commit or roll back together.  No referral changes occur here.
 
 Flow:
-    Task  →  Verification  →  Verified result  →  Completion gate  →  user_tasks.status = completed
+    Task  →  Verification  →  Verified result  →  Completion gate
+        →  user_tasks.status = completed  +  wallet credit  +  ledger entry
+           (one BEGIN IMMEDIATE transaction)
 
 No user-facing code should call database completion directly.
 """
@@ -20,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import db
+from task_reward import TaskRewardService
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +78,11 @@ class CompletionGate:
     - Transitions to 'completed' inside db.transaction() (BEGIN IMMEDIATE)
       so the validate-then-transition sequence is atomic: exactly one
       concurrent attempt can move started → completed.
-    - Does NOT grant rewards or modify referral/wallet state.
+    - MT-REWARD-01: settles the task reward on that SAME transaction
+      (wallet credit + ledger entry through TaskRewardService) — any
+      financial failure rolls the transition back, so there is never a
+      completed task without its reward nor a reward without its
+      completion.  No referral or other wallet state is touched.
     """
 
     def complete(
@@ -158,9 +168,22 @@ class CompletionGate:
                     f"expected '{db.USER_TASK_STATUS_STARTED}'"
                 )
 
+            # 7. Atomic reward settlement (MT-REWARD-01): credit the
+            #    user's USDT wallet and record the ledger entry on THIS
+            #    same transaction, after the transition succeeded —
+            #    completion + wallet + ledger commit together.  Any
+            #    failure (invalid reward, wallet write, ledger insert)
+            #    propagates out of db.transaction(), which rolls back
+            #    the compare-and-set above along with every financial
+            #    write: no partial state is left behind.
+            credited_units = TaskRewardService.settle_completion(
+                conn, user_id=user_id, task_id=task_id, task=task
+            )
+
         logger.info(
-            "Task completed via gate: user=%d task=%d",
+            "Task completed via gate: user=%d task=%d credited_units=%s",
             user_id,
             task_id,
+            credited_units,
         )
         return True

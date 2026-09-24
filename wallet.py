@@ -15,26 +15,32 @@ Currency model:
     12.50000000 USDT = 1,250,000,000 wallet units
     Decimal("1.5")    -> 150,000,000 units
 
-Scope (MT-2 only):
+Scope (MT-2 only, plus MT-REWARD-01's injected-connection support):
 
     - exact Decimal <-> integer-unit conversion (no rounding, no float)
     - lazy wallet creation (``ensure_wallet``)
     - available-balance read (``balance_of`` -> Decimal, available only)
     - ``reserve`` / ``release_units`` / ``settle_units`` primitives
+    - connection-injected availability credit (``credit_units``,
+      MT-REWARD-01) so a caller's outer transaction can move units
+      atomically with its own writes — no nested transactions, and
+      this scope never commits/rolls back a caller-owned connection
 
 Deliberately NOT implemented here (future micro-tasks):
 
     - Ledger entries (MT-3): every wallet mutation touches ONLY the
-      ``wallets`` table — no ledger rows are ever written here
+      ``wallets`` table — no ledger rows are ever written here (the
+      task-reward ledger rows belong to ``task_reward.py``)
     - Withdrawal persistence / integration (MT-4, MT-5)
-    - deposits, task/referral rewards, admin credits
+    - deposits, referral rewards, admin credits
     - EGP conversion, exchange-rate fetching, fee/rate pinning
     - Telegram handlers, Mini App, balance UI
 
 Atomicity & concurrency:
 
     Every mutation is ONE conditional UPDATE verified by its affected-row
-    count (``available_units >= ?`` / ``held_units >= ?``), executed via
+    count (``available_units >= ?`` / ``held_units >= ?``, or the
+    rowcount of the availability credit), executed via
     the existing commit/rollback context manager.  The forbidden
     read-calculate-write pattern is never used, so two concurrent
     reserves cannot spend the same balance and a failed operation leaves
@@ -54,6 +60,7 @@ Conventions:
 
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
@@ -222,6 +229,16 @@ _SETTLE_SQL = """
       AND held_units >= ?
 """
 
+# Availability credit (MT-REWARD-01): available increases by the exact
+# integer-unit amount, held is never touched.  The affected-row count is
+# verified by the caller (the row must exist — never create money).
+_CREDIT_SQL = """
+    UPDATE wallets
+    SET available_units = available_units + ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+"""
+
 
 # ── Internal helpers ─────────────────────────────────────────────────
 
@@ -259,12 +276,23 @@ def _amount_to_units(amount: object, *, field: str) -> int:
 
 # ── Wallet service ───────────────────────────────────────────────────
 
-def ensure_wallet(user_id: int) -> bool:
+def ensure_wallet(
+    user_id: int, *, connection: sqlite3.Connection | None = None
+) -> bool:
     """Create the wallet row for an existing user if it is missing.
 
     Lazily initializes ``available_units = 0`` and ``held_units = 0``.
     Idempotent and race-safe (``INSERT OR IGNORE``): repeated or
     concurrent calls never duplicate the row.
+
+    Args:
+        user_id: existing Telegram user id.
+        connection: optional caller-owned connection (MT-REWARD-01).
+            When supplied, the row is created on THAT connection so the
+            creation participates in the caller's transaction — this
+            scope then never commits, rolls back or closes it.  When
+            omitted, the standard ``db.get_connection()`` scope owns
+            commit/rollback/close exactly as before.
 
     Returns:
         True when the row was created, False when it already existed.
@@ -273,21 +301,91 @@ def ensure_wallet(user_id: int) -> bool:
         UserNotFoundError: invalid user_id or no such user in ``users``.
     """
     _require_user_id(user_id)
+    if connection is not None:
+        return _ensure_wallet_on(connection, user_id)
     with db.get_connection() as conn:
-        if conn.execute(
-            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone() is None:
-            raise UserNotFoundError(f"user {user_id} does not exist")
-        if conn.execute(
-            "SELECT 1 FROM wallets WHERE user_id = ?", (user_id,)
-        ).fetchone() is not None:
-            return False  # already there — no write, no contention
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO wallets "
-            "(user_id, available_units, held_units) VALUES (?, 0, 0)",
-            (user_id,),
+        return _ensure_wallet_on(conn, user_id)
+
+
+def _ensure_wallet_on(conn: sqlite3.Connection, user_id: int) -> bool:
+    """``ensure_wallet`` body executed on an explicit connection.
+
+    The connection is borrowed: statements are executed on it but it
+    is never committed, rolled back or closed here.
+    """
+    if conn.execute(
+        "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone() is None:
+        raise UserNotFoundError(f"user {user_id} does not exist")
+    if conn.execute(
+        "SELECT 1 FROM wallets WHERE user_id = ?", (user_id,)
+    ).fetchone() is not None:
+        return False  # already there — no write, no contention
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO wallets "
+        "(user_id, available_units, held_units) VALUES (?, 0, 0)",
+        (user_id,),
+    )
+    return cursor.rowcount == 1
+
+
+def credit_units(
+    user_id: int,
+    amount_units: object,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
+    """Atomically add ``amount_units`` USDT units to available balance.
+
+    ONE UPDATE (``available_units = available_units + ?``) with the
+    affected-row count verified — the amount is added exactly once and
+    ``held_units`` is never touched.  A missing wallet row or user
+    raises instead of creating money.
+
+    Connection ownership (MT-REWARD-01):
+
+        With ``connection`` the statement runs inside the caller's
+        open transaction (e.g. the CompletionGate's ``BEGIN
+        IMMEDIATE`` block): this scope never commits/rolls back/closes
+        it, there is no nested transaction, and the credit commits or
+        rolls back together with the caller's other writes.  Without
+        it, the standard ``db.get_connection()`` scope commits per
+        call, exactly like the other mutations.
+
+    Only the ``wallets`` table is touched: no ledger entry is ever
+    written here — composing wallet + ledger is the settlement
+    service's job (``task_reward.py``).
+
+    Args:
+        user_id: existing Telegram user id.
+        amount_units: positive int of USDT units (bool/float rejected).
+        connection: optional caller-owned connection to join.
+
+    Returns:
+        The credited amount in integer wallet units.
+
+    Raises:
+        UserNotFoundError, InvalidWalletAmountError, WalletError.
+    """
+    units = _require_positive_units(amount_units, field="amount_units")
+    if connection is None:
+        with db.get_connection() as conn:
+            return _credit_units_on(conn, user_id, units)
+    return _credit_units_on(connection, user_id, units)
+
+
+def _credit_units_on(
+    conn: sqlite3.Connection, user_id: int, units: int
+) -> int:
+    """Ensure the wallet exists on ``conn`` and credit ``units`` to it
+    with one UPDATE on that same (borrowed) connection."""
+    ensure_wallet(user_id, connection=conn)
+    cursor = conn.execute(_CREDIT_SQL, (units, user_id))
+    if cursor.rowcount != 1:
+        raise WalletError(
+            f"wallet row missing for user {user_id}; credit not applied"
         )
-        return cursor.rowcount == 1
+    return units
 
 
 def wallet_units(user_id: int) -> WalletUnits:

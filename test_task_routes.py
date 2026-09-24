@@ -37,7 +37,9 @@ Covers the required checklist:
   - inactive task → 404 task_inactive
   - malformed request body → 400
   - authentication failure → 401
-  - no reward/wallet/ledger write on completion (PART 12)
+  - completion credits the USDT wallet + ledger exactly once,
+    server-side, with the server-defined task reward (MT-REWARD-01);
+    the route itself adds no second credit and never computes money
 
 Run:
     python3 -m pytest test_task_routes.py -v
@@ -49,6 +51,7 @@ import pytest
 
 import db
 import serve_miniapp
+from wallet import USDT_SCALE
 from config import CHANNELS, Channel
 from channel_task_verifier import (
     CHANNEL_TASK_TYPE,
@@ -583,13 +586,19 @@ class TestSubmit:
 
 
 # ════════════════════════════════════════════════════════════════════
-# No reward credit (PART 12)
+# Reward credit — server-side, exactly once (MT-REWARD-01)
 # ════════════════════════════════════════════════════════════════════
 
 
-class TestNoRewardCredit:
-    def test_completion_touches_no_wallet_or_ledger(self, client, members):
-        task_id = _create_channel_task()
+class TestRewardCredit:
+    def test_route_completion_credits_reward_exactly_once(
+        self, client, members
+    ):
+        """A PASSED submission through the HTTP route credits the wallet
+        and ledger exactly once with the server-defined reward; the
+        route itself never computes money and a repeated completion
+        attempt adds no second credit."""
+        task_id = _create_channel_task()   # reward=50 (whole USDT)
         members.statuses[USER_A] = "member"
         client.post(f"/api/tasks/{task_id}/start", headers=_auth())
         response = client.post(
@@ -598,14 +607,47 @@ class TestNoRewardCredit:
         assert response.status_code == 200
         assert _status(USER_A, task_id) == "completed"
 
+        reward_units = 50 * USDT_SCALE
         with db.get_connection() as conn:
             wallets = conn.execute(
-                "SELECT COUNT(*) AS c FROM wallets WHERE user_id = ?",
+                "SELECT available_units, held_units FROM wallets "
+                "WHERE user_id = ?",
                 (USER_A,),
-            ).fetchone()["c"]
-            ledger_rows = conn.execute(
+            ).fetchall()
+            entries = conn.execute(
+                "SELECT entry_type, amount_units, available_delta, "
+                "       held_delta, currency, reference_type "
+                "FROM ledger WHERE user_id = ?",
+                (USER_A,),
+            ).fetchall()
+        # Exactly one wallet row, credited exactly once — no more.
+        assert len(wallets) == 1
+        assert wallets[0]["available_units"] == reward_units
+        assert wallets[0]["held_units"] == 0
+        # Exactly one ledger credit, equal to the wallet delta.
+        assert len(entries) == 1
+        entry = dict(entries[0])
+        assert entry["entry_type"] == "credit"
+        assert entry["amount_units"] == reward_units
+        assert entry["available_delta"] == reward_units
+        assert entry["held_delta"] == 0
+        assert entry["currency"] == "USDT"
+        assert entry["reference_type"] == "task"
+
+        # A repeated completion attempt (409) never adds another credit.
+        response = client.post(
+            f"/api/tasks/{task_id}/submit", headers=_auth()
+        )
+        assert response.status_code == 409
+        with db.get_connection() as conn:
+            assert conn.execute(
                 "SELECT COUNT(*) AS c FROM ledger WHERE user_id = ?",
                 (USER_A,),
-            ).fetchone()["c"]
-        assert wallets == 0
-        assert ledger_rows == 0
+            ).fetchone()["c"] == 1
+            row = conn.execute(
+                "SELECT available_units, held_units FROM wallets "
+                "WHERE user_id = ?",
+                (USER_A,),
+            ).fetchone()
+        assert row["available_units"] == reward_units
+        assert row["held_units"] == 0
