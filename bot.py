@@ -2,6 +2,7 @@ import os
 import random
 import re
 import logging
+import json
 from dotenv import load_dotenv
 from telegram import (
     BotCommandScopeChat,
@@ -813,6 +814,94 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("Channels listed by admin %d", user_id)
 
 
+# ── Admin: Create Task ───────────────────────────────────────────────
+
+ADD_TASK_USAGE = (
+    "❌ صيغة خاطئة. استخدم:\n"
+    "/addtask عنوان | وصف | نقاط | channel_slug\n\n"
+    "مثال:\n"
+    "/addtask انضم لقناتنا | اشترك في القناة | 500 | main"
+)
+
+
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a task from chat. Admin only.
+
+    Usage: /addtask title | description | points | channel_slug
+
+    Only the ``telegram_channel`` task type is supported here.  The
+    channel_slug MUST already exist in the required-channel registry
+    (config.CHANNELS).  The task is stored in the existing tasks table
+    via db.create_task with task_data ``{"channel_slug": "<slug>"}``.
+
+    Mandatory subscription channels are a separate concern: this
+    handler only reads the registry to validate the slug and never
+    adds, removes, or gates channels.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    args_text = parts[1] if len(parts) > 1 else ""
+    fields = [p.strip() for p in args_text.split("|")]
+
+    if len(fields) != 4:
+        await update.message.reply_text(ADD_TASK_USAGE)
+        return
+
+    title, description, points_text, slug = fields
+    slug = slug.lstrip("@")
+
+    if not title or not description or not slug:
+        await update.message.reply_text(ADD_TASK_USAGE)
+        return
+
+    try:
+        points = int(points_text)
+    except ValueError:
+        points = -1
+    if points < 0:
+        await update.message.reply_text(
+            "❌ النقاط يجب أن تكون عددًا صحيحًا لا يقل عن صفر."
+        )
+        return
+
+    if slug not in CHANNELS:
+        await update.message.reply_text(
+            f"❌ الـ channel_slug '{slug}' غير موجود في سجل القنوات.\n"
+            "استخدم /listchannels لعرض السجل."
+        )
+        return
+
+    try:
+        task_id = db.create_task(
+            title,
+            description,
+            "telegram_channel",
+            points,
+            task_data=json.dumps({"channel_slug": slug}, ensure_ascii=False),
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعذر إنشاء المهمة: {exc}")
+        return
+
+    await update.message.reply_text(
+        "✅ تم إنشاء المهمة:\n\n"
+        f"🆔 ID: {task_id}\n"
+        f"📌 العنوان: {title}\n"
+        f"📝 الوصف: {description}\n"
+        f"💰 النقاط: {points}\n"
+        f"📡 القناة: {slug}"
+    )
+    logger.info(
+        "Task created: id=%d type=telegram_channel channel=%s by admin %d",
+        task_id, slug, user_id,
+    )
+
+
 # ── Admin: Remove Channel ────────────────────────────────────────────
 
 async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1602,6 +1691,10 @@ def main() -> None:
     app.add_handler(addchannel_conv, group=0)
     app.add_handler(removechannel_conv, group=0)
     app.add_handler(CommandHandler("listchannels", list_channels), group=0)
+    # Admin-only task creation (telegram_channel).  Authorization is
+    # enforced inside add_task; non-admins get an admin-only reply.
+    # Not added to the BotCommand menu, same as the other admin commands.
+    app.add_handler(CommandHandler("addtask", add_task), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
