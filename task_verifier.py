@@ -430,3 +430,21 @@ try:
     register_verifier(_CHANNEL_TASK_TYPE, _ChannelTaskVerifier())
 except ImportError:  # pragma: no cover - partially-initialised cycle
     pass
+
+# The telegram channel task verifier (MT-TASK-05, the user-facing
+# telegram_channel family) registers itself the same way.  Same
+# circular-import safety as above: when this module was triggered from
+# inside telegram_channel_task_verifier's own import, the name import
+# below raises ImportError and registration is completed by that
+# module's own bottom instead.
+try:
+    from telegram_channel_task_verifier import (  # noqa: E402,F401
+        TELEGRAM_CHANNEL_TASK_TYPE as _TELEGRAM_CHANNEL_TASK_TYPE,
+        TelegramChannelTaskVerifier as _TelegramChannelTaskVerifier,
+    )
+
+    register_verifier(
+        _TELEGRAM_CHANNEL_TASK_TYPE, _TelegramChannelTaskVerifier()
+    )
+except ImportError:  # pragma: no cover - partially-initialised cycle
+    pass

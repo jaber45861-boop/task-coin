@@ -33,9 +33,10 @@ Security rules enforced here:
   imported here
 - responses expose only safe presentation fields (id, title,
   description, type, reward, status) plus, for ``channel_subscription``
-  tasks only, the public ``https://t.me/<username>`` join destination
-  resolved server-side from the trusted task definition — never raw
-  ``task_data``, never numeric channel ids, never verifier internals
+  and ``telegram_channel`` tasks, the public ``https://t.me/<username>``
+  join destination resolved server-side from the trusted task
+  definition — never raw ``task_data``, never numeric channel ids,
+  never verifier internals
 - errors are distinguished with stable machine codes and concise
   Arabic user-facing messages; internal exception details and stack
   traces never reach the client
@@ -53,6 +54,10 @@ import db
 import miniapp_auth
 from config import get_channel
 from channel_task_verifier import CHANNEL_TASK_TYPE
+from telegram_channel_task_verifier import (
+    TELEGRAM_CHANNEL_TASK_TYPE,
+    task_channel_slug,
+)
 from task_catalog import TaskCatalog
 from task_lifecycle import TaskLifecycle
 from task_start import StartGateError
@@ -235,24 +240,32 @@ def _pipeline_state_error(reason: str):
 def _safe_join_url(task_id: int, task_type: str) -> str | None:
     """Public join destination for a channel task, or ``None``.
 
-    Narrow scope: only ``channel_subscription`` tasks, only the
-    configured channel's public ``@username`` rendered as a
-    ``https://t.me/<username>`` link.  Numeric channel ids, slugs,
+    Narrow scope: only ``channel_subscription`` and
+    ``telegram_channel`` tasks, only the configured channel's public
+    ``@username`` rendered as a ``https://t.me/<username>`` link.  The
+    slug always comes from the trusted server-side task definition —
+    the browser never chooses the target.  Numeric channel ids, slugs,
     task_data and admin fields are never returned.
     """
-    if task_type != CHANNEL_TASK_TYPE:
+    if task_type == CHANNEL_TASK_TYPE:
+        task = db.get_task(task_id)
+        if task is None:
+            return None
+        raw = task.get("task_data") or ""
+        try:
+            task_data = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(task_data, dict):
+            return None
+        slug = task_data.get("channel_slug")
+    elif task_type == TELEGRAM_CHANNEL_TASK_TYPE:
+        task = db.get_task(task_id)
+        if task is None:
+            return None
+        slug = task_channel_slug(task)
+    else:
         return None
-    task = db.get_task(task_id)
-    if task is None:
-        return None
-    raw = task.get("task_data") or ""
-    try:
-        task_data = json.loads(raw) if raw else {}
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(task_data, dict):
-        return None
-    slug = task_data.get("channel_slug")
     if not isinstance(slug, str) or not slug.strip():
         return None
     channel = get_channel(slug)
