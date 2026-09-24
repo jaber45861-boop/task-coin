@@ -67,6 +67,12 @@ class SubmissionRecord:
     submitted_at: str
     completed_at: str | None
     created_at: str
+    # Buyer-approval state (MT-TASK-06): NULL for every non-referral
+    # submission; 'pending' | 'approved' | 'rejected' for an
+    # approval-gated referral claim.
+    approval_status: str | None = None
+    approver_user_id: int | None = None
+    approval_decided_at: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -85,13 +91,16 @@ def _row_to_record(row) -> SubmissionRecord:
         submitted_at=row["submitted_at"],
         completed_at=row["completed_at"],
         created_at=row["created_at"],
+        approval_status=row["approval_status"],
+        approver_user_id=row["approver_user_id"],
+        approval_decided_at=row["approval_decided_at"],
     )
 
 
 _COLUMNS = (
     "submission_id, user_id, task_id, attempt_number, status, "
     "idempotency_key, verification_reason, submitted_at, completed_at, "
-    "created_at"
+    "created_at, approval_status, approver_user_id, approval_decided_at"
 )
 
 
@@ -325,6 +334,177 @@ class TaskSubmissionStore:
                 "WHERE user_id = ? AND task_id = ?",
                 (user_id, task_id),
             ).fetchone()["c"]
+
+    # ── Buyer-approval claims (MT-TASK-06) ─────────────────────
+    #
+    # A paid-referral claim IS a submission record that is born in
+    # approval_status='pending'.  These methods are the only writers of
+    # that state; they never touch user_tasks, wallets, ledgers or the
+    # four-state submission `status` vocabulary.
+
+    @staticmethod
+    def create_approval_claim(
+        user_id: int,
+        task_id: int,
+        idempotency_key: str,
+        db_path: str | None = None,
+    ) -> tuple["SubmissionRecord", bool]:
+        """Create a submission already marked approval-pending, or
+        return the existing claim.
+
+        Returns ``(record, created)``:
+        - ``created=True``: this caller opened the claim.
+        - ``created=False``: either the same idempotency key already
+          exists, or the (user, task) already has an open pending
+          claim — the returned record is that claim (duplicate-claim
+          prevention: at most ONE pending claim per user/task ever).
+
+        The same-key race is decided by the UNIQUE constraint and the
+        single-open-claim rule is decided inside ``BEGIN IMMEDIATE`` —
+        never application-level SELECT-then-INSERT.
+        """
+        with db.transaction(db_path) as conn:
+            existing_key = conn.execute(
+                f"SELECT {_COLUMNS} FROM task_submissions "
+                "WHERE user_id = ? AND task_id = ? AND idempotency_key = ?",
+                (user_id, task_id, idempotency_key),
+            ).fetchone()
+            if existing_key is not None:
+                return _row_to_record(existing_key), False
+
+            pending = conn.execute(
+                f"SELECT {_COLUMNS} FROM task_submissions "
+                "WHERE user_id = ? AND task_id = ? "
+                "AND approval_status = ? "
+                "ORDER BY submission_id DESC LIMIT 1",
+                (
+                    user_id, task_id,
+                    db.SUBMISSION_APPROVAL_PENDING,
+                ),
+            ).fetchone()
+            if pending is not None:
+                return _row_to_record(pending), False
+
+            attempt_number = conn.execute(
+                "SELECT COUNT(*) AS c FROM task_submissions "
+                "WHERE user_id = ? AND task_id = ?",
+                (user_id, task_id),
+            ).fetchone()["c"] + 1
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO task_submissions "
+                    "(user_id, task_id, attempt_number, status, "
+                    " idempotency_key, approval_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        user_id, task_id, attempt_number,
+                        db.SUBMISSION_STATUS_SUBMITTED,
+                        idempotency_key,
+                        db.SUBMISSION_APPROVAL_PENDING,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    f"SELECT {_COLUMNS} FROM task_submissions "
+                    "WHERE user_id = ? AND task_id = ? "
+                    "AND idempotency_key = ?",
+                    (user_id, task_id, idempotency_key),
+                ).fetchone()
+                if row is None:
+                    raise
+                return _row_to_record(row), False
+            submission_id = cursor.lastrowid
+
+        logger.info(
+            "Approval claim opened: user=%d task=%d attempt=%d key=%s",
+            user_id, task_id, attempt_number, idempotency_key,
+        )
+        record = TaskSubmissionStore.get_submission(submission_id, db_path)
+        assert record is not None
+        return record, True
+
+    @staticmethod
+    def get_pending_claim(
+        user_id: int, task_id: int, db_path: str | None = None
+    ) -> "SubmissionRecord | None":
+        """The user's open pending claim for this task, or None."""
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM task_submissions "
+                "WHERE user_id = ? AND task_id = ? "
+                "AND approval_status = ? "
+                "ORDER BY submission_id DESC LIMIT 1",
+                (user_id, task_id, db.SUBMISSION_APPROVAL_PENDING),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    @staticmethod
+    def get_latest_claim(
+        user_id: int, task_id: int, db_path: str | None = None
+    ) -> "SubmissionRecord | None":
+        """The user's most recent approval-gated claim (any state)."""
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM task_submissions "
+                "WHERE user_id = ? AND task_id = ? "
+                "AND approval_status IS NOT NULL "
+                "ORDER BY submission_id DESC LIMIT 1",
+                (user_id, task_id),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    @staticmethod
+    def list_pending_claims_for_task(
+        task_id: int, db_path: str | None = None
+    ) -> list["SubmissionRecord"]:
+        """All open pending claims of one task, oldest first.
+        (Approver-facing read; scoped by the caller's authorization.)"""
+        with db.get_connection(db_path) as conn:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM task_submissions "
+                "WHERE task_id = ? AND approval_status = ? "
+                "ORDER BY submission_id ASC",
+                (task_id, db.SUBMISSION_APPROVAL_PENDING),
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    @staticmethod
+    def mark_approval_decision(
+        submission_id: int,
+        approval_status: str,
+        approver_user_id: int,
+        db_path: str | None = None,
+    ) -> "SubmissionRecord | None":
+        """CAS a pending claim to approved/rejected, recording who and when.
+
+        Only a record still in approval_status='pending' transitions;
+        a second (or opposite) decision can never overwrite the first.
+        Returns the updated record, or None when it was not pending.
+        """
+        if approval_status not in (
+            db.SUBMISSION_APPROVAL_APPROVED,
+            db.SUBMISSION_APPROVAL_REJECTED,
+        ):
+            raise ValueError(f"invalid approval decision: {approval_status!r}")
+        with db.transaction(db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE task_submissions "
+                "SET approval_status = ?, approver_user_id = ?, "
+                "    approval_decided_at = CURRENT_TIMESTAMP "
+                "WHERE submission_id = ? AND approval_status = ?",
+                (
+                    approval_status, approver_user_id, submission_id,
+                    db.SUBMISSION_APPROVAL_PENDING,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+        logger.info(
+            "Approval decision recorded: submission=%d status=%s "
+            "approver=%d",
+            submission_id, approval_status, approver_user_id,
+        )
+        return TaskSubmissionStore.get_submission(submission_id, db_path)
 
     @staticmethod
     def await_terminal(

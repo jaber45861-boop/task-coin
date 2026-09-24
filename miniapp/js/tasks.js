@@ -50,7 +50,8 @@ const Tasks = (() => {
 
     const TYPE_LABELS = {
         channel_subscription: 'اشتراك في قناة',
-        deterministic: 'مهمة تحقق'
+        deterministic: 'مهمة تحقق',
+        referral_task: 'مهمة إحالة'
     };
 
     let pageEl = null;
@@ -266,6 +267,18 @@ const Tasks = (() => {
             return;
         }
 
+        // Referral claim already submitted — the buyer's decision is
+        // what matters now, so no submit control is offered while the
+        // server says the claim is still being decided.
+        if (task.awaiting_decision === true) {
+            const waiting = document.createElement('span');
+            waiting.className = 'task-waiting-label';
+            waiting.setAttribute('data-testid', 'task-awaiting');
+            waiting.textContent = 'بانتظار موافقة العميل';
+            actions.appendChild(waiting);
+            return;
+        }
+
         if (task.status === 'available') {
             const startBtn = document.createElement('button');
             startBtn.type = 'button';
@@ -387,7 +400,16 @@ const Tasks = (() => {
         busy = false;
 
         if (ok) {
-            _replaceTask(Object.assign({}, task, { status: 'completed' }));
+            if (data.awaiting_decision === true) {
+                // Referral claim accepted — the task stays started
+                // until the buyer's decision arrives server-side.
+                _replaceTask(Object.assign({}, task, {
+                    status: 'started',
+                    awaiting_decision: true
+                }));
+            } else {
+                _replaceTask(Object.assign({}, task, { status: 'completed' }));
+            }
             _showNotice(data.message || 'تم إنجاز المهمة بنجاح', 'success');
             return;
         }

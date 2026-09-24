@@ -15,6 +15,22 @@ Endpoints (all under ``/api/tasks``):
                                          (AttemptPolicy → SubmissionService
                                           → ChannelTaskVerifier →
                                           CompletionGate on PASSED only)
+                                         referral tasks dispatch to the
+                                         approval-gated claim path instead
+                                         (MT-TASK-06 — see below)
+
+Paid referral extension (MT-TASK-06, minimal):
+
+- ``GET  /api/tasks/<task_id>/claims``         pending claims, only for
+                                               the task's server-defined
+                                               buyer/approver
+- ``POST /api/tasks/<task_id>/claims/<sid>/decision``  approve|reject by
+                                               the verified buyer identity
+
+Referral claims never complete on submission: they open a pending
+claim at the submission layer, and only the authorized buyer's
+approve decision reaches CompletionGate → TaskRewardService.  The
+worker-facing API carries no approval capability of any kind.
 
 Idempotency (MT-TASK-04): the submit endpoint accepts the standard
 ``Idempotency-Key`` header.  The key is validated here and enforced by
@@ -58,9 +74,20 @@ from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
     task_channel_slug,
 )
+from referral_task import (
+    REFERRAL_TASK_TYPE,
+    ReferralApprovalService,
+    ReferralClaimError,
+    ReferralClaimService,
+    ReferralDecisionError,
+    task_approver_user_id,
+    worker_claim_state,
+)
 from task_catalog import TaskCatalog
 from task_lifecycle import TaskLifecycle
 from task_start import StartGateError
+from task_submission import FORBIDDEN_FIELDS
+from task_submission_store import TaskSubmissionStore
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +126,20 @@ _MSG_VERIFICATION_FAILED = (
     "لم يتم تأكيد إنجاز المهمة، تأكد من اشتراكك ثم أعد المحاولة"
 )
 _MSG_VERIFICATION_ERROR = "تعذر التحقق حالياً، حاول مرة أخرى لاحقاً"
+
+# Paid referral claims (MT-TASK-06)
+_MSG_CLAIM_RECEIVED = "تم استلام طلبك، بانتظار موافقة العميل"
+_MSG_CLAIM_REJECTED = "تم رفض الطلب، يمكنك إعادة المحاولة"
+_MSG_NO_REFERRAL = "لا توجد إحالة صالحة مرتبطة بحسابك"
+_MSG_OWN_TASK = "لا يمكنك تنفيذ مهمة تعود لك"
+_MSG_CLAIM_NOT_REPEATABLE = "هذه المهمة غير متاحة للتقديم الحالي"
+_MSG_NOT_APPROVER = "ليست لديك صلاحية اتخاذ هذا القرار"
+_MSG_CLAIM_NOT_FOUND = "الطلب غير موجود"
+_MSG_ALREADY_CLAIM_APPROVED = "تمت الموافقة على هذا الطلب مسبقاً"
+_MSG_ALREADY_CLAIM_REJECTED = "تم رفض هذا الطلب مسبقاً"
+_MSG_INVALID_DECISION = "القرار غير صالح"
+_MSG_APPROVED_OK = "تمت الموافقة على الطلب"
+_MSG_REJECTED_OK = "تم رفض الطلب"
 
 _MSG_STARTED_OK = "تم بدء المهمة"
 _MSG_COMPLETED_OK = "تم إنجاز المهمة بنجاح"
@@ -277,6 +318,91 @@ def _safe_join_url(task_id: int, task_type: str) -> str | None:
     return "https://t.me/" + username
 
 
+# ── Paid referral claim helpers (MT-TASK-06) ─────────────────────────
+
+
+def _claim_error(reason: str, user_id: int, task_id: int):
+    """Map a ReferralClaimError message to a safe API error.
+
+    Existing pipeline/state rejections reuse their exact stable codes
+    first; claim-specific reasons get narrow dedicated codes; anything
+    else degrades to the generic state error without leaking internals.
+    """
+    state_error = _pipeline_state_error(reason)
+    if state_error is not None:
+        return state_error
+    lowered = reason.lower()
+    if "no referral attribution" in lowered or "self-referral" in lowered:
+        return _error("no_referral", _MSG_NO_REFERRAL, 409)
+    if "own referral task" in lowered:
+        return _error("own_task", _MSG_OWN_TASK, 409)
+    if "not supported" in lowered or "repeatable" in lowered:
+        return _error(
+            "claim_not_repeatable", _MSG_CLAIM_NOT_REPEATABLE, 409
+        )
+    logger.info(
+        "Referral claim rejected: user=%s task=%s — %s",
+        user_id, task_id, reason,
+    )
+    return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
+
+
+def _claim_outcome_response(outcome, user_id: int, task_id: int):
+    """Safe response for a claim outcome (pending/approved/rejected)."""
+    status = _current_status(user_id, task_id)
+    if outcome.state == "pending":
+        return jsonify(
+            {
+                "ok": True,
+                "status": status,
+                "approval": "pending",
+                # Page-facing boolean: keep the pending/approved/
+                # rejected vocabulary server-side only.
+                "awaiting_decision": True,
+                "message": _MSG_CLAIM_RECEIVED,
+            }
+        ), 200
+    if outcome.state == "rejected":
+        # Same-key replay of a rejected claim: durable outcome, no
+        # completion, no reward.
+        return _error(
+            "claim_rejected",
+            _MSG_CLAIM_REJECTED,
+            409,
+            status=status,
+            approval="rejected",
+        )
+    # approved: idempotent same-key replay of an already-completed
+    # claim (the attempt policy blocks this path otherwise).
+    return jsonify(
+        {
+            "ok": True,
+            "status": status,
+            "approval": "approved",
+            "message": _MSG_COMPLETED_OK,
+        }
+    ), 200
+
+
+def _decision_error(reason: str):
+    """Map a ReferralDecisionError message to a safe API error."""
+    lowered = reason.lower()
+    if "authorized buyer" in lowered or "own claim" in lowered:
+        return _error("not_approver", _MSG_NOT_APPROVER, 403)
+    if "not found" in lowered:
+        return _error("claim_not_found", _MSG_CLAIM_NOT_FOUND, 404)
+    if "already approved" in lowered:
+        return _error(
+            "claim_already_approved", _MSG_ALREADY_CLAIM_APPROVED, 409
+        )
+    if "already rejected" in lowered:
+        return _error(
+            "claim_already_rejected", _MSG_ALREADY_CLAIM_REJECTED, 409
+        )
+    logger.warning("Referral decision rejected: %s", reason)
+    return _error("invalid_decision", _MSG_INVALID_DECISION, 409)
+
+
 # ── GET /api/tasks — catalog + the caller's status ────────────────────
 
 
@@ -310,6 +436,15 @@ def list_tasks():
             join_url = _safe_join_url(summary.id, summary.type)
             if join_url:
                 entry["join_url"] = join_url
+            if summary.type == REFERRAL_TASK_TYPE:
+                # The worker's OWN claim state as a narrow boolean for
+                # the page (pending → true).  Own state only — never
+                # anyone else's identity or the buyer's data, never
+                # approval authority (this page has no decision control).
+                entry["awaiting_decision"] = (
+                    worker_claim_state(user_id, summary.id)
+                    == db.SUBMISSION_APPROVAL_PENDING
+                )
             tasks.append(entry)
     except Exception:
         logger.exception("Failed to list tasks for user %s", user_id)
@@ -414,6 +549,33 @@ def submit_task(task_id: int):
                 400,
             )
 
+    # ── Paid referral tasks (MT-TASK-06): approval-gated dispatch ──
+    # Referral claims never complete on submission: they open a
+    # pending claim at the submission layer.  Completion happens only
+    # through the buyer's decision endpoint below.
+    task_row = db.get_task(task_id)
+    if task_row is not None and task_row["type"] == REFERRAL_TASK_TYPE:
+        forbidden_found = FORBIDDEN_FIELDS.intersection(
+            actual_data.keys()
+        )
+        if forbidden_found:
+            return _error(
+                "invalid_submission", _MSG_INVALID_SUBMISSION, 400
+            )
+        try:
+            outcome = ReferralClaimService.submit(
+                user_id, task_id, idempotency_key
+            )
+        except ReferralClaimError as exc:
+            return _claim_error(str(exc), user_id, task_id)
+        except Exception:
+            logger.exception(
+                "Referral claim failed unexpectedly: user=%s task=%s",
+                user_id, task_id,
+            )
+            return _server_error()
+        return _claim_outcome_response(outcome, user_id, task_id)
+
     try:
         result = TaskLifecycle().submit_task(
             user_id, task_id, actual_data,
@@ -462,3 +624,114 @@ def submit_task(task_id: int):
         502,
         status=status,
     )
+
+
+# ── GET /api/tasks/<task_id>/claims — buyer/approver view ────────────
+
+
+@tasks_bp.get("/api/tasks/<int:task_id>/claims")
+def list_claims(task_id: int):
+    """Pending referral claims of one task — the buyer's view.
+
+    Authorization comes ONLY from the trusted server-side task
+    definition (task_data.approver.telegram_user_id) compared against
+    the verified initData identity.  A worker probing this endpoint
+    gets a narrow denial and zero data; worker identities are never
+    exposed to anyone here.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task = db.get_task(task_id)
+    if task is None:
+        return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+    if task["type"] != REFERRAL_TASK_TYPE:
+        return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
+
+    approver_id = task_approver_user_id(task)
+    if approver_id is None:
+        # Broken/malformed definition: fail closed, expose nothing.
+        return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
+    if user_id != approver_id:
+        return _error("not_approver", _MSG_NOT_APPROVER, 403)
+
+    try:
+        claims = TaskSubmissionStore.list_pending_claims_for_task(task_id)
+    except Exception:
+        logger.exception("Failed to list claims: task=%s", task_id)
+        return _server_error()
+
+    # Safe fields only: claim id + when it was opened.  No worker
+    # identity, no referral ids, no task_data, no reward internals.
+    return jsonify(
+        {
+            "ok": True,
+            "claims": [
+                {
+                    "claim_id": c.submission_id,
+                    "submitted_at": c.submitted_at,
+                }
+                for c in claims
+            ],
+        }
+    ), 200
+
+
+# ── POST /api/tasks/<task_id>/claims/<sid>/decision ──────────────────
+
+
+@tasks_bp.post(
+    "/api/tasks/<int:task_id>/claims/<int:submission_id>/decision"
+)
+def decide_claim(task_id: int, submission_id: int):
+    """The authorized buyer's approve/reject decision on one claim.
+
+    Flow: HTTP → ReferralApprovalService.decide (server-side
+    authorization against the trusted task definition) → CAS approval
+    → on approve: record passed → CompletionGate → TaskRewardService;
+    on reject: record failed, nothing else.  The decision comes from
+    a literal body value — identity, authority, reward and completion
+    all stay server-side.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    body = request.get_json(silent=True)
+    if body is not None and not isinstance(body, dict):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+    decision = body.get("decision") if isinstance(body, dict) else None
+    if decision not in ("approve", "reject"):
+        return _error("invalid_decision", _MSG_INVALID_DECISION, 400)
+
+    try:
+        outcome = ReferralApprovalService.decide(
+            user_id,
+            task_id,
+            submission_id,
+            approve=(decision == "approve"),
+        )
+    except ReferralDecisionError as exc:
+        return _decision_error(str(exc))
+    except Exception:
+        logger.exception(
+            "Decision failed unexpectedly: user=%s task=%s claim=%s",
+            user_id, task_id, submission_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "claim_id": submission_id,
+            "approval": outcome.state,
+            "message": (
+                _MSG_APPROVED_OK
+                if outcome.state == "approved"
+                else _MSG_REJECTED_OK
+            ),
+        }
+    ), 200

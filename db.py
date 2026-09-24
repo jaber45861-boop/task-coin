@@ -39,6 +39,19 @@ SUBMISSION_STATUSES = (
     SUBMISSION_STATUS_FAILED,
     SUBMISSION_STATUS_ERROR,
 )
+
+# Buyer-approval states for approval-gated submissions (MT-TASK-06).
+# Lives on task_submissions (submission layer) — NEVER on user_tasks.
+# NULL in approval_status means "not approval-gated" (every non-referral
+# submission, and all legacy rows).
+SUBMISSION_APPROVAL_PENDING = "pending"
+SUBMISSION_APPROVAL_APPROVED = "approved"
+SUBMISSION_APPROVAL_REJECTED = "rejected"
+SUBMISSION_APPROVAL_STATES = (
+    SUBMISSION_APPROVAL_PENDING,
+    SUBMISSION_APPROVAL_APPROVED,
+    SUBMISSION_APPROVAL_REJECTED,
+)
 ALLOWED_USER_TASK_STATUSES = {
     USER_TASK_STATUS_AVAILABLE,
     USER_TASK_STATUS_STARTED,
@@ -289,6 +302,40 @@ def init_db(db_path: str | None = None) -> None:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_task_submissions_user_task
             ON task_submissions (user_id, task_id, submission_id)
+        """)
+
+        # ── Buyer-approval columns for paid referral claims (MT-TASK-06).
+        # Smallest additive change possible: approval state lives at the
+        # SUBMISSION layer (never on user_tasks), and the existing
+        # submission `status` vocabulary stays exactly the four MT-TASK-04
+        # states — a claim is 'submitted' while approval is pending.
+        #   approval_status      NULL (not approval-gated) |
+        #                       'pending' | 'approved' | 'rejected'
+        #   approver_user_id     server-authorized decider (on decision)
+        #   approval_decided_at  decision timestamp (on decision)
+        # Legacy/non-referral rows keep NULL in all three.
+        try:
+            conn.execute(
+                "ALTER TABLE task_submissions ADD COLUMN approval_status TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute(
+                "ALTER TABLE task_submissions ADD COLUMN approver_user_id INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute(
+                "ALTER TABLE task_submissions ADD COLUMN approval_decided_at TIMESTAMP"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Buyer view: pending claims of one task, oldest first.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_submissions_pending_approval
+            ON task_submissions (task_id, approval_status, submission_id)
         """)
 
         # ── Wallet / ledger / withdrawal schema (MT-1) ─────────────
