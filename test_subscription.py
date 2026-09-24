@@ -945,7 +945,12 @@ class TestNoOldBusinessLogic(unittest.TestCase):
         combined = sub_src + bot_src + config_src
 
         forbidden_keywords = [
-            "reward",
+            # NOTE: "reward" is deliberately not banned.  The task domain's
+            # reward metadata (tasks.reward) and its read-only display in the
+            # admin /listtasks command (MT-TASK-08) legitimately name the
+            # field.  What this guard still forbids is any *financial*
+            # reward/penalty logic from the old repo: deduction, balances,
+            # wallet movement, activation — none of that may come back.
             "deduct",
             "penalty",
             "wallet",

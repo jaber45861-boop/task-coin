@@ -902,6 +902,49 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Admin: List Tasks ───────────────────────────────────────────────
+
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all task definitions (id, title, type, reward, active).
+
+    Admin only.  Read-only: queries the existing tasks table via
+    db.list_tasks() and never creates, modifies, or disables tasks.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        unlock_user(user_id)
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    tasks = db.list_tasks()
+
+    if not tasks:
+        await update.message.reply_text("📭 لا توجد مهام حالياً.")
+        return
+
+    lines = ["📋 *قائمة المهام:*\n"]
+    for task in tasks:
+        active_text = "نعم" if task["active"] else "لا"
+        lines.append(
+            f"🆔 ID: `{task['id']}`\n"
+            f"   📝 العنوان: *{task['title']}*\n"
+            f"   📂 النوع: `{task['type']}`\n"
+            f"   💰 المكافأة: `{task['reward']}`\n"
+            f"   ✅ نشطة: {active_text}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    logger.info("Tasks listed by admin %d", user_id)
+
+
 # ── Admin: Remove Channel ────────────────────────────────────────────
 
 async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1695,6 +1738,7 @@ def main() -> None:
     # enforced inside add_task; non-admins get an admin-only reply.
     # Not added to the BotCommand menu, same as the other admin commands.
     app.add_handler(CommandHandler("addtask", add_task), group=0)
+    app.add_handler(CommandHandler("listtasks", list_tasks), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
