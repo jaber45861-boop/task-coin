@@ -945,6 +945,61 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     logger.info("Tasks listed by admin %d", user_id)
 
 
+# ── Admin: Disable Task ─────────────────────────────────────────
+
+async def off_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable a task (soft delete). Admin only.
+
+    Usage: /offtask <id>
+
+    Sets only ``active=False`` via ``db.update_task()``.  The task row
+    is never removed: user_tasks history, task_submissions, approvals,
+    and ledger rewards stay untouched, and the existing catalog,
+    start-gate, and attempt-policy checks then exclude the task.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        subscribed, missing = await check_subscription_access(
+            context.bot, user_id
+        )
+        if not subscribed:
+            lock_user(user_id)
+            text, markup = _build_missing_message(missing)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        unlock_user(user_id)
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    parts = (update.message.text or "").strip().split(maxsplit=1)
+    id_text = parts[1].strip() if len(parts) > 1 else ""
+    if not id_text.isdigit():
+        await update.message.reply_text(
+            "❌ صيغة خاطئة. استخدم:\n"
+            "/offtask <id>\n\n"
+            "مثال:\n"
+            "/offtask 1"
+        )
+        return
+
+    task_id = int(id_text)
+    task = db.get_task(task_id)
+    if task is None:
+        await update.message.reply_text(
+            f"❌ لا توجد مهمة بالرقم {task_id}."
+        )
+        return
+
+    db.update_task(task_id, active=False)
+    await update.message.reply_text(
+        "✅ تم إيقاف المهمة:\n\n"
+        f"🆔 ID: {task_id}\n"
+        f"📌 العنوان: {task['title']}\n"
+        f"✅ نشطة: لا"
+    )
+    logger.info("Task switched off: id=%d by admin %d", task_id, user_id)
+
+
 # ── Admin: Remove Channel ────────────────────────────────────────────
 
 async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1739,6 +1794,7 @@ def main() -> None:
     # Not added to the BotCommand menu, same as the other admin commands.
     app.add_handler(CommandHandler("addtask", add_task), group=0)
     app.add_handler(CommandHandler("listtasks", list_tasks), group=0)
+    app.add_handler(CommandHandler("offtask", off_task), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
