@@ -931,9 +931,11 @@ class TestClaimsRoute:
         assert data["ok"] is True
         assert len(data["claims"]) == 1
         claim = data["claims"][0]
-        # proof_ref for review + safe fields ONLY — no worker identity.
+        # Safe review fields ONLY (MT-TASK-16): claim id, task id,
+        # submitted_at, proof_ref — no worker identity.
         assert set(claim.keys()) == {
-            "claim_id", "submitted_at", "proof_ref"}
+            "claim_id", "task_id", "submitted_at", "proof_ref"}
+        assert claim["task_id"] == tid
         assert claim["proof_ref"] == PROOF
         assert "user_id" not in claim
 

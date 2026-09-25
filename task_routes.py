@@ -767,9 +767,9 @@ def list_claims(task_id: int):
         return _server_error()
 
     # Safe fields only: claim id + when it was opened, plus (manual
-    # tasks only) the bounded proof reference the authorized reviewer
-    # must see.  No worker identity, no referral ids, no task_data,
-    # no reward internals.
+    # tasks only) the task id and the bounded proof reference the
+    # authorized reviewer must see.  No worker identity, no referral
+    # ids, no task_data, no reward internals.
     items = []
     for c in claims:
         item = {
@@ -777,6 +777,7 @@ def list_claims(task_id: int):
             "submitted_at": c.submitted_at,
         }
         if task["type"] == MANUAL_TASK_TYPE:
+            item["task_id"] = task_id
             item["proof_ref"] = c.proof_ref
         items.append(item)
     return jsonify({"ok": True, "claims": items}), 200
