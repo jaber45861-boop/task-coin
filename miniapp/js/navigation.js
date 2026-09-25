@@ -36,7 +36,10 @@ const Navigation = (() => {
         // The Wallet page is opened from the Home wallet icon — it is
         // NOT a bottom-navigation tab, so the Home tab stays active
         // while the Wallet page is open (approved design).
-        const activeTab = page === 'wallet' ? 'home' : page;
+        // The Review page (MT-TASK-18) likewise opens from the Account
+        // entry, so the Account tab stays active while it is open.
+        const activeTab = page === 'wallet' ? 'home'
+            : page === 'review' ? 'profile' : page;
 
         // Update active state
         const navItems = document.querySelectorAll('.nav-item');

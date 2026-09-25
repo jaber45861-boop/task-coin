@@ -64,6 +64,8 @@ const App = (() => {
             pageEl = Wallet.render();
         } else if (page === 'tasks' && typeof Tasks !== 'undefined') {
             pageEl = Tasks.render();
+        } else if (page === 'review' && typeof Review !== 'undefined') {
+            pageEl = Review.render();
         } else {
             const template = document.getElementById(`page-${page}`);
 
@@ -80,6 +82,13 @@ const App = (() => {
         }
 
         contentEl.appendChild(pageEl);
+
+        // In-page entries (e.g. the Account reviewer entry) reuse the
+        // existing Navigation router — same pattern as the wallet
+        // icon on Home; no second router is introduced.
+        pageEl.querySelectorAll('[data-goto]').forEach((el) => {
+            el.addEventListener('click', () => Navigation.navigateTo(el.dataset.goto));
+        });
 
         // Add enter animation
         pageEl.classList.add('page-enter');
