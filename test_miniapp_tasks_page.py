@@ -15,6 +15,9 @@ Verifies the production Tasks page integration:
 - reward is display-only: never sent back, never client-controlled
 - no wallet controls on the Tasks page
 - no channel URL hardcoded in JavaScript (join_url comes from the API)
+- telegram_channel presentation: Arabic type label, join link rendered
+  only from a server-provided https join_url, completed stays terminal,
+  and the client never derives channel identity (MT-TASK-13)
 - the existing shell, theme and template constraints keep holding
 
 Run:
@@ -358,3 +361,139 @@ class TestTasksStyling:
         html = _html()
         assert 'dir="rtl"' in html
         assert 'lang="ar"' in html
+
+
+# ════════════════════════════════════════════════════════════════════
+# 8. telegram_channel presentation (MT-TASK-13)
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestTelegramChannelPresentation:
+    """Presentation of the existing telegram_channel task family.
+
+    Display only: no API, lifecycle, verification or wallet change —
+    the card renders what the server sends and nothing more.
+    """
+
+    @staticmethod
+    def _type_labels() -> dict:
+        match = re.search(
+            r"TYPE_LABELS\s*=\s*\{(.*?)\}", _tasks_js(), re.DOTALL
+        )
+        assert match, "TYPE_LABELS missing"
+        return dict(re.findall(r"(\w+)\s*:\s*'([^']+)'", match.group(1)))
+
+    @staticmethod
+    def _branch(content: str, start: str, end: str | None = None) -> str:
+        begin = content.find(start)
+        assert begin >= 0, f"branch marker not found: {start!r}"
+        if end is None:
+            return content[begin:]
+        stop = content.find(end, begin)
+        assert stop > begin, f"branch end marker not found: {end!r}"
+        return content[begin:stop]
+
+    # ── Arabic type label ───────────────────────────────────────
+
+    def test_telegram_channel_arabic_type_label(self):
+        """telegram_channel renders a human-readable Arabic label."""
+        labels = self._type_labels()
+        assert "telegram_channel" in labels, \
+            "telegram_channel must have a type label"
+        label = labels["telegram_channel"]
+        assert re.search(r"[؀-ۿ]", label), \
+            f"telegram_channel label must be Arabic: {label!r}"
+        # Distinct from the mandatory subscription-gate family label.
+        assert label != labels.get("channel_subscription")
+        # Existing families keep their labels untouched.
+        assert labels.get("channel_subscription") == "اشتراك في قناة"
+        assert labels.get("referral_task")
+        assert labels.get("deterministic")
+
+    def test_label_is_presentation_not_task_data(self):
+        """The label is a type name — never baked-in task content."""
+        content = _tasks_js()
+        assert "قناة تيليجرام" not in content, \
+            "hardcoded task description found"
+        assert "task_data" not in content
+
+    # ── join_url rendering ──────────────────────────────────────
+
+    def test_valid_join_url_renders_as_channel_action_link(self):
+        """A server-provided join_url becomes the channel action link."""
+        content = _tasks_js()
+        started = self._branch(
+            content,
+            "if (task.status === 'started')",
+            "// completed — terminal",
+        )
+        guard = (
+            "typeof task.join_url === 'string'"
+            " && task.join_url.startsWith('https://')"
+        )
+        guard_pos = started.find(guard)
+        link_pos = started.find("'task-join'")
+        assert guard_pos >= 0, "join_url type/https guard missing"
+        assert link_pos > guard_pos, \
+            "the join link must be created inside the join_url guard"
+        assert "joinLink.href = task.join_url;" in started, \
+            "href must come from the server-provided join_url verbatim"
+        assert "انضم للقناة" in started, \
+            "the channel action link must keep its Arabic label"
+
+    def test_missing_join_url_produces_no_link(self):
+        """null/absent join_url renders no link — never a broken one."""
+        content = _tasks_js()
+        # Null/undefined/non-string/non-https values never pass.
+        assert "typeof task.join_url === 'string'" in content
+        assert "startsWith('https://')" in content
+        # No fallback URL construction of any kind.
+        assert "t.me" not in content, \
+            "channel URL must never be hardcoded in JavaScript"
+        assert re.search(r"join_url\s*\+", content) is None, \
+            "join_url must never be concatenated into a URL"
+        assert re.search(r"join_url\s*\|\|", content) is None, \
+            "no default join_url fallback is allowed"
+        # The only href assignment in the page is task.join_url.
+        hrefs = re.findall(r"\.href\s*=\s*([^;\n]+)", content)
+        assert hrefs, "expected the join link href assignment"
+        for value in hrefs:
+            assert value.strip() == "task.join_url", \
+                f"href assigned from non-server value: {value.strip()!r}"
+
+    # ── completed stays terminal ────────────────────────────────
+
+    def test_completed_keeps_completed_state_without_join_action(self):
+        """A completed task shows only the terminal label — no join."""
+        content = _tasks_js()
+        completed = self._branch(content, "// completed — terminal")
+        assert "'task-completed-label'" in completed
+        assert "تم الإنجاز" in completed
+        assert "task-join" not in completed, \
+            "completed tasks must not offer a join action"
+        assert "'task-start'" not in completed
+        assert "'task-submit'" not in completed
+        # Exactly one join control in the whole page: the started branch.
+        assert content.count("'task-join'") == 1
+        # The card still reflects the server status, and the terminal
+        # state itself comes from the server response, never the client.
+        assert "'data-status'" in content
+        assert "{ status: 'completed' }" in content
+
+    # ── no client-side channel identity ─────────────────────────
+
+    def test_client_does_not_derive_channel_identity_from_task_data(self):
+        """The page never reads task_data or builds channel identity."""
+        content = _tasks_js()
+        for forbidden in (
+            "task_data",
+            "channel_slug",
+            "channel_id",
+            "username",
+            "chat_id",
+            "slug",
+        ):
+            assert forbidden not in content, \
+                f"client-side channel identity derivation found: {forbidden}"
+        # The join destination is the server's join_url and nothing else.
+        assert "task.join_url" in content

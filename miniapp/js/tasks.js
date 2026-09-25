@@ -51,7 +51,8 @@ const Tasks = (() => {
     const TYPE_LABELS = {
         channel_subscription: 'اشتراك في قناة',
         deterministic: 'مهمة تحقق',
-        referral_task: 'مهمة إحالة'
+        referral_task: 'مهمة إحالة',
+        telegram_channel: 'انضمام عبر تيليجرام'
     };
 
     let pageEl = null;
