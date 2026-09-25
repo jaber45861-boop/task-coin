@@ -32,6 +32,16 @@ claim at the submission layer, and only the authorized buyer's
 approve decision reaches CompletionGate → TaskRewardService.  The
 worker-facing API carries no approval capability of any kind.
 
+Manual/social-proof extension (MT-TASK-15, minimal):
+
+- ``POST /api/tasks/<task_id>/submit`` dispatches ``manual`` tasks to
+  ``ManualProofService.submit`` — a pending claim carrying a bounded
+  text/URL ``proof_ref`` (no photo/file storage, never trusted for
+  identity, authorization, reward or task selection)
+- the claims + decision endpoints above also serve ``manual`` tasks,
+  authorized ONLY by task_data.approver.telegram_user_id (no admin
+  fallback, no arbitrary authenticated user)
+
 Idempotency (MT-TASK-04): the submit endpoint accepts the standard
 ``Idempotency-Key`` header.  The key is validated here and enforced by
 the database — a repeated key returns the original submission result
@@ -82,6 +92,15 @@ from referral_task import (
     ReferralDecisionError,
     task_approver_user_id,
     worker_claim_state,
+)
+from manual_task import (
+    MANUAL_TASK_TYPE,
+    ManualDecisionError,
+    ManualProofError,
+    ManualProofService,
+    ManualReviewService,
+    manual_task_approver_user_id,
+    worker_awaiting_decision,
 )
 from task_catalog import TaskCatalog
 from task_lifecycle import TaskLifecycle
@@ -140,6 +159,10 @@ _MSG_ALREADY_CLAIM_REJECTED = "تم رفض هذا الطلب مسبقاً"
 _MSG_INVALID_DECISION = "القرار غير صالح"
 _MSG_APPROVED_OK = "تمت الموافقة على الطلب"
 _MSG_REJECTED_OK = "تم رفض الطلب"
+
+# Manual/social-proof claims (MT-TASK-15)
+_MSG_PROOF_RECEIVED = "تم استلام إثباتك، بانتظار مراجعة المشرف"
+_MSG_INVALID_PROOF = "الإثبات غير صالح، أرسل رابطاً أو نصاً واضحاً"
 
 _MSG_STARTED_OK = "تم بدء المهمة"
 _MSG_COMPLETED_OK = "تم إنجاز المهمة بنجاح"
@@ -347,8 +370,18 @@ def _claim_error(reason: str, user_id: int, task_id: int):
     return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
 
 
-def _claim_outcome_response(outcome, user_id: int, task_id: int):
-    """Safe response for a claim outcome (pending/approved/rejected)."""
+def _claim_outcome_response(
+    outcome,
+    user_id: int,
+    task_id: int,
+    pending_message: str = _MSG_CLAIM_RECEIVED,
+):
+    """Safe response for a claim outcome (pending/approved/rejected).
+
+    Shared by the referral and manual proof families — identical
+    state vocabulary; ``pending_message`` only tailors the Arabic
+    wording.  Referral callers use the default (unchanged).
+    """
     status = _current_status(user_id, task_id)
     if outcome.state == "pending":
         return jsonify(
@@ -359,7 +392,7 @@ def _claim_outcome_response(outcome, user_id: int, task_id: int):
                 # Page-facing boolean: keep the pending/approved/
                 # rejected vocabulary server-side only.
                 "awaiting_decision": True,
-                "message": _MSG_CLAIM_RECEIVED,
+                "message": pending_message,
             }
         ), 200
     if outcome.state == "rejected":
@@ -384,10 +417,37 @@ def _claim_outcome_response(outcome, user_id: int, task_id: int):
     ), 200
 
 
-def _decision_error(reason: str):
-    """Map a ReferralDecisionError message to a safe API error."""
+def _manual_error(reason: str, user_id: int, task_id: int):
+    """Map a ManualProofError message to a safe API error.
+
+    Existing pipeline/state rejections reuse their exact stable codes
+    first; proof-specific rejections get a narrow dedicated code;
+    anything else degrades to the generic state error without leaking
+    internals.
+    """
+    state_error = _pipeline_state_error(reason)
+    if state_error is not None:
+        return state_error
     lowered = reason.lower()
-    if "authorized buyer" in lowered or "own claim" in lowered:
+    if "proof_ref" in lowered:
+        return _error("invalid_proof", _MSG_INVALID_PROOF, 400)
+    if "own manual task" in lowered:
+        return _error("own_task", _MSG_OWN_TASK, 409)
+    logger.info(
+        "Manual proof rejected: user=%s task=%s — %s",
+        user_id, task_id, reason,
+    )
+    return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
+
+
+def _decision_error(reason: str):
+    """Map a referral/manual decision error message to a safe API error."""
+    lowered = reason.lower()
+    if (
+        "authorized buyer" in lowered
+        or "authorized approver" in lowered
+        or "own claim" in lowered
+    ):
         return _error("not_approver", _MSG_NOT_APPROVER, 403)
     if "not found" in lowered:
         return _error("claim_not_found", _MSG_CLAIM_NOT_FOUND, 404)
@@ -444,6 +504,13 @@ def list_tasks():
                 entry["awaiting_decision"] = (
                     worker_claim_state(user_id, summary.id)
                     == db.SUBMISSION_APPROVAL_PENDING
+                )
+            elif summary.type == MANUAL_TASK_TYPE:
+                # Same narrow own-state boolean for manual proofs
+                # (MT-TASK-15): true while the worker's own claim
+                # awaits the reviewer's decision.  Own state only.
+                entry["awaiting_decision"] = worker_awaiting_decision(
+                    user_id, summary.id
                 )
             tasks.append(entry)
     except Exception:
@@ -576,6 +643,39 @@ def submit_task(task_id: int):
             return _server_error()
         return _claim_outcome_response(outcome, user_id, task_id)
 
+    # ── Manual/social-proof tasks (MT-TASK-15): approval-gated dispatch
+    # Manual claims never complete on submission: they open a pending
+    # claim at the submission layer carrying the bounded proof_ref.
+    # Completion happens only through the reviewer's decision endpoint
+    # below; proof_ref itself is never trusted for identity,
+    # authorization, reward or task selection.
+    if task_row is not None and task_row["type"] == MANUAL_TASK_TYPE:
+        forbidden_found = FORBIDDEN_FIELDS.intersection(
+            actual_data.keys()
+        )
+        if forbidden_found:
+            return _error(
+                "invalid_submission", _MSG_INVALID_SUBMISSION, 400
+            )
+        proof_ref = actual_data.get("proof_ref")
+        try:
+            outcome = ManualProofService.submit(
+                user_id, task_id, proof_ref, idempotency_key
+            )
+        except ManualProofError as exc:
+            return _manual_error(str(exc), user_id, task_id)
+        except Exception:
+            logger.exception(
+                "Manual proof claim failed unexpectedly: "
+                "user=%s task=%s",
+                user_id, task_id,
+            )
+            return _server_error()
+        return _claim_outcome_response(
+            outcome, user_id, task_id,
+            pending_message=_MSG_PROOF_RECEIVED,
+        )
+
     try:
         result = TaskLifecycle().submit_task(
             user_id, task_id, actual_data,
@@ -647,10 +747,13 @@ def list_claims(task_id: int):
     task = db.get_task(task_id)
     if task is None:
         return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
-    if task["type"] != REFERRAL_TASK_TYPE:
+    if task["type"] not in (REFERRAL_TASK_TYPE, MANUAL_TASK_TYPE):
         return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
 
-    approver_id = task_approver_user_id(task)
+    if task["type"] == MANUAL_TASK_TYPE:
+        approver_id = manual_task_approver_user_id(task)
+    else:
+        approver_id = task_approver_user_id(task)
     if approver_id is None:
         # Broken/malformed definition: fail closed, expose nothing.
         return _error("invalid_task_state", _MSG_INVALID_STATE, 409)
@@ -663,20 +766,20 @@ def list_claims(task_id: int):
         logger.exception("Failed to list claims: task=%s", task_id)
         return _server_error()
 
-    # Safe fields only: claim id + when it was opened.  No worker
-    # identity, no referral ids, no task_data, no reward internals.
-    return jsonify(
-        {
-            "ok": True,
-            "claims": [
-                {
-                    "claim_id": c.submission_id,
-                    "submitted_at": c.submitted_at,
-                }
-                for c in claims
-            ],
+    # Safe fields only: claim id + when it was opened, plus (manual
+    # tasks only) the bounded proof reference the authorized reviewer
+    # must see.  No worker identity, no referral ids, no task_data,
+    # no reward internals.
+    items = []
+    for c in claims:
+        item = {
+            "claim_id": c.submission_id,
+            "submitted_at": c.submitted_at,
         }
-    ), 200
+        if task["type"] == MANUAL_TASK_TYPE:
+            item["proof_ref"] = c.proof_ref
+        items.append(item)
+    return jsonify({"ok": True, "claims": items}), 200
 
 
 # ── POST /api/tasks/<task_id>/claims/<sid>/decision ──────────────────
@@ -686,10 +789,11 @@ def list_claims(task_id: int):
     "/api/tasks/<int:task_id>/claims/<int:submission_id>/decision"
 )
 def decide_claim(task_id: int, submission_id: int):
-    """The authorized buyer's approve/reject decision on one claim.
+    """The authorized buyer's/reviewer's approve/reject decision.
 
-    Flow: HTTP → ReferralApprovalService.decide (server-side
-    authorization against the trusted task definition) → CAS approval
+    Flow: HTTP → ReferralApprovalService.decide (referral tasks) or
+    ManualReviewService.decide (manual proof tasks) — server-side
+    authorization against the trusted task definition → CAS approval
     → on approve: record passed → CompletionGate → TaskRewardService;
     on reject: record failed, nothing else.  The decision comes from
     a literal body value — identity, authority, reward and completion
@@ -708,13 +812,25 @@ def decide_claim(task_id: int, submission_id: int):
         return _error("invalid_decision", _MSG_INVALID_DECISION, 400)
 
     try:
-        outcome = ReferralApprovalService.decide(
-            user_id,
-            task_id,
-            submission_id,
-            approve=(decision == "approve"),
-        )
-    except ReferralDecisionError as exc:
+        # Dispatch by the server-side task type: manual proof claims
+        # go to the manual review service (MT-TASK-15); everything
+        # else keeps the referral decision path exactly as before.
+        task = db.get_task(task_id)
+        if task is not None and task["type"] == MANUAL_TASK_TYPE:
+            outcome = ManualReviewService.decide(
+                user_id,
+                task_id,
+                submission_id,
+                approve=(decision == "approve"),
+            )
+        else:
+            outcome = ReferralApprovalService.decide(
+                user_id,
+                task_id,
+                submission_id,
+                approve=(decision == "approve"),
+            )
+    except (ReferralDecisionError, ManualDecisionError) as exc:
         return _decision_error(str(exc))
     except Exception:
         logger.exception(

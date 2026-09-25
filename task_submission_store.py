@@ -73,6 +73,11 @@ class SubmissionRecord:
     approval_status: str | None = None
     approver_user_id: int | None = None
     approval_decided_at: str | None = None
+    # Manual/social-proof reference (MT-TASK-15): NULL for every
+    # non-manual submission; the bounded text/URL proof reference of a
+    # manual proof claim.  Presentation-only — never identity,
+    # authorization, reward or task data.
+    proof_ref: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -94,13 +99,15 @@ def _row_to_record(row) -> SubmissionRecord:
         approval_status=row["approval_status"],
         approver_user_id=row["approver_user_id"],
         approval_decided_at=row["approval_decided_at"],
+        proof_ref=row["proof_ref"],
     )
 
 
 _COLUMNS = (
     "submission_id, user_id, task_id, attempt_number, status, "
     "idempotency_key, verification_reason, submitted_at, completed_at, "
-    "created_at, approval_status, approver_user_id, approval_decided_at"
+    "created_at, approval_status, approver_user_id, approval_decided_at, "
+    "proof_ref"
 )
 
 
@@ -348,9 +355,14 @@ class TaskSubmissionStore:
         task_id: int,
         idempotency_key: str,
         db_path: str | None = None,
+        proof_ref: str | None = None,
     ) -> tuple["SubmissionRecord", bool]:
         """Create a submission already marked approval-pending, or
         return the existing claim.
+
+        ``proof_ref`` (MT-TASK-15) is the caller-validated bounded
+        proof reference for a manual proof claim; NULL for every
+        other claim (referral calls omit it — unchanged behavior).
 
         Returns ``(record, created)``:
         - ``created=True``: this caller opened the claim.
@@ -394,13 +406,14 @@ class TaskSubmissionStore:
                 cursor = conn.execute(
                     "INSERT INTO task_submissions "
                     "(user_id, task_id, attempt_number, status, "
-                    " idempotency_key, approval_status) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    " idempotency_key, approval_status, proof_ref) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         user_id, task_id, attempt_number,
                         db.SUBMISSION_STATUS_SUBMITTED,
                         idempotency_key,
                         db.SUBMISSION_APPROVAL_PENDING,
+                        proof_ref,
                     ),
                 )
             except sqlite3.IntegrityError:

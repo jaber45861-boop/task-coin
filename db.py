@@ -332,6 +332,19 @@ def init_db(db_path: str | None = None) -> None:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # ── Manual/social-proof reference (MT-TASK-15). ────────────
+        # Smallest additive change possible: a bounded text/URL proof
+        # reference for the manual proof task family.  NULL for every
+        # non-manual submission (legacy rows included); read/written
+        # ONLY through TaskSubmissionStore, and never trusted for
+        # identity, authorization, reward, task or user identity.
+        try:
+            conn.execute(
+                "ALTER TABLE task_submissions ADD COLUMN proof_ref TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Buyer view: pending claims of one task, oldest first.
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_task_submissions_pending_approval
