@@ -40,6 +40,11 @@ from flask import Flask, send_from_directory
 from waitress import create_server
 
 import db
+from telegram_channel_task_verifier import (
+    TELEGRAM_CHANNEL_TASK_TYPE,
+    TelegramChannelTaskDataError,
+    validate_telegram_channel_task_data,
+)
 
 load_dotenv()
 
@@ -832,7 +837,19 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Only the ``telegram_channel`` task type is supported here.  The
     channel_slug MUST already exist in the required-channel registry
     (config.CHANNELS).  The task is stored in the existing tasks table
-    via db.create_task with task_data ``{"channel_slug": "<slug>"}``.
+    via db.create_task with exactly the MT-TASK-05 server-side
+    task_data contract the registered verifier reads back:
+
+        {
+            "provider": "telegram",
+            "action": "join_channel",
+            "target": {"channel_slug": "<slug>"},
+            "instructions": "<description>"
+        }
+
+    The payload is validated with the verifier's own
+    ``validate_telegram_channel_task_data`` before persisting, so this
+    writer can never store a task_data the reader rejects.
 
     Mandatory subscription channels are a separate concern: this
     handler only reads the registry to validate the slug and never
@@ -876,13 +893,30 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Build exactly the MT-TASK-05 contract and prove it with the
+    # verifier's own validator before anything is persisted — the
+    # writer and the reader share one contract, never two shapes.
+    task_data_payload = {
+        "provider": "telegram",
+        "action": "join_channel",
+        "target": {"channel_slug": slug},
+        "instructions": description,
+    }
+    try:
+        validate_telegram_channel_task_data(task_data_payload)
+    except TelegramChannelTaskDataError as exc:
+        await update.message.reply_text(
+            f"❌ بيانات المهمة غير صالحة: {exc}"
+        )
+        return
+
     try:
         task_id = db.create_task(
             title,
             description,
-            "telegram_channel",
+            TELEGRAM_CHANNEL_TASK_TYPE,
             points,
-            task_data=json.dumps({"channel_slug": slug}, ensure_ascii=False),
+            task_data=json.dumps(task_data_payload, ensure_ascii=False),
         )
     except ValueError as exc:
         await update.message.reply_text(f"❌ تعذر إنشاء المهمة: {exc}")

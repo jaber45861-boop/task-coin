@@ -3,7 +3,10 @@ Tests for the admin /addtask task-creation workflow (MT-TASK-07).
 
 Covers:
   - Authorization: non-admin users are rejected.
-  - Valid creation: telegram_channel task persisted with task_data.
+  - Valid creation: telegram_channel task persisted with the MT-TASK-05
+    nested task_data contract (provider / action / target / instructions).
+  - Contract enforcement: a payload the verifier would reject (overlong
+    instructions, unsafe registry slug) is rejected, nothing persisted.
   - Invalid channel_slug: rejected, nothing persisted.
   - Persistence: row lands in the tasks table with the right fields.
   - Malformed input (wrong field count / bad reward) is rejected safely.
@@ -26,6 +29,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from config import CHANNELS, Channel
 import db
 from bot import ADD_TASK_USAGE, add_task
+from telegram_channel_task_verifier import (
+    parse_telegram_channel_task_data,
+)
 
 # Explicit test-only admin ID — never depends on ADMINS being non-empty.
 _TEST_ADMIN_ID = 77777777
@@ -138,7 +144,18 @@ class TestAddTask(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["type"], "telegram_channel")
         self.assertEqual(task["reward"], 500)
         task_data = json.loads(task["task_data"])
-        self.assertEqual(task_data["channel_slug"], "main")
+        # Exactly the MT-TASK-05 verifier contract — nested, never flat.
+        self.assertEqual(task_data["provider"], "telegram")
+        self.assertEqual(task_data["action"], "join_channel")
+        self.assertEqual(
+            task_data["target"], {"channel_slug": "main"}
+        )
+        self.assertEqual(
+            task_data["instructions"], "اشترك في القناة"
+        )
+        self.assertNotIn("channel_slug", task_data)  # no flat key
+        # Round-trip through the verifier's own contract validator.
+        parse_telegram_channel_task_data(task["task_data"])
 
         reply = update.message.reply_text.call_args[0][0]
         self.assertIn("تم إنشاء المهمة", reply)
@@ -162,7 +179,8 @@ class TestAddTask(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["type"], "telegram_channel")
         self.assertEqual(task["reward"], 250)
         self.assertEqual(
-            json.loads(task["task_data"])["channel_slug"], "main"
+            json.loads(task["task_data"])["target"]["channel_slug"],
+            "main",
         )
 
     # ── Invalid channel_slug ────────────────────────────────
@@ -198,8 +216,52 @@ class TestAddTask(unittest.IsolatedAsyncioTestCase):
         tasks = db.list_tasks(db_path=self.test_db_path)
         self.assertEqual(len(tasks), 1)
         self.assertEqual(
-            json.loads(tasks[0]["task_data"])["channel_slug"], "main"
+            json.loads(tasks[0]["task_data"])["target"]["channel_slug"],
+            "main",
         )
+
+    # ── Contract enforcement (writer never outlives the reader) ──
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_overlong_description_rejected(
+        self, _mock: MagicMock
+    ) -> None:
+        """instructions beyond the contract bound are rejected safely."""
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID,
+            text="/addtask title | " + ("ب" * 1001) + " | 500 | main",
+        )
+        ctx = _make_context()
+
+        await add_task(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("بيانات المهمة غير صالحة", reply)
+        self.assertEqual(db.list_tasks(db_path=self.test_db_path), [])
+
+    @patch("bot.is_admin", side_effect=lambda uid: uid == _TEST_ADMIN_ID)
+    async def test_unsafe_registry_slug_rejected(
+        self, _mock: MagicMock
+    ) -> None:
+        """A registry slug the verifier contract cannot express is rejected."""
+        CHANNELS["bad-slug!"] = Channel(
+            slug="bad-slug!",
+            channel_id=-200222,
+            username="badslug",
+            title="Bad Slug",
+            required=True,
+        )
+        update = _make_update(
+            user_id=_TEST_ADMIN_ID,
+            text="/addtask title | desc | 500 | bad-slug!",
+        )
+        ctx = _make_context()
+
+        await add_task(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("بيانات المهمة غير صالحة", reply)
+        self.assertEqual(db.list_tasks(db_path=self.test_db_path), [])
 
     # ── Malformed input ─────────────────────────────────────
 
