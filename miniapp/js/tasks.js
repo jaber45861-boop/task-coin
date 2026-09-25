@@ -14,6 +14,9 @@
  * - the channel join link (join_url) comes from the server response;
  *   no channel URL is hardcoded in JavaScript and clicking "join"
  *   never marks a task complete — only the verify call can do that
+ * - manual tasks (MT-TASK-17) submit the bounded text/URL proof_ref
+ *   through the existing submit endpoint; only the server response
+ *   (awaiting_decision / status) decides the card's next state
  * - business rules stay in the backend; this file only maps the
  *   server's Arabic messages (with safe fallbacks) onto the UI
  */
@@ -34,6 +37,7 @@ const Tasks = (() => {
         invalid_task_state: 'لا يمكن تنفيذ هذا الإجراء الآن',
         invalid_request: 'الطلب غير صالح',
         invalid_submission: 'بيانات الإرسال غير صالحة',
+        invalid_proof: 'الإثبات غير صالح، أرسل رابطاً أو نصاً واضحاً',
         verification_failed: 'لم يتم تأكيد الإنجاز، تأكد من اشتراكك ثم أعد المحاولة',
         verification_error: 'تعذر التحقق حالياً، حاول مرة أخرى لاحقاً',
         submission_in_progress: 'جارٍ التحقق من محاولة سابقة، حاول بعد قليل',
@@ -51,6 +55,7 @@ const Tasks = (() => {
     const TYPE_LABELS = {
         channel_subscription: 'اشتراك في قناة',
         deterministic: 'مهمة تحقق',
+        manual: 'مهمة يدوية',
         referral_task: 'مهمة إحالة',
         telegram_channel: 'انضمام عبر تيليجرام'
     };
@@ -91,6 +96,22 @@ const Tasks = (() => {
         }
         return 'k' + Date.now().toString(36)
             + Math.random().toString(36).slice(2, 12);
+    }
+
+    /**
+     * JSON body for a manual proof: exactly the one field the
+     * existing submit endpoint reads (proof_ref), escaped for JSON.
+     * Nothing else — no identity, no status, no reward — is ever
+     * serialized by this page.
+     */
+    function _proofBody(value) {
+        const escaped = String(value)
+            .replace(/\\/g, '\\\\')
+            .replace(/"/g, '\\"')
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\r')
+            .replace(/\t/g, '\\t');
+        return '{"proof_ref":"' + escaped + '"}';
     }
 
     function _node(testid) {
@@ -268,14 +289,18 @@ const Tasks = (() => {
             return;
         }
 
-        // Referral claim already submitted — the buyer's decision is
-        // what matters now, so no submit control is offered while the
-        // server says the claim is still being decided.
+        // A referral claim or manual proof is already awaiting its
+        // server-side decision, so no submit control is offered while
+        // the server keeps reporting awaiting_decision.
         if (task.awaiting_decision === true) {
             const waiting = document.createElement('span');
             waiting.className = 'task-waiting-label';
             waiting.setAttribute('data-testid', 'task-awaiting');
-            waiting.textContent = 'بانتظار موافقة العميل';
+            // Referral keeps the buyer wording; manual proofs show
+            // the clearer "under review" wording.
+            waiting.textContent = task.type === 'manual'
+                ? 'المهمة قيد المراجعة'
+                : 'بانتظار موافقة العميل';
             actions.appendChild(waiting);
             return;
         }
@@ -302,6 +327,28 @@ const Tasks = (() => {
                 joinLink.rel = 'noopener';
                 joinLink.textContent = 'انضم للقناة';
                 actions.appendChild(joinLink);
+            }
+
+            if (task.type === 'manual') {
+                // Manual proof (MT-TASK-17): one bounded text/URL
+                // reference posted to the existing submit endpoint
+                // as proof_ref — the server validates and reviews it.
+                const proofInput = document.createElement('input');
+                proofInput.type = 'text';
+                proofInput.className = 'task-proof-input';
+                proofInput.setAttribute('data-testid', 'task-proof-input');
+                proofInput.maxLength = 500;
+                proofInput.placeholder = 'رابط الإثبات أو نصاً واضحاً';
+
+                const proofBtn = document.createElement('button');
+                proofBtn.type = 'button';
+                proofBtn.className = 'task-action-btn';
+                proofBtn.setAttribute('data-testid', 'task-proof-submit');
+                proofBtn.textContent = 'إرسال الإثبات';
+                proofBtn.addEventListener('click', () => submitProof(task, proofInput, proofBtn));
+                actions.appendChild(proofInput);
+                actions.appendChild(proofBtn);
+                return;
             }
 
             const submitBtn = document.createElement('button');
@@ -415,6 +462,62 @@ const Tasks = (() => {
             return;
         }
 
+        if (button) {
+            button.disabled = false;
+        }
+        _showNotice(_messageFor(data), 'error');
+    }
+
+    /**
+     * Manual proof submission (MT-TASK-17): posts the bounded
+     * proof_ref to the existing submit endpoint. Every outcome —
+     * validation, waiting state, review decision — comes from the
+     * server response; this function only renders it.
+     */
+    async function submitProof(task, input, button) {
+        if (busy) {
+            return;
+        }
+        busy = true;
+        _haptic();
+        _hideNotice();
+        if (button) {
+            button.disabled = true;
+        }
+
+        let data = null;
+        let ok = false;
+        try {
+            const headers = _headers();
+            headers['Content-Type'] = 'application/json';
+            headers['Idempotency-Key'] = _idempotencyKey();
+            const response = await fetch(`/api/tasks/${task.id}/submit`, {
+                method: 'POST',
+                headers: headers,
+                body: _proofBody(input.value)
+            });
+            data = await _parse(response);
+            ok = response.ok && data && data.ok === true;
+        } catch (error) {
+            ok = false;
+        }
+
+        busy = false;
+
+        if (ok) {
+            // The server decides: awaiting its review keeps the card
+            // in the waiting state, its approval completes the task.
+            _replaceTask(Object.assign({}, task, {
+                status: data.status || 'started',
+                awaiting_decision: data.awaiting_decision === true
+            }));
+            _showNotice(data.message || 'تم استلام الإثبات', 'success');
+            return;
+        }
+
+        // Failure (invalid proof, a decision against this attempt,
+        // network): the server message is shown and the input stays
+        // editable, so a new proof can be submitted right away.
         if (button) {
             button.disabled = false;
         }
