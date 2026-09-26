@@ -457,6 +457,13 @@ def init_db(db_path: str | None = None) -> None:
                 status TEXT NOT NULL CHECK (status IN (
                     'pending', 'rejected', 'completed')),
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                payment_method_id INTEGER REFERENCES payment_methods(id),
+                pm_display_name TEXT,
+                pm_category TEXT,
+                pm_asset TEXT,
+                pm_network TEXT,
+                pm_provider TEXT,
+                pm_destination TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
@@ -471,6 +478,33 @@ def init_db(db_path: str | None = None) -> None:
             ON withdrawal_requests (user_id)
             WHERE status = 'pending'
         """)
+
+        # ── Withdrawal ↔ payment-method linkage (MT-ADMIN-10) ───────
+        # Additive migration only: seven NULLABLE columns on
+        # withdrawal_requests.  payment_method_id is a real FK to
+        # payment_methods(id) (SQLite allows the inline REFERENCES
+        # clause in ADD COLUMN because the default value is NULL);
+        # the pm_* columns snapshot the linked method's display
+        # fields at request time.  Existing rows and every
+        # pre-existing column — including the method CHECK and the
+        # native_unit policy — are untouched.  Re-running init_db on
+        # an already-migrated database is a harmless no-op.
+        for _linkage_column in (
+            "payment_method_id INTEGER REFERENCES payment_methods(id)",
+            "pm_display_name TEXT",
+            "pm_category TEXT",
+            "pm_asset TEXT",
+            "pm_network TEXT",
+            "pm_provider TEXT",
+            "pm_destination TEXT",
+        ):
+            try:
+                conn.execute(
+                    "ALTER TABLE withdrawal_requests ADD COLUMN "
+                    + _linkage_column
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         # ── Linked social accounts (SA-YT-01) ────────────────────────
         # Additive migration only: a brand-new table — no existing table

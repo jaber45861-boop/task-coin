@@ -26,11 +26,13 @@ Design rules (MT-ADMIN-08):
 - **Separation.**  This layer touches ONLY the ``payment_methods``
   table — never ``wallets``, ``ledger`` or ``withdrawal_requests``
   (MT-07/finance accounting stays untouched).
-- **Deletion.**  Zero-state production has no financial history, so a
-  normal DELETE is used today.  The integer primary key is the stable
-  handle a future transaction table can reference (FK RESTRICT) to
-  block destructive deletion once real history exists — no archival
-  machinery is invented now.
+- **Deletion.**  Zero-state production used to have no financial
+  history, so a normal DELETE was correct at MT-ADMIN-08.  Since
+  MT-ADMIN-10, ``withdrawal_requests.payment_method_id`` references
+  ``payment_methods(id)``, so SQLite's FK rejects deleting a method
+  that any withdrawal still points at and ``delete_payment_method``
+  maps that ``IntegrityError`` to the store-level
+  ``PaymentMethodInUseError`` — no archival machinery is invented.
 
 Conventions: writes go through ``db.transaction()`` (BEGIN IMMEDIATE);
 reads open their own ``db.get_connection()`` scope.  Every mutation
@@ -90,6 +92,19 @@ class PaymentMethodValidationError(PaymentMethodError):
 
 class PaymentMethodNotFoundError(PaymentMethodError):
     """No payment method matches the given id."""
+
+
+class PaymentMethodInactiveError(PaymentMethodError):
+    """The method exists but is deactivated (hidden from users)."""
+
+
+class PaymentMethodInUseError(PaymentMethodError):
+    """Deletion blocked: at least one row still references the method.
+
+    Raised when the FK from ``withdrawal_requests.payment_method_id``
+    (MT-ADMIN-10) turns a raw ``sqlite3.IntegrityError`` into a clear
+    store-level failure the caller can report without parsing SQL.
+    """
 
 
 # ── Row snapshot ──────────────────────────────────────────────────────
@@ -440,6 +455,40 @@ def get_payment_method(
     return _row_to_method(row) if row else None
 
 
+def get_active_payment_method(
+    method_id: object, db_path: str | None = None
+) -> PaymentMethod:
+    """Fetch ONE active payment method by id (strict lookup).
+
+    Unlike :func:`get_payment_method` (lenient, ``None`` on miss),
+    this helper either returns an ACTIVE method or raises:
+
+    - ``PaymentMethodValidationError`` — the id itself is malformed
+    - ``PaymentMethodNotFoundError``  — no such method
+    - ``PaymentMethodInactiveError``  — exists, but deactivated
+
+    Read-only: listing/mutating nothing.  It exists so callers that
+    must never surface a deactivated payout destination fail loudly
+    instead of silently falling back.
+    """
+    mid = _require_id(method_id, "method_id")
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
+            (mid,),
+        ).fetchone()
+    if row is None:
+        raise PaymentMethodNotFoundError(
+            f"لا توجد وسيلة دفع بالمعرّف {mid}"
+        )
+    method = _row_to_method(row)
+    if not method.is_active:
+        raise PaymentMethodInactiveError(
+            f"وسيلة الدفع #{mid} غير مفعّلة"
+        )
+    return method
+
+
 def list_payment_methods(
     *, active_only: bool = False, db_path: str | None = None
 ) -> list[PaymentMethod]:
@@ -579,17 +628,25 @@ def delete_payment_method(
 ) -> bool:
     """Delete one payment method.  True when a row was removed.
 
-    Zero-state rule: no financial history references payment methods
-    yet, so a plain DELETE is correct today.  Once future transaction
-    rows reference ``payment_methods(id)``, the FK (RESTRICT) — not a
-    new archive system — will guard this path.
+    A plain DELETE is used, but since MT-ADMIN-10 withdrawals may
+    reference ``payment_methods(id)`` through the schema FK: SQLite
+    rejects removing a referenced method with an
+    ``sqlite3.IntegrityError``, which is mapped here to the clear
+    store-level ``PaymentMethodInUseError`` (the row survives and
+    nothing is partially deleted — the transaction rolls back).
     """
     mid = _require_id(method_id, "method_id")
     actor = _require_admin_id(deleted_by, "deleted_by")
     with db.transaction(db_path) as conn:
-        cursor = conn.execute(
-            "DELETE FROM payment_methods WHERE id = ?", (mid,)
-        )
+        try:
+            cursor = conn.execute(
+                "DELETE FROM payment_methods WHERE id = ?", (mid,)
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PaymentMethodInUseError(
+                f"لا يمكن حذف وسيلة الدفع #{mid}: "
+                "توجد سجلات مرتبطة بها"
+            ) from exc
         deleted = cursor.rowcount > 0
     if deleted:
         logger.info("Payment method deleted: id=%d admin=%r", mid, actor)
