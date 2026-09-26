@@ -121,11 +121,31 @@ async def _send_math_question(message) -> tuple[str, int]:
     return f"🔒 للتحقق أنك لست بوت:\n\nما ناتج: {a} {op} {b}؟", correct
 
 
+def _non_private_chat(update: Update) -> bool:
+    """Return True only when *update* positively targets a group/channel.
+
+    MT-ADMIN-02 isolation guard: the private chat is the operational
+    control plane, so user-facing handlers (onboarding, anti-bot,
+    subscription gating) must never run — or reply — outside private
+    chats.  Updates whose chat type cannot be resolved (no chat, or a
+    test double without a real chat type) are NOT treated as groups, so
+    existing direct-handler behaviour is unchanged.
+    """
+    chat = getattr(update, "effective_chat", None)
+    chat_type = getattr(chat, "type", None)
+    return isinstance(chat_type, str) and chat_type != "private"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the /start flow: language gate first, then Anti-Bot.
-    
+
     Also captures referral payload from deep link if present.
     """
+    # MT-ADMIN-02: /start must never start the private onboarding flow
+    # inside groups or channels — stay silent and start nothing.
+    if _non_private_chat(update):
+        return ConversationHandler.END
+
     # ── Referral attribution (capture before anti-bot flow) ──────────
     user = update.effective_user
     user_id = user.id
@@ -185,6 +205,8 @@ async def language_selected(
     existing /start flow from the Anti-Bot step.  Safe on repeated
     presses and on invalid/stale callback data.
     """
+    if _non_private_chat(update):
+        return ConversationHandler.END
     query = update.callback_query
     code = _language_code(query.data)
     if code is None:
@@ -213,6 +235,8 @@ async def language_prompt_again(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     """Stray text while selection is pending → re-show the prompt."""
+    if _non_private_chat(update):
+        return ConversationHandler.END
     await update.message.reply_text(
         LANGUAGE_PROMPT, reply_markup=_language_keyboard()
     )
@@ -230,6 +254,8 @@ async def language_callback_fallback(
     already-persisted language is left untouched (idempotent) and
     invalid codes are refused without touching anything.
     """
+    if _non_private_chat(update):
+        return
     query = update.callback_query
     code = _language_code(query.data)
     if code is None:
@@ -246,6 +272,8 @@ async def language_callback_fallback(
 
 async def _blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle messages from users who exhausted their anti-bot attempts."""
+    if _non_private_chat(update):
+        return ConversationHandler.END
     await update.message.reply_text(
         "🚫 لقد تجاوزت الحد الأقصى للمحاولات. "
         "أرسل /start للبدء من جديد."
@@ -255,6 +283,8 @@ async def _blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Check the user's answer with up to 3 attempts."""
+    if _non_private_chat(update):
+        return ConversationHandler.END
     expected = context.user_data.get("anti_bot_answer")
     attempts = context.user_data.get("anti_bot_attempts", 0)
     text = update.message.text.strip()
@@ -363,6 +393,9 @@ def _build_missing_message(
 
 async def verify_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-check all required channels when the verify button is pressed."""
+    if _non_private_chat(update):
+        # MT-ADMIN-02: never answer/edit anything inside groups/channels.
+        return
     query = update.callback_query
     await query.answer()
 
@@ -401,6 +434,8 @@ async def verify_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the anti-bot check."""
+    if _non_private_chat(update):
+        return ConversationHandler.END
     context.user_data.pop("anti_bot_answer", None)
     await update.message.reply_text("تم الإلغاء.")
     return ConversationHandler.END
@@ -1288,25 +1323,14 @@ async def removechannel_cancel(
 async def subscription_gate(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Block non-admin users who are missing required channels.
+    """Disabled duplicate gate — kept only as an importable symbol (MT-ADMIN-02).
 
-    Placed *before* other CommandHandlers in main() so locked users
-    never reach protected functionality.
+    This function duplicated ``subscription_message_gate`` but was never
+    registered in ``main()``: dead code.  It is intentionally a no-op so
+    no duplicate lock/reply behaviour can ever run.  The live gate is
+    ``subscription_message_gate`` (registered for private chats only).
     """
-    user_id = update.effective_user.id
-    if is_admin(user_id):
-        return
-
-    subscribed, missing = await check_subscription_access(
-        context.bot, user_id
-    )
-    if subscribed:
-        unlock_user(user_id)
-        return
-
-    lock_user(user_id)
-    text, markup = _build_missing_message(missing)
-    await update.message.reply_text(text, reply_markup=markup)
+    return None
 
 
 # ── Chat-member update handler ───────────────────────────────────────
@@ -1359,6 +1383,10 @@ async def subscription_message_gate(
     (group=1), so the ConversationHandler consumes anti-bot answer
     messages before this gate ever sees them.
     """
+    if _non_private_chat(update):
+        # MT-ADMIN-02: gating/lock messages must never reach groups or
+        # channels — private chat only.
+        return
     if update.message is None or update.message.text is None:
         return
 
@@ -1587,6 +1615,10 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
                 await application.post_init(application)
             await application.updater.start_polling(
                 error_callback=_error_callback,
+                # MT-ADMIN-02: chat_member updates are excluded unless
+                # requested explicitly — the ChatMemberHandler would
+                # otherwise never receive them.
+                allowed_updates=Update.ALL_TYPES,
             )
             await application.start()
             logger.info("Telegram bot polling started (background thread)")
@@ -1705,7 +1737,10 @@ def main() -> None:
     app.post_init = clear_command_menus
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            # MT-ADMIN-02: onboarding starts in private chats only.
+            CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
+        ],
         states={
             ANTI_BOT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer),
@@ -1726,18 +1761,18 @@ def main() -> None:
     )
 
     # 1. Detect channel departures immediately.
-    required_ids = {
-        ch.channel_id for ch in get_required_channels()
-    }
-    if required_ids:
-        app.add_handler(
-            ChatMemberHandler(
-                on_chat_member_update,
-                ChatMemberHandler.CHAT_MEMBER,
-                block=False,
-            ),
-            group=0,
-        )
+    #    MT-ADMIN-02: registered unconditionally — even when zero channels
+    #    are configured at startup — so chat_member updates are always
+    #    handled as soon as required channels exist.  The handler itself
+    #    ignores chats that are not required channels.
+    app.add_handler(
+        ChatMemberHandler(
+            on_chat_member_update,
+            ChatMemberHandler.CHAT_MEMBER,
+            block=False,
+        ),
+        group=0,
+    )
 
     # 2. Anti-bot conversation (entry: /start).
     app.add_handler(conv_handler, group=1)
@@ -1757,9 +1792,11 @@ def main() -> None:
     #    Same group as the ConversationHandler so only one fires per
     #    update: when the ConversationHandler matches (ANTI_BOT state)
     #    it consumes the update and the gate never fires for it.
+    #    MT-ADMIN-02: private chats only — the gate must never reply in
+    #    groups/channels.
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
             subscription_message_gate,
         ),
         group=1,
