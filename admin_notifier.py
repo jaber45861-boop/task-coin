@@ -22,6 +22,13 @@ Design constraints (MT-ADMIN-02):
   is provided by the caller, so the notifier is fully testable without
   network access and carries no inbox/review semantics — those belong
   to MT-ADMIN-03.
+- **Server-originated events (MT-ADMIN-03).**  ``notify_system()``
+  delivers an operational notification on behalf of the server itself
+  (a worker's manual-proof submission has no acting admin), with the
+  same ADMINS-only targeting rules, an optional inline keyboard, and
+  the resulting Telegram ``message_id`` returned for persistent
+  linkage.  It grants no user any authority — decisions stay with the
+  task-specific approver via the review services.
 
 Usage::
 
@@ -37,6 +44,10 @@ from config import ADMINS, is_admin
 
 # Async transport: deliver *text* to the private chat *chat_id*.
 SendFunc = Callable[[int, str], Awaitable[None]]
+# Async markup transport: deliver *text* with an optional inline
+# keyboard and return the Telegram message id (MT-ADMIN-03) so the
+# caller can persist an operation → message linkage.
+MarkupSendFunc = Callable[[int, str, Optional[object]], Awaitable[Optional[int]]]
 
 
 class AdminNotifierError(Exception):
@@ -54,18 +65,28 @@ class AdminNotifierTargetError(AdminNotifierError):
 class AdminNotifier:
     """Delivers operational notifications to configured admins only.
 
-    The only public delivery method is :meth:`notify`, which both
-    authorizes the acting admin and constrains every recipient to
-    ``config.ADMINS``.  There is intentionally no API that can send to
-    an arbitrary chat.
+    The public delivery methods are :meth:`notify` (acting-admin
+    events) and :meth:`notify_system` (server-originated events,
+    MT-ADMIN-03); both constrain every recipient to ``config.ADMINS``.
+    There is intentionally no API that can send to an arbitrary chat.
     """
 
-    def __init__(self, send: SendFunc) -> None:
+    def __init__(
+        self,
+        send: SendFunc,
+        markup_send: Optional[MarkupSendFunc] = None,
+    ) -> None:
         if not callable(send):
             raise AdminNotifierError(
                 "send must be a callable with signature (chat_id, text)"
             )
+        if markup_send is not None and not callable(markup_send):
+            raise AdminNotifierError(
+                "markup_send must be a callable with signature "
+                "(chat_id, text, reply_markup) returning a message id"
+            )
         self._send = send
+        self._markup_send = markup_send
 
     @property
     def admin_ids(self) -> tuple[int, ...]:
@@ -105,24 +126,83 @@ class AdminNotifier:
             raise AdminNotifierAuthorizationError(
                 f"actor {actor_id!r} is not a configured admin"
             )
-        if not isinstance(text, str) or not text.strip():
-            raise AdminNotifierError(
-                "notification text must be a non-empty string"
-            )
-
-        admins = tuple(ADMINS)
-        if targets is None:
-            recipients = admins
-        else:
-            recipients = tuple(dict.fromkeys(targets))
-            outside = [t for t in recipients if t not in admins]
-            if outside:
-                raise AdminNotifierTargetError(
-                    f"refusing to notify non-admin chats: {outside!r}"
-                )
+        self._validate_text(text)
+        recipients = self._resolve_recipients(targets)
 
         delivered: list[int] = []
         for chat_id in recipients:
             await self._send(chat_id, text)
             delivered.append(chat_id)
         return delivered
+
+    async def notify_system(
+        self,
+        text: str,
+        *,
+        reply_markup: Optional[object] = None,
+        targets: Optional[Sequence[int]] = None,
+    ) -> list[tuple[int, Optional[int]]]:
+        """Deliver a server-originated operational notification (MT-ADMIN-03).
+
+        Unlike :meth:`notify`, this entry point has no acting admin:
+        it is invoked by the server when an operational event occurs
+        (e.g. a worker's manual-proof submission opens a pending
+        claim).  It is NOT an authorization surface — it grants no
+        user any decision authority, and it cannot be steered outside
+        ``config.ADMINS``: the same text and target validation as
+        :meth:`notify` applies, so required channels/groups can never
+        receive operational notifications through this path either.
+
+        Args:
+            text: Non-empty notification body.
+            reply_markup: Optional inline keyboard (Telegram object)
+                passed through to the markup transport.
+            targets: Optional subset of admin IDs.  Any target outside
+                ``config.ADMINS`` raises ``AdminNotifierTargetError``
+                before anything is sent.
+
+        Returns:
+            ``(chat_id, message_id)`` per delivered chat — the message
+            id feeds the persistent operation → message linkage.
+            Requires the markup transport configured at construction.
+        """
+        if self._markup_send is None:
+            raise AdminNotifierError(
+                "markup_send transport is required for notify_system"
+            )
+        self._validate_text(text)
+        recipients = self._resolve_recipients(targets)
+
+        delivered: list[tuple[int, Optional[int]]] = []
+        for chat_id in recipients:
+            message_id = await self._markup_send(chat_id, text, reply_markup)
+            delivered.append((chat_id, message_id))
+        return delivered
+
+    @staticmethod
+    def _validate_text(text: object) -> None:
+        """Reject empty/non-string notification bodies (before any send)."""
+        if not isinstance(text, str) or not text.strip():
+            raise AdminNotifierError(
+                "notification text must be a non-empty string"
+            )
+
+    @staticmethod
+    def _resolve_recipients(
+        targets: Optional[Sequence[int]],
+    ) -> tuple[int, ...]:
+        """Resolve delivery targets, refusing anything outside ADMINS.
+
+        Raises ``AdminNotifierTargetError`` before any message is sent
+        when a requested target is not a configured admin.
+        """
+        admins = tuple(ADMINS)
+        if targets is None:
+            return admins
+        recipients = tuple(dict.fromkeys(targets))
+        outside = [t for t in recipients if t not in admins]
+        if outside:
+            raise AdminNotifierTargetError(
+                f"refusing to notify non-admin chats: {outside!r}"
+            )
+        return recipients

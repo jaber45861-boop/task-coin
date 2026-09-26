@@ -46,6 +46,8 @@ Pending approval lives at the SUBMISSION layer (never on user_tasks):
                  status='submitted' + approval_status='pending'
                  (+ proof_ref)  ─► PENDING outcome
                  (NO VerificationResult, NO completion, NO reward)
+                 + fresh claim → admin inbox notification
+                   (MT-ADMIN-03: ADMINS private chat, fail-soft)
     reviewer ─► ManualReviewService.decide (authorized approver only)
               approve ─► CAS approval ─► record 'passed'
                         ─► CompletionGate ─► TaskRewardService
@@ -314,6 +316,10 @@ class ManualProofService:
     - produce VerificationResult(PASSED) or any completion-authorization
     - read identity, authorization or reward from the proof reference
     - touch user_tasks (it stays 'started' throughout)
+    - decide the claim (MT-ADMIN-03 only schedules an admin-inbox
+      NOTIFICATION for a freshly opened claim — fail-soft, never on
+      idempotent replays — and all decision authority stays with
+      ManualReviewService.decide)
     """
 
     @staticmethod
@@ -389,6 +395,28 @@ class ManualProofService:
             "opened" if created else "resolved",
             user_id, task_id, record.submission_id, key,
         )
+
+        # ── MT-ADMIN-03: notify the admin private-chat inbox ──────
+        # ONLY a freshly opened pending claim notifies; an idempotent
+        # replay (created=False) resolves the existing claim and never
+        # sends a duplicate notification.  Fail-soft by design: the
+        # claim is already durable, so a notification/transport
+        # failure must never fail the worker's submission.  The late
+        # import avoids a module cycle (the inbox imports this
+        # module's review services).
+        if created and state == STATE_PENDING:
+            try:
+                from manual_proof_inbox import (
+                    schedule_pending_notification,
+                )
+                schedule_pending_notification(task, record)
+            except Exception:
+                logger.exception(
+                    "Admin inbox notification failed for claim %d "
+                    "(submission preserved)",
+                    record.submission_id,
+                )
+
         return ManualProofOutcome(
             state=state,
             submission_id=record.submission_id,

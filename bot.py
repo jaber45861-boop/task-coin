@@ -40,6 +40,8 @@ from flask import Flask, send_from_directory
 from waitress import create_server
 
 import db
+import manual_proof_inbox
+from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
     TelegramChannelTaskDataError,
@@ -1605,6 +1607,29 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # MT-ADMIN-03: bridge the server-side manual-proof submission flow
+    # (Waitress/Flask thread) onto this bot loop.  Fresh pending claims
+    # are scheduled with run_coroutine_threadsafe and delivered through
+    # AdminNotifier — config.ADMINS private chats only, never the
+    # required channels/groups.  Bound only while this bot loop runs
+    # and unbound in the finally below, so a stopped bot never sends.
+    async def _send_text(chat_id: int, text: str) -> None:
+        await application.bot.send_message(chat_id=chat_id, text=text)
+
+    async def _send_markup(chat_id: int, text: str, reply_markup) -> int:
+        message = await application.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup
+        )
+        return message.message_id
+
+    def _schedule_notification(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, loop)
+
+    manual_proof_inbox.bind(
+        AdminNotifier(_send_text, markup_send=_send_markup),
+        _schedule_notification,
+    )
+
     def _error_callback(exc: TelegramError) -> None:
         application.create_task(application.process_error(error=exc, update=None))
 
@@ -1633,6 +1658,10 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
     except Exception:
         logger.exception("Telegram bot background thread error")
     finally:
+        # MT-ADMIN-03: detach the notification bridge before the loop
+        # goes away so late submissions fail soft (inbox unbound)
+        # instead of scheduling onto a dead loop.
+        manual_proof_inbox.unbind()
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
@@ -1878,6 +1907,14 @@ def main() -> None:
         admin_panel_callback, pattern=r"^admin_panel:(add|remove|list)$",
     ), group=5)
     app.add_handler(CommandHandler("admin", admin_command), group=5)
+
+    # 8. MT-ADMIN-03: admin manual-proof inbox — Approve/Reject
+    #    callbacks on the notification messages.  Authorization is
+    #    entirely task-specific (task_data.approver) inside the
+    #    handler; ADMINS membership grants no decision authority.
+    app.add_handler(CallbackQueryHandler(
+        manual_proof_inbox.proof_callback_handler, pattern=r"^mproof:",
+    ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
     # We chain it with the admin command menu setup.

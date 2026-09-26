@@ -510,6 +510,32 @@ def init_db(db_path: str | None = None) -> None:
             WHERE status = 'linked'
         """)
 
+        # ── Admin notification linkage (MT-ADMIN-03) ───────────────
+        # Additive migration only: a brand-new table.  Persists the
+        # association between a server-side operation (e.g. a manual
+        # proof claim) and the Telegram admin message that was sent
+        # for it, so untrusted callback data can always be resolved
+        # back to server-side state.  No in-memory operation state.
+        # Deliberately generic (operation_type + operation_id): the
+        # table does not FK to task_submissions so future operation
+        # families can reuse it without schema changes.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_type TEXT NOT NULL,
+                operation_id INTEGER NOT NULL,
+                admin_chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Exactly ONE notification message per operation per admin
+        # chat — the notification path is idempotent under replay.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_notifications_op_chat
+            ON admin_notifications (operation_type, operation_id, admin_chat_id)
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
