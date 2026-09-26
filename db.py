@@ -536,6 +536,37 @@ def init_db(db_path: str | None = None) -> None:
             ON admin_notifications (operation_type, operation_id, admin_chat_id)
         """)
 
+        # ── Admin task-creation drafts (MT-ADMIN-05) ──────────────
+        # Additive migration only: a brand-new table.  The /addtask
+        # wizard persists its current step + payload JSON here so a
+        # draft survives bot restarts, handler recreation and process
+        # failures between steps — there is no in-memory wizard state
+        # anywhere.  A draft belongs to exactly one admin (every read/
+        # write is filtered by admin_user_id) and at most ONE draft per
+        # admin can be open at a time (partial unique index below).
+        #   status          'open' (being edited) | 'published'
+        #                   (a task was created from it; the confirm
+        #                   CAS below makes replays idempotent)
+        #   published_task_id  the tasks row created on publish
+        # Cancelling simply deletes the draft row.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_task_drafts (
+                draft_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'published')),
+                payload_json TEXT NOT NULL,
+                published_task_id INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_task_drafts_open
+            ON admin_task_drafts (admin_user_id) WHERE status = 'open'
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
@@ -632,13 +663,21 @@ def create_task(title: str, description: str, task_type: str, reward: int,
                 active: bool = True, db_path: str | None = None,
                 task_data: str | None = None,
                 repeat_policy: str = REPEAT_POLICY_ONE_TIME,
-                repeat_hours: int | None = None) -> int:
+                repeat_hours: int | None = None,
+                conn: sqlite3.Connection | None = None) -> int:
     """Create a new task definition. Returns the new task ID.
 
     Args:
         task_data: Optional JSON string with task-specific verification data.
         repeat_policy: 'one_time' (default) or 'repeatable'.
         repeat_hours: Required integer >= 1 for repeatable tasks only.
+        conn: Optional caller-owned connection (MT-ADMIN-05 publish
+            transaction).  When given, the INSERT runs on THAT
+            connection inside the caller's transaction and is NOT
+            committed here; ownership, BEGIN/COMMIT and rollback stay
+            entirely with the caller (``db.transaction()``).  When
+            None, the classic self-contained ``get_connection()``
+            scope is used — existing callers are unaffected.
     """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
@@ -652,15 +691,23 @@ def create_task(title: str, description: str, task_type: str, reward: int,
         repeat_policy, repeat_hours
     )
 
-    with get_connection(db_path) as conn:
-        cursor = conn.execute(
-            "INSERT INTO tasks "
-            "(title, description, type, reward, active, task_data, "
-            " repeat_policy, repeat_hours) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (title.strip(), description.strip(), task_type.strip(), reward,
-             int(active), task_data, repeat_policy, repeat_hours)
-        )
+    insert_sql = (
+        "INSERT INTO tasks "
+        "(title, description, type, reward, active, task_data, "
+        " repeat_policy, repeat_hours) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    values = (title.strip(), description.strip(), task_type.strip(), reward,
+              int(active), task_data, repeat_policy, repeat_hours)
+
+    if conn is not None:
+        cursor = conn.execute(insert_sql, values)
+        task_id = cursor.lastrowid
+        logger.info("Task created: id=%d title=%s", task_id, title)
+        return task_id
+
+    with get_connection(db_path) as own_conn:
+        cursor = own_conn.execute(insert_sql, values)
         task_id = cursor.lastrowid
         logger.info("Task created: id=%d title=%s", task_id, title)
         return task_id

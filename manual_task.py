@@ -75,6 +75,13 @@ from task_completion import (
 )
 from task_submission import SubmissionError, _normalize_idempotency_key
 from task_submission_store import SubmissionRecord, TaskSubmissionStore
+from task_taxonomy import (  # MT-ADMIN-05 shared generic contract vocabulary
+    GENERIC_PROVIDER_SET,
+    MANUAL_TASK_ACTIONS,
+    MAX_TARGET_LABEL_LENGTH,
+    MAX_TARGET_REF_LENGTH,
+    has_unsafe_control_chars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,17 @@ logger = logging.getLogger(__name__)
 MANUAL_TASK_TYPE = "manual"
 
 # ── Server-side task_data contract (MT-TASK-15) ─────────────────────
+#
+# MT-ADMIN-05 (smallest additive extension): the contract gained an
+# OPTIONAL generic ``target`` (``ref`` + optional ``label``) so a
+# wizard-created manual task can carry its platform target, and the
+# provider/action checks widened from equality with the legacy
+# ``telegram``/``proof`` pair to the shared stable whitelists in
+# ``task_taxonomy``.  Legacy MT-TASK-15 payloads keep validating
+# unchanged; the referral action stays rejected (it belongs to the
+# MT-TASK-06 referral family); ``reward`` stays forbidden (it lives in
+# tasks.reward only).  Authorization semantics are untouched:
+# ``approver.telegram_user_id`` remains the ONLY decision authority.
 
 MANUAL_PROVIDER = "telegram"
 MANUAL_ACTION = "proof"
@@ -90,8 +108,11 @@ APPROVER_USER_ID_KEY = "telegram_user_id"
 
 # Strict whitelists: anything else in the definition is ambiguous and
 # rejected (including "reward", which lives in tasks.reward only).
-ALLOWED_TASK_DATA_KEYS = frozenset({"provider", "action", "approver"})
+ALLOWED_TASK_DATA_KEYS = frozenset(
+    {"provider", "action", "approver", "target"}
+)
 ALLOWED_APPROVER_KEYS = frozenset({APPROVER_USER_ID_KEY})
+ALLOWED_TARGET_KEYS = frozenset({"ref", "label"})
 
 # ── Proof bounds (MT-TASK-15) ────────────────────────────────────────
 
@@ -107,12 +128,18 @@ class ManualTaskDataError(ValueError):
 def validate_manual_task_data(task_data: object) -> dict:
     """Validate a parsed manual task_data object.
 
-    Enforces provider, action and approver — nothing else is accepted.
+    Enforces provider, action and approver — nothing else is accepted
+    (plus the MT-ADMIN-05 optional generic ``target``).  The provider
+    must be one of the platform's stable provider identifiers and the
+    action one of the manual-family actions — this is how a generic
+    wizard task (e.g. ``instagram`` / ``follow``) stays representable
+    without weakening the strict whitelist (``web``, ``nope``,
+    ``referral`` and friends remain rejected).
 
     Raises:
         ManualTaskDataError: missing/wrong provider, missing/wrong
-        action, missing/malformed approver, unexpected keys (including
-        reward), or a non-object payload.
+        action, missing/malformed approver, malformed optional target,
+        unexpected keys (including reward), or a non-object payload.
     """
     if not isinstance(task_data, dict):
         raise ManualTaskDataError("task_data must be a JSON object")
@@ -132,19 +159,21 @@ def validate_manual_task_data(task_data: object) -> dict:
     # ── provider ────────────────────────────────────────────────
     if "provider" not in task_data:
         raise ManualTaskDataError("missing 'provider' in task_data")
-    if task_data["provider"] != MANUAL_PROVIDER:
+    provider = task_data["provider"]
+    if not isinstance(provider, str) or provider not in GENERIC_PROVIDER_SET:
         raise ManualTaskDataError(
-            f"'provider' must be '{MANUAL_PROVIDER}', "
-            f"got {task_data['provider']!r}"
+            f"'provider' must be one of the supported provider "
+            f"identifiers, got {provider!r}"
         )
 
     # ── action ──────────────────────────────────────────────────
     if "action" not in task_data:
         raise ManualTaskDataError("missing 'action' in task_data")
-    if task_data["action"] != MANUAL_ACTION:
+    action = task_data["action"]
+    if not isinstance(action, str) or action not in MANUAL_TASK_ACTIONS:
         raise ManualTaskDataError(
-            f"'action' must be '{MANUAL_ACTION}', "
-            f"got {task_data['action']!r}"
+            f"'action' must be a supported manual action identifier, "
+            f"got {action!r}"
         )
 
     # ── approver (reviewer identity) ────────────────────────────
@@ -174,6 +203,49 @@ def validate_manual_task_data(task_data: object) -> dict:
             "'approver.telegram_user_id' must be a positive telegram "
             "user id"
         )
+
+    # ── target (MT-ADMIN-05: optional generic platform target) ───
+    # Legacy MT-TASK-15 payloads have no target and keep validating;
+    # when present it is bounded display/data only — never executable,
+    # never a credential, never a reward.
+    if "target" in task_data:
+        target = task_data["target"]
+        if not isinstance(target, dict):
+            raise ManualTaskDataError("'target' must be a JSON object")
+        extra_target = set(target) - ALLOWED_TARGET_KEYS
+        if extra_target:
+            raise ManualTaskDataError(
+                "unexpected target keys: "
+                + ", ".join(sorted(str(k) for k in extra_target))
+            )
+        if "ref" not in target:
+            raise ManualTaskDataError("missing 'target.ref'")
+        ref = target["ref"]
+        if not isinstance(ref, str) or not ref.strip():
+            raise ManualTaskDataError("'target.ref' must be a non-empty string")
+        if len(ref) > MAX_TARGET_REF_LENGTH:
+            raise ManualTaskDataError(
+                f"'target.ref' exceeds {MAX_TARGET_REF_LENGTH} characters"
+            )
+        if has_unsafe_control_chars(ref, allow_newlines=False):
+            raise ManualTaskDataError(
+                "'target.ref' contains unsafe control characters"
+            )
+        if "label" in target:
+            label = target["label"]
+            if not isinstance(label, str) or not label.strip():
+                raise ManualTaskDataError(
+                    "'target.label' must be a non-empty string"
+                )
+            if len(label) > MAX_TARGET_LABEL_LENGTH:
+                raise ManualTaskDataError(
+                    f"'target.label' exceeds "
+                    f"{MAX_TARGET_LABEL_LENGTH} characters"
+                )
+            if has_unsafe_control_chars(label, allow_newlines=False):
+                raise ManualTaskDataError(
+                    "'target.label' contains unsafe control characters"
+                )
 
     return task_data
 

@@ -41,7 +41,10 @@ from waitress import create_server
 
 import db
 import admin_review_queue
+import admin_task_wizard
 import manual_proof_inbox
+import task_creation
+import task_taxonomy
 from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
@@ -870,6 +873,13 @@ ADD_TASK_USAGE = (
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Create a task from chat. Admin only.
 
+    MT-ADMIN-05: a bare ``/addtask`` (no arguments) opens the
+    canonical step-by-step wizard (``admin_task_wizard``) — private
+    admin chat only.  The legacy pipe form below is retained for
+    compatibility and delegates into the SAME ``task_creation``
+    service the wizard publishes through (one validated creation
+    path, never two).
+
     Usage: /addtask title | description | points | channel_slug
 
     Only the ``telegram_channel`` task type is supported here.  The
@@ -901,6 +911,14 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     parts = text.split(maxsplit=1)
     args_text = parts[1] if len(parts) > 1 else ""
+
+    if not args_text:
+        # MT-ADMIN-05: bare /addtask → the canonical creation wizard.
+        # start_wizard re-checks admin + private chat itself, so a
+        # group invocation produces zero replies.
+        await admin_task_wizard.start_wizard(update, context)
+        return
+
     fields = [p.strip() for p in args_text.split("|")]
 
     if len(fields) != 4:
@@ -931,31 +949,27 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Build exactly the MT-TASK-05 contract and prove it with the
-    # verifier's own validator before anything is persisted — the
-    # writer and the reader share one contract, never two shapes.
-    task_data_payload = {
-        "provider": "telegram",
-        "action": "join_channel",
-        "target": {"channel_slug": slug},
-        "instructions": description,
-    }
+    # MT-ADMIN-05: the legacy pipe delegates into the SAME canonical
+    # creation service the wizard publishes through — one validated
+    # creation path, never two.  The service builds the exact
+    # MT-TASK-05 contract and proves it with the verifier's own
+    # validator before anything is persisted.
+    spec = task_creation.TaskSpec(
+        title=title,
+        description=description,
+        provider="telegram",
+        action="join_channel",
+        target={"channel_slug": slug},
+        verification=task_taxonomy.VERIFICATION_AUTO,
+        reward=points,
+    )
     try:
-        validate_telegram_channel_task_data(task_data_payload)
+        task_id = task_creation.create_task_from_spec(spec)
     except TelegramChannelTaskDataError as exc:
         await update.message.reply_text(
             f"❌ بيانات المهمة غير صالحة: {exc}"
         )
         return
-
-    try:
-        task_id = db.create_task(
-            title,
-            description,
-            TELEGRAM_CHANNEL_TASK_TYPE,
-            points,
-            task_data=json.dumps(task_data_payload, ensure_ascii=False),
-        )
     except ValueError as exc:
         await update.message.reply_text(f"❌ تعذر إنشاء المهمة: {exc}")
         return
@@ -1902,6 +1916,15 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "reviews", admin_review_queue.reviews_command,
     ), group=0)
+    # MT-ADMIN-05: wizard free-text answers (title, target,
+    #    instructions, reward, repeat hours).  Registered LAST in
+    #    group 0 so the add/remove-channel conversations consume their
+    #    own text first; the handler itself stays silent unless the
+    #    sender is an admin with an open draft on a text-input step.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_task_wizard.wizard_text_input,
+    ), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
@@ -1928,6 +1951,14 @@ def main() -> None:
     #    into ManualReviewService.decide with task-specific authority.
     app.add_handler(CallbackQueryHandler(
         admin_review_queue.review_queue_callback, pattern=r"^mr(view|vp):",
+    ), group=5)
+
+    # MT-ADMIN-05: task-creation wizard buttons (family/provider/
+    #    action/verification/approver/repeat/edit/confirm/cancel).
+    #    The draft id in the callback is a lookup pointer only — the
+    #    handler re-reads actor, ownership and state from the DB.
+    app.add_handler(CallbackQueryHandler(
+        admin_task_wizard.wizard_callback, pattern=r"^atw:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
