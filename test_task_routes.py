@@ -260,7 +260,7 @@ class TestCatalog:
         task = response.get_json()["tasks"][0]
         assert set(task.keys()) <= {
             "id", "title", "description", "type", "reward",
-            "status", "join_url",
+            "reward_units", "status", "join_url",
         }
         raw = response.get_data(as_text=True)
         assert "task_data" not in raw

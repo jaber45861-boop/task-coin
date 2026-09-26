@@ -19,9 +19,13 @@ import db
 
 @dataclass(frozen=True)
 class TaskSummary:
-    """Immutable read-only representation of a task for external consumption.
+    """
+    Immutable read-only representation of a task for external consumption.
 
-    Exposes ONLY: id, title, description, type, reward.
+    Exposes ONLY: id, title, description, type, reward, reward_units.
+    ``reward`` is the whole-USDT compatibility/display value;
+    ``reward_units`` (MT-ADMIN-14) is the exact atomic accounting
+    value the Mini App renders sub-cent rewards from (integer math).
     Does NOT expose: task_data, expected_data, active, created_at,
     database connections, user state, or verifier internals.
     """
@@ -30,6 +34,7 @@ class TaskSummary:
     description: str
     type: str
     reward: int
+    reward_units: int | None = None
 
 
 class TaskCatalog:
@@ -57,6 +62,7 @@ class TaskCatalog:
                 description=row["description"],
                 type=row["type"],
                 reward=row["reward"],
+                reward_units=row["reward_units"],
             )
             for row in rows
         ]

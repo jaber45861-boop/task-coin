@@ -264,10 +264,15 @@ class TestCatalogArchitecture(unittest.TestCase):
         self.assertNotIn("expected_data", fields)
         self.assertNotIn("task_data", fields)
 
-    def test_task_summary_has_only_five_fields(self):
-        """TaskSummary must expose exactly: id, title, description, type, reward."""
+    def test_task_summary_has_only_safe_fields(self):
+        """TaskSummary exposes exactly: id, title, description, type,
+        reward, reward_units (MT-ADMIN-14 exact atomic display)."""
         fields = {f.name for f in dataclasses.fields(TaskSummary)}
-        self.assertEqual(fields, {"id", "title", "description", "type", "reward"})
+        self.assertEqual(
+            fields,
+            {"id", "title", "description", "type", "reward",
+             "reward_units"},
+        )
 
 
 class TestExistingBehaviorUnchanged(unittest.TestCase):

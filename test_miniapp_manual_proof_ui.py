@@ -358,6 +358,10 @@ class TestExistingFamiliesUnchanged:
 
     def test_no_wallet_changes(self):
         content = _tasks_js().lower()
+        # MT-ADMIN-14: `WalletData.formatUsdt` is the shared
+        # integer-only DISPLAY formatter — not a wallet control,
+        # balance, deposit or withdraw surface.
+        content = content.replace("walletdata", "")
         for banned in ("wallet", "balance", "deposit", "withdraw"):
             assert banned not in content
 

@@ -49,7 +49,15 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import db
 import task_draft_store
 from config import ADMINS, CHANNELS, is_admin
-from task_creation import TaskCreationError, TaskSpec, create_task_from_spec
+from task_creation import (
+    TaskCreationError,
+    TaskSpec,
+    create_task_from_spec,
+    parse_reward_units,
+    reward_payload_value,
+    reward_units_to_text,
+    whole_usdt_reward,
+)
 from task_draft_store import DRAFT_STATUS_PUBLISHED, TaskDraft
 from task_taxonomy import (
     ACTION_JOIN_CHANNEL,
@@ -66,7 +74,6 @@ from task_taxonomy import (
     VERIFICATION_LABELS,
     VERIFICATION_MANUAL,
     VERIFICATION_MODE_SET,
-    parse_non_negative_int,
     parse_positive_int,
     validate_instructions,
     validate_target_ref,
@@ -207,7 +214,9 @@ MSG_APPROVER_PROMPT = (
     "8️⃣ اختر المراجع المختص بالموافقة على هذه المهمة:"
 )
 MSG_REWARD_PROMPT = (
-    "9️⃣ أرسل المكافأة (نقاط): رقم صحيح من 0 فأكثر."
+    "9️⃣ أرسل المكافأة (USDT): رقم عشري دقيق حتى 8 منازل عشرية.\n"
+    "أمثلة: 1 أو 0.5 أو 0.0001 أو 0.00000001 — "
+    "بدون قيم سالبة وبدون صيغة علمية (e-)."
 )
 MSG_REPEAT_PROMPT = "🔟 اختر سياسة التكرار:"
 MSG_REPEAT_HOURS_PROMPT = (
@@ -440,8 +449,11 @@ def _validate_text_step(step: str, text: str, payload: dict) -> dict:
     elif step == STEP_INSTRUCTIONS:
         payload["instructions"] = validate_instructions(text)
     elif step == STEP_REWARD:
-        payload["reward"] = parse_non_negative_int(
-            text, field="المكافأة"
+        # MT-ADMIN-14: the ONE canonical exact parser — decimal USDT
+        # text (≤ 8 dp) in, atomic units out; the payload keeps the
+        # whole-USDT int or the exact decimal string (never a float).
+        payload["reward"] = reward_payload_value(
+            parse_reward_units(text, field="المكافأة")
         )
     elif step == STEP_REPEAT_HOURS:
         payload["repeat_hours"] = parse_positive_int(
@@ -497,7 +509,11 @@ def build_preview_text(draft: TaskDraft) -> str:
     if verification != VERIFICATION_AUTO:
         approver = p.get("approver_id") or draft.admin_user_id
         lines.append(f"👤 المراجع المختص: {approver}")
-    lines.append(f"💰 المكافأة: {p.get('reward') if p.get('reward') is not None else '—'} نقطة")
+    reward_value = p.get("reward")
+    lines.append(
+        f"💰 المكافأة: "
+        f"{reward_value if reward_value is not None else '—'} USDT"
+    )
     if p.get("repeat_policy") == db.REPEAT_POLICY_REPEATABLE:
         hours = p.get("repeat_hours")
         lines.append(f"🔁 التكرار: كل {hours} ساعة" if hours
@@ -644,11 +660,17 @@ def render_step(draft: TaskDraft) -> tuple[str, InlineKeyboardMarkup]:
 
 def _published_text(task_id: int) -> str:
     task = db.get_task(task_id) or {}
+    units = task.get("reward_units")
+    reward_text = (
+        reward_units_to_text(units)
+        if isinstance(units, int) and not isinstance(units, bool)
+        else str(task.get("reward", "—"))
+    )
     return (
         "✅ تم نشر المهمة بنجاح!\n\n"
         f"🆔 المهمة: #{task_id}\n"
         f"📌 العنوان: {task.get('title', '—')}\n"
-        f"💰 النقاط: {task.get('reward', '—')}\n"
+        f"💰 المكافأة: {reward_text} USDT\n"
         f"📡 النوع: {task.get('type', '—')}\n\n"
         "ظهرت المهمة في قائمة المهام المتاحة."
     )
@@ -664,8 +686,14 @@ def spec_from_draft(draft: TaskDraft) -> TaskSpec:
     if verification not in VERIFICATION_MODE_SET:
         raise TaskCreationError("اختر طريقة التحقق أولًا.")
     reward = p.get("reward")
-    if isinstance(reward, bool) or not isinstance(reward, int):
-        raise TaskCreationError("أدخل مكافأة صالحة أولًا.")
+    try:
+        # MT-ADMIN-14: the canonical exact parser re-validates the
+        # PERSISTED payload (str or legacy int) — a corrupted value
+        # ("not-a-number", float, bool, over-precision) fails here and
+        # the draft stays open, zero tasks created.
+        reward_units = parse_reward_units(reward, field="المكافأة")
+    except ValueError as exc:
+        raise TaskCreationError("أدخل مكافأة صالحة أولًا.") from exc
     target_ref = p.get("target_ref")
     if not isinstance(target_ref, str) or not target_ref.strip():
         raise TaskCreationError("أدخل هدف المهمة أولًا.")
@@ -684,7 +712,8 @@ def spec_from_draft(draft: TaskDraft) -> TaskSpec:
         action=p.get("action") or "",
         target=target,
         verification=verification,
-        reward=reward,
+        reward=whole_usdt_reward(reward_units),
+        reward_units=reward_units,
         approver_id=approver_id,
         repeat_policy=p.get("repeat_policy") or db.REPEAT_POLICY_ONE_TIME,
         repeat_hours=p.get("repeat_hours"),

@@ -871,7 +871,10 @@ class TestValidation(WizardTestBase):
         draft_id = self._drive()
         self._press(f"atw:{draft_id}:edit:reward")
         self.assertEqual(self._step(draft_id), admin_task_wizard.STEP_REWARD)
-        for bad in ("abc", "-5", "5.5", "", "٥.٥"):
+        # MT-ADMIN-14: decimals are valid USDT input now — rejection
+        # covers malformed / negative / empty / scientific /
+        # over-precision text only.
+        for bad in ("abc", "-5", "", "1e-8", "0.000000001", "-0.1"):
             with self.subTest(reward=bad):
                 reply = self._send(bad)
                 self.assertIn("المكافأة", reply.await_args.args[0])
@@ -879,6 +882,35 @@ class TestValidation(WizardTestBase):
                     self._step(draft_id), admin_task_wizard.STEP_REWARD
                 )
                 self.assertEqual(self._payload(draft_id)["reward"], 100)
+
+    def test_decimal_rewards_accepted_exactly(self) -> None:
+        """MT-ADMIN-14: exact decimal USDT strings (including
+        sub-cent and Arabic-Indic digits) are stored exactly — never
+        rounded, never float — and the preview says USDT, not points."""
+        draft_id = self._drive()
+        self._press(f"atw:{draft_id}:edit:reward")
+        for text, stored in (
+            ("5.5", "5.5"),
+            ("٥.٥", "5.5"),
+            ("0.0001", "0.0001"),
+        ):
+            with self.subTest(reward=text):
+                reply = self._send(text)
+                self.assertEqual(
+                    self._step(draft_id), admin_task_wizard.STEP_PREVIEW
+                )
+                self.assertEqual(
+                    self._payload(draft_id)["reward"], stored
+                )
+                preview, _ = admin_task_wizard.render_step(
+                    self._draft(draft_id)
+                )
+                self.assertIn(f"{stored} USDT", preview)
+                # Back to the reward step for the next value.
+                self._press(f"atw:{draft_id}:edit:reward")
+                self.assertEqual(
+                    self._step(draft_id), admin_task_wizard.STEP_REWARD
+                )
 
     def test_invalid_repeat_hours_rejected(self) -> None:
         self._start()

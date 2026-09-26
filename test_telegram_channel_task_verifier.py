@@ -986,7 +986,10 @@ class TestNoUnsafeExposure:
         summaries = TaskCatalog().list_available_tasks()
         assert len(summaries) == 1
         fields = set(dataclasses.asdict(summaries[0]).keys())
-        assert fields == {"id", "title", "description", "type", "reward"}
+        assert fields == {
+            "id", "title", "description", "type", "reward",
+            "reward_units",
+        }
         dumped = json.dumps(dataclasses.asdict(summaries[0]))
         assert "task_data" not in dumped
         assert "instructions" not in dumped

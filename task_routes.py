@@ -470,9 +470,14 @@ def _decision_error(reason: str):
 def list_tasks():
     """Return active tasks with the authenticated user's status.
 
-    Safe fields only: id, title, description, type, reward, status
-    (plus ``join_url`` for channel tasks when a public username is
-    configured).
+    Safe fields only: id, title, description, type, reward,
+    reward_units, status (plus ``join_url`` for channel tasks when a
+    public username is configured).
+
+    ``reward_units`` (MT-ADMIN-14) is the exact atomic accounting
+    value: the page derives sub-cent USDT display from it with
+    integer math only.  ``reward`` stays the whole-USDT
+    compatibility/display field.
     """
     user = _authenticate()
     if user is None:
@@ -491,6 +496,7 @@ def list_tasks():
                 "description": summary.description,
                 "type": summary.type,
                 "reward": summary.reward,
+                "reward_units": summary.reward_units,
                 "status": status,
             }
             join_url = _safe_join_url(summary.id, summary.type)

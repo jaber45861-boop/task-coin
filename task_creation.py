@@ -22,6 +22,10 @@ What it guarantees on every call:
 - reward / repeat policy are the EXISTING ``tasks.reward`` fields with
   the EXISTING ``db.validate_repeat_policy`` rules — no new currency,
   no new repeat mode, no wallet/ledger involvement here.
+- reward input goes through the ONE canonical exact parser
+  (``parse_reward_units``, MT-ADMIN-14): decimal text → atomic
+  ``reward_units`` int (the accounting authority written at creation);
+  ``reward`` stays the whole-USDT compatibility/display field.
 - the produced task_data is proven by the very validator the reader
   side uses (``validate_telegram_channel_task_data`` /
   ``validate_manual_task_data``): the writer can never persist a
@@ -42,9 +46,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 import db
+import wallet
 from config import CHANNELS
 from manual_task import MANUAL_TASK_TYPE, validate_manual_task_data
 from task_taxonomy import (
@@ -56,6 +62,7 @@ from task_taxonomy import (
     VERIFICATION_AUTO,
     VERIFICATION_MANUAL,
     VERIFICATION_MODE_SET,
+    normalize_digits,
     validate_instructions,
     validate_title,
 )
@@ -75,6 +82,120 @@ class TaskCreationError(ValueError):
     """
 
 
+# ── Canonical exact reward input (MT-ADMIN-14) ────────────────────────
+# The ONE parser for every human reward input (legacy /addtask pipe,
+# admin wizard, spec re-validation).  Exact decimal text → atomic
+# integer units (1 USDT = 100,000,000): no float, no round(), no
+# truncation — over-precision is REJECTED, never rounded.
+
+_REWARD_TEXT_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+# Mirrors db._SQLITE_INT64_MAX — the signed SQLite INTEGER bound the
+# stored atomic value must fit (reward_units stays INTEGER, never REAL).
+_SQLITE_INT64_MAX = 9_223_372_036_854_775_807
+
+
+def _reward_invalid(field: str) -> ValueError:
+    """Admin-displayable Arabic error for a malformed reward input."""
+    return ValueError(
+        f"❌ {field} يجب أن تكون قيمة USDT رقمية "
+        f"(مثال: 1 أو 0.0001 — حتى 8 منازل عشرية)."
+    )
+
+
+def parse_reward_units(value: object, *, field: str = "المكافأة") -> int:
+    """The canonical exact USDT reward input → atomic units.
+
+    1 USDT = ``wallet.USDT_SCALE`` (100,000,000) atomic units; sub-cent
+    rewards are exact.  The input stays a string until the exact
+    integer conversion completes — this function never sees a float:
+
+    Accepts:
+        str  — exact decimal text up to 8 decimal places
+               (``"1"``, ``"0.5"``, ``"0.00000001"``; Arabic-Indic
+               digits are normalized first, matching the other
+               admin-input parsers)
+        int  — whole USDT for compatibility (``1`` → ``100_000_000``)
+
+    Rejects (ValueError, admin-displayable Arabic message):
+        bool / float / None / any other type, empty or whitespace-only
+        text, negatives, more than 8 decimal places (never rounded),
+        scientific notation (``"1e-8"``), NaN / Infinity, malformed
+        text, and any atomic result outside the signed SQLite INTEGER
+        range.
+
+    Returns:
+        int — exact atomic units (never rounded, never truncated).
+    """
+    if isinstance(value, bool) or isinstance(value, float):
+        raise _reward_invalid(field)
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"❌ {field} لا يمكن أن تكون سالبة.")
+        units = value * wallet.USDT_SCALE
+    elif isinstance(value, str):
+        text = normalize_digits(value.strip())
+        if not text:
+            raise ValueError(f"❌ {field} لا يمكن أن تكون فارغة.")
+        if text.startswith("-"):
+            raise ValueError(f"❌ {field} لا يمكن أن تكون سالبة.")
+        if not _REWARD_TEXT_RE.fullmatch(text):
+            raise _reward_invalid(field)
+        if "." in text and len(text.split(".", 1)[1]) > wallet.USDT_DECIMALS:
+            raise ValueError(
+                f"❌ {field}: الحد الأقصى {wallet.USDT_DECIMALS} "
+                f"منازل عشرية بعد الفاصلة."
+            )
+        try:
+            # Existing exact wallet primitive: Decimal text → int
+            # units (float/bool/NaN/negative/precision-proof).
+            units = wallet.decimal_to_units(text, field=field)
+        except wallet.InvalidWalletAmountError as exc:
+            raise _reward_invalid(field) from exc
+    else:
+        raise _reward_invalid(field)
+    if units > _SQLITE_INT64_MAX:
+        raise ValueError(f"❌ {field}: القيمة تتجاوز الحد المسموح.")
+    return units
+
+
+def whole_usdt_reward(units: int) -> int:
+    """Whole-USDT compatibility display derived from exact units.
+
+    ``tasks.reward`` keeps its legacy whole-USDT INTEGER meaning; the
+    accounting value stays ``reward_units``.  Pure integer division
+    (display only — never an accounting source).
+    """
+    return units // wallet.USDT_SCALE
+
+
+def reward_units_to_text(units: int) -> str:
+    """Exact display text for atomic units (integer math only).
+
+    ``10000`` → ``"0.0001"``, ``100000000`` → ``"1"``,
+    ``1`` → ``"0.00000001"``.  Display only, never accounting.
+    """
+    if isinstance(units, bool) or not isinstance(units, int) or units < 0:
+        raise ValueError("reward_units must be a non-negative int")
+    whole, fraction = divmod(units, wallet.USDT_SCALE)
+    if not fraction:
+        return str(whole)
+    return f"{whole}.{fraction:0{wallet.USDT_DECIMALS}d}".rstrip("0")
+
+
+def reward_payload_value(units: int) -> int | str:
+    """Draft-payload form of exact units (admin wizard storage).
+
+    Whole-USDT values stay the legacy ``int`` (existing payloads and
+    callers keep their meaning); sub-cent values stay an exact decimal
+    string — never a float, never rounded.
+    """
+    whole, fraction = divmod(units, wallet.USDT_SCALE)
+    if not fraction:
+        return whole
+    return reward_units_to_text(units)
+
+
 @dataclass(frozen=True)
 class TaskSpec:
     """Fully-resolved task definition — server-side, validated here.
@@ -83,6 +204,10 @@ class TaskSpec:
     data) or by the legacy /addtask parser.  ``target`` is the shaped
     task_data target: ``{"channel_slug": ...}`` for auto Telegram joins
     or ``{"ref": ...}`` (``label`` optional) for generic tasks.
+
+    ``reward`` is the whole-USDT compatibility/display int;
+    ``reward_units`` (when given) is the exact atomic accounting value
+    written to ``tasks.reward_units`` at creation (MT-ADMIN-14).
     """
 
     title: str
@@ -95,6 +220,7 @@ class TaskSpec:
     approver_id: int | None = None
     repeat_policy: str = db.REPEAT_POLICY_ONE_TIME
     repeat_hours: int | None = None
+    reward_units: int | None = None
 
 
 def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
@@ -128,6 +254,16 @@ def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
         or spec.reward < 0
     ):
         raise TaskCreationError("reward must be a non-negative integer")
+    if spec.reward_units is not None and (
+        isinstance(spec.reward_units, bool)
+        or not isinstance(spec.reward_units, int)
+        or spec.reward_units < 0
+        or spec.reward_units > _SQLITE_INT64_MAX
+    ):
+        raise TaskCreationError(
+            "reward_units must be a non-negative integer within the "
+            "SQLite INTEGER range"
+        )
 
     # ── auto: the EXISTING Telegram membership verifier only ──────────
     if spec.verification == VERIFICATION_AUTO:
@@ -209,11 +345,12 @@ def create_task_from_spec(
         repeat_policy=spec.repeat_policy,
         repeat_hours=spec.repeat_hours,
         conn=conn,
+        reward_units=spec.reward_units,
     )
     logger.info(
         "Task created from spec: id=%d type=%s provider=%s "
-        "action=%s verification=%s reward=%d",
+        "action=%s verification=%s reward=%d reward_units=%s",
         task_id, task_type, spec.provider, spec.action,
-        spec.verification, spec.reward,
+        spec.verification, spec.reward, spec.reward_units,
     )
     return task_id

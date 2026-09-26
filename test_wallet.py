@@ -686,7 +686,14 @@ class TestConcurrency(WalletTestBase):
 class TestScopePolicy(WalletTestBase):
 
     def test_no_miniapp_files_changed(self):
-        """45. This micro-task does not touch the Mini App."""
+        """45. The wallet micro-task never touched the Mini App.
+
+        MT-ADMIN-14 adds the single allowed exception:
+        ``miniapp/js/tasks.js`` renders the task's exact atomic reward
+        field (integer display only).  Every other Mini App file —
+        wallet.js, wallet-data.js, index.html, CSS, the rest — must
+        stay byte-identical.
+        """
         repo_root = os.path.dirname(os.path.abspath(__file__))
         try:
             result = subprocess.run(
@@ -697,8 +704,16 @@ class TestScopePolicy(WalletTestBase):
             self.skipTest("git is not available in this environment")
         if result.returncode != 0:
             self.skipTest(f"git status failed: {result.stderr.strip()}")
+        allowed = {"miniapp/js/tasks.js"}
+        changed = {
+            # porcelain line: 2 status chars + 1 space + path — parse
+            # from the RAW output so a leading status space survives.
+            line[3:].strip()
+            for line in result.stdout.splitlines()
+            if len(line) >= 4
+        }
         self.assertEqual(
-            result.stdout.strip(), "",
+            changed - allowed, set(),
             f"Mini App files were modified:\n{result.stdout}",
         )
 

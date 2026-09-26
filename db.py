@@ -877,7 +877,8 @@ def create_task(title: str, description: str, task_type: str, reward: int,
                 task_data: str | None = None,
                 repeat_policy: str = REPEAT_POLICY_ONE_TIME,
                 repeat_hours: int | None = None,
-                conn: sqlite3.Connection | None = None) -> int:
+                conn: sqlite3.Connection | None = None,
+                reward_units: int | None = None) -> int:
     """Create a new task definition. Returns the new task ID.
 
     Args:
@@ -891,6 +892,10 @@ def create_task(title: str, description: str, task_type: str, reward: int,
             entirely with the caller (``db.transaction()``).  When
             None, the classic self-contained ``get_connection()``
             scope is used — existing callers are unaffected.
+        reward_units: Optional EXACT atomic reward (MT-ADMIN-14) from
+            the canonical reward parser — stored verbatim as the
+            accounting authority.  When None, the MT-ADMIN-13
+            whole-USDT derivation from ``reward`` still applies.
     """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
@@ -900,16 +905,27 @@ def create_task(title: str, description: str, task_type: str, reward: int,
         raise ValueError("type cannot be empty")
     if reward < 0:
         raise ValueError("reward cannot be negative")
-    # MT-ADMIN-13: authoritative atomic reward alongside the whole-USDT
-    # display value — exact Python int math only.  A non-integer reward
-    # (reachable only by direct callers; the app layer validates ints)
-    # stores NULL so settlement's legacy validation rejects it exactly
-    # as it did before this column existed.
-    reward_units = (
-        reward * wallet.USDT_SCALE
-        if isinstance(reward, int) and not isinstance(reward, bool)
-        else None
-    )
+    # MT-ADMIN-13/14: the authoritative atomic reward alongside the
+    # whole-USDT display value — exact Python int math only.  An
+    # explicit ``reward_units`` (from the canonical reward parser) is
+    # validated and stored VERBATIM, never re-derived from ``reward``.
+    # Without it, a non-integer reward (reachable only by direct
+    # callers; the app layer validates ints) stores NULL so
+    # settlement's legacy validation rejects it exactly as it did
+    # before this column existed.
+    if reward_units is None:
+        reward_units = (
+            reward * wallet.USDT_SCALE
+            if isinstance(reward, int) and not isinstance(reward, bool)
+            else None
+        )
+    elif (
+        isinstance(reward_units, bool)
+        or not isinstance(reward_units, int)
+        or reward_units < 0
+        or reward_units > _SQLITE_INT64_MAX
+    ):
+        raise ValueError("reward_units must be a non-negative int64")
     repeat_policy, repeat_hours = validate_repeat_policy(
         repeat_policy, repeat_hours
     )
@@ -967,8 +983,8 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
     """List all tasks, optionally filtering to active only."""
     with get_connection(db_path) as conn:
         columns = (
-            "id, title, description, type, reward, active, task_data, "
-            "repeat_policy, repeat_hours, created_at"
+            "id, title, description, type, reward, reward_units, active, "
+            "task_data, repeat_policy, repeat_hours, created_at"
         )
         if active_only:
             cursor = conn.execute(
@@ -983,6 +999,7 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
                 "description": row["description"],
                 "type": row["type"],
                 "reward": row["reward"],
+                "reward_units": row["reward_units"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],

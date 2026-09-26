@@ -866,9 +866,9 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 ADD_TASK_USAGE = (
     "❌ صيغة خاطئة. استخدم:\n"
-    "/addtask عنوان | وصف | نقاط | channel_slug\n\n"
+    "/addtask عنوان | وصف | المكافأة (USDT) | channel_slug\n\n"
     "مثال:\n"
-    "/addtask انضم لقناتنا | اشترك في القناة | 500 | main"
+    "/addtask انضم لقناتنا | اشترك في القناة | 0.0001 | main"
 )
 
 
@@ -882,7 +882,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     service the wizard publishes through (one validated creation
     path, never two).
 
-    Usage: /addtask title | description | points | channel_slug
+    Usage: /addtask title | description | reward (USDT) | channel_slug
 
     Only the ``telegram_channel`` task type is supported here.  The
     channel_slug MUST already exist in the required-channel registry
@@ -935,13 +935,13 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        points = int(points_text)
-    except ValueError:
-        points = -1
-    if points < 0:
-        await update.message.reply_text(
-            "❌ النقاط يجب أن تكون عددًا صحيحًا لا يقل عن صفر."
+        # MT-ADMIN-14: the ONE canonical exact reward parser — decimal
+        # USDT text (≤ 8 dp) → atomic units; no float, no rounding.
+        reward_units = task_creation.parse_reward_units(
+            points_text, field="النقاط"
         )
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
         return
 
     if slug not in CHANNELS:
@@ -963,7 +963,8 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         action="join_channel",
         target={"channel_slug": slug},
         verification=task_taxonomy.VERIFICATION_AUTO,
-        reward=points,
+        reward=task_creation.whole_usdt_reward(reward_units),
+        reward_units=reward_units,
     )
     try:
         task_id = task_creation.create_task_from_spec(spec)
@@ -981,7 +982,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🆔 ID: {task_id}\n"
         f"📌 العنوان: {title}\n"
         f"📝 الوصف: {description}\n"
-        f"💰 النقاط: {points}\n"
+        f"💰 المكافأة: {task_creation.reward_units_to_text(reward_units)} USDT\n"
         f"📡 القناة: {slug}"
     )
     logger.info(

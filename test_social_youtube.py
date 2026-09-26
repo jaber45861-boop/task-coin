@@ -777,13 +777,19 @@ class TestNoTaskOrRewardLogic:
         assert "المكافآت" not in code
 
     def test_existing_business_files_untouched(self):
-        """(28) wallet/ledger/withdrawal/bot/task lifecycle stay clean."""
+        """(28) wallet/ledger/withdrawal/task lifecycle stay clean.
+
+        ``bot.py`` left this list in MT-ADMIN-14: the legacy /addtask
+        pipe there now uses the canonical exact reward parser (its
+        required change).  wallet.py, ledger.py, withdrawal_rules.py
+        and task_lifecycle.py must still be byte-identical.
+        """
         import subprocess
         import os
         repo_root = os.path.dirname(os.path.abspath(__file__))
         forbidden = [
             "wallet.py", "ledger.py", "withdrawal_rules.py",
-            "task_lifecycle.py", "bot.py",
+            "task_lifecycle.py",
         ]
         try:
             result = subprocess.run(

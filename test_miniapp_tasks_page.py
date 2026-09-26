@@ -313,6 +313,10 @@ class TestSecurityGuards:
 
     def test_no_wallet_controls_on_tasks_page(self):
         content = _tasks_js().lower()
+        # MT-ADMIN-14: `WalletData.formatUsdt` is the shared
+        # integer-only DISPLAY formatter (no balance, no controls,
+        # no markup) — referencing it is not a wallet control.
+        content = content.replace("walletdata", "")
         for banned in ("wallet", "balance", "deposit", "withdraw",
                        "المحفظة", "الرصيد", "السحب", "الشحن"):
             assert banned not in content, \

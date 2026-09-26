@@ -277,8 +277,19 @@ const Tasks = (() => {
         card.querySelector('[data-testid="task-description"]').textContent = task.description || '';
         card.querySelector('[data-testid="task-type"]').textContent = typeLabel;
         // Reward is read-only metadata rendered exactly as the server sent it.
+        // Sub-cent tasks carry the exact atomic field (integer USDT
+        // units): the display derives from it with integer math only —
+        // never JavaScript floating-point — through the existing
+        // WalletData formatter; the whole-USDT `reward` field remains
+        // the fallback for rows without an atomic value.
+        const hasExactUnits = task.reward_units !== null
+            && task.reward_units !== undefined
+            && typeof WalletData !== 'undefined';
+        const rewardText = hasExactUnits
+            ? WalletData.formatUsdt(task.reward_units)
+            : String(task.reward);
         card.querySelector('[data-testid="task-reward"]').textContent =
-            'المكافأة: ' + String(task.reward);
+            'المكافأة: ' + rewardText;
 
         _buildActions(card.querySelector('[data-testid="task-actions"]'), task);
         return card;
