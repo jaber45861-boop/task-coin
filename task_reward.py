@@ -25,14 +25,15 @@ compare-and-set, on the transaction's own connection):
 
 Money representation (existing model only, never float):
 
-    ``tasks.reward`` is read as an **integer whole-USDT amount** — the
-    repository's existing convention for integer monetary values:
-    ``wallet.decimal_to_units`` accepts ``int`` as whole USDT and the
-    Mini App presents ``task.reward`` to users as that whole number
-    (e.g. 50).  Conversion goes exclusively through the existing
-    ``decimal_to_units`` / ``USDT_SCALE`` (1 USDT = 100,000,000 units).
-    A reward that is negative, a float smuggled past the application
-    layer, or otherwise not a valid USDT amount raises
+    ``tasks.reward_units`` (MT-ADMIN-13) is the **authoritative**
+    accounting value: exact USDT atomic units (1 USDT = 100,000,000,
+    sub-cent included), read as an ``int`` straight from the stored
+    row.  ``tasks.reward`` keeps its whole-USDT display meaning and is
+    still validated on every settlement — a corrupt display row never
+    settles — but it supplies the credited amount ONLY when the atomic
+    field is absent or NULL (legacy in-memory fixtures / pre-migration
+    rows).  A reward that is negative, a float smuggled past the
+    application layer, or otherwise not a valid USDT amount raises
     :class:`TaskRewardError` and the whole completion rolls back —
     values are never guessed, rounded, or reinterpreted.
 
@@ -121,8 +122,9 @@ class TaskRewardService:
     Everything here runs inside the CompletionGate's open transaction
     on that transaction's connection.  The service:
 
-    1. validates the server-side ``tasks.reward`` as an exact USDT
-       amount (integer whole USDT → ``decimal_to_units``),
+    1. validates the task's stored ``reward_units`` (authoritative
+       atomic units) and the legacy ``reward`` display value, rejecting
+       anything that is not an exact non-negative integer amount,
     2. derives the stable completion-cycle identity,
     3. replays an already-recorded reward instead of crediting twice,
     4. credits ``wallets.available_units`` (held never changes),
@@ -139,28 +141,56 @@ class TaskRewardService:
 
     @staticmethod
     def reward_units(task: dict | None) -> int:
-        """Exact USDT-unit value of ``tasks.reward``.
+        """Exact USDT atomic units this task's completion must credit.
 
-        The repository's convention: an ``int`` monetary value is whole
-        USDT (``decimal_to_units`` accepts ``int`` as whole USDT), so
-        ``reward=50`` → ``5_000_000_000`` units.  Conversion is exact —
-        no rounding, no float, no second money representation.
+        ``tasks.reward_units`` is authoritative: a populated stored
+        value IS the accounting amount itself — whole USDT and
+        sub-cent alike — and must be an exact non-negative ``int``
+        (bool / non-int / negative → :class:`TaskRewardError`, never
+        coerced, never rounded, never converted through float).
+
+        The legacy whole-USDT ``reward`` field is validated on EVERY
+        call (a corrupt display row still rolls the completion back,
+        exactly as before MT-ADMIN-13) and provides the amount only
+        when ``reward_units`` is absent or NULL — legacy in-memory
+        fixtures and rows predating the migration.  ``reward`` never
+        overrides a populated ``reward_units``.
 
         Raises:
-            TaskRewardError: missing task or a reward that is not a
-                valid non-negative USDT amount (negative, float,
-                over-precision, wrong type).
+            TaskRewardError: missing task, invalid legacy reward, or
+                invalid stored ``reward_units`` — the caller's
+                transaction rolls the completion back with the money.
         """
         if not isinstance(task, dict):
             raise TaskRewardError(
                 "a server-side task definition is required to settle a reward"
             )
         try:
-            return wallet.decimal_to_units(task.get("reward"), field="reward")
+            legacy_units = wallet.decimal_to_units(
+                task.get("reward"), field="reward"
+            )
         except wallet.InvalidWalletAmountError as exc:
             raise TaskRewardError(
                 f"task {task.get('id')} has an invalid reward: {exc}"
             ) from exc
+
+        stored = task.get("reward_units")
+        if stored is None:
+            # No atomic value stored (legacy fixture / pre-migration
+            # row): the validated whole-USDT conversion remains the
+            # amount, exactly as before MT-ADMIN-13.
+            return legacy_units
+        if isinstance(stored, bool) or not isinstance(stored, int):
+            raise TaskRewardError(
+                f"task {task.get('id')} has invalid reward_units: "
+                "must be an exact int of atomic units"
+            )
+        if stored < 0:
+            raise TaskRewardError(
+                f"task {task.get('id')} has invalid reward_units: "
+                "must not be negative"
+            )
+        return stored
 
     # ── Settlement (inside the caller's transaction) ────────────
 

@@ -13,6 +13,10 @@ from typing import Iterator, Optional
 from contextlib import contextmanager
 
 from config import Channel, CHANNELS
+# USDT scale authority (1 USDT = 100,000,000 atomic units).  Importing
+# the module (not its attributes) keeps the runtime-only cycle safe in
+# both import orders: neither module touches the other at import time.
+import wallet
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,12 @@ ALLOWED_USER_TASK_STATUSES = {
 }
 
 DB_PATH = os.environ.get("TASKCOIN_DB_PATH", "task_coin.db")
+
+# SQLite INTEGER is a signed 64-bit value.  The reward backfill range-
+# checks against these bounds so an absurd reward can never be stored
+# as a wrapped or REAL (float) value.
+_SQLITE_INT64_MIN = -9_223_372_036_854_775_808
+_SQLITE_INT64_MAX = 9_223_372_036_854_775_807
 
 # How long a connection waits for a lock before SQLite raises SQLITE_BUSY.
 # Applied to every connection at the connection layer (no retry loops).
@@ -227,6 +237,7 @@ def init_db(db_path: str | None = None) -> None:
                 repeat_policy TEXT NOT NULL DEFAULT 'one_time',
                 repeat_hours INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reward_units INTEGER,
                 CHECK (repeat_policy IN ('one_time', 'repeatable')),
                 CHECK (
                     (repeat_policy = 'one_time' AND repeat_hours IS NULL)
@@ -252,9 +263,50 @@ def init_db(db_path: str | None = None) -> None:
         except sqlite3.OperationalError:
             pass  # column already exists
         try:
-            conn.execute("ALTER TABLE tasks ADD COLUMN repeat_hours INTEGER")
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN repeat_hours INTEGER"
+            )
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # ── Authoritative atomic task reward (MT-ADMIN-13) ─────────
+        # Additive migration: ``reward_units`` stores the reward in
+        # exact USDT atomic units (1 USDT = 100,000,000) and is the
+        # value settlement reads.  ``tasks.reward`` keeps its existing
+        # whole-USDT meaning untouched.
+        try:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN reward_units INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Backfill every not-yet-populated row exactly once:
+        # reward_units = reward * USDT_SCALE in Python integer
+        # arithmetic.  SQLite is never asked to multiply: its integer
+        # arithmetic silently promotes to REAL on overflow, which
+        # would store float money.  Only rows still NULL are touched,
+        # so re-running init_db() can never re-multiply a populated
+        # value.  A non-integer or out-of-int64 reward stays NULL —
+        # settlement's validation then rejects such a row exactly as
+        # it did before this migration (no corruption, no guesswork).
+        for row in conn.execute(
+            "SELECT id, reward FROM tasks WHERE reward_units IS NULL"
+        ).fetchall():
+            reward = row["reward"]
+            if not isinstance(reward, int) or isinstance(reward, bool):
+                continue  # corrupt/legacy junk: left NULL on purpose
+            units = reward * wallet.USDT_SCALE
+            if units < _SQLITE_INT64_MIN or units > _SQLITE_INT64_MAX:
+                logger.warning(
+                    "task %s: reward %s overflows INTEGER atomic units; "
+                    "reward_units left NULL",
+                    row["id"], reward,
+                )
+                continue
+            conn.execute(
+                "UPDATE tasks SET reward_units = ? WHERE id = ?",
+                (units, row["id"]),
+            )
 
         # ── User task state table ────────────────────────────────
         conn.execute("""
@@ -848,6 +900,16 @@ def create_task(title: str, description: str, task_type: str, reward: int,
         raise ValueError("type cannot be empty")
     if reward < 0:
         raise ValueError("reward cannot be negative")
+    # MT-ADMIN-13: authoritative atomic reward alongside the whole-USDT
+    # display value — exact Python int math only.  A non-integer reward
+    # (reachable only by direct callers; the app layer validates ints)
+    # stores NULL so settlement's legacy validation rejects it exactly
+    # as it did before this column existed.
+    reward_units = (
+        reward * wallet.USDT_SCALE
+        if isinstance(reward, int) and not isinstance(reward, bool)
+        else None
+    )
     repeat_policy, repeat_hours = validate_repeat_policy(
         repeat_policy, repeat_hours
     )
@@ -855,11 +917,12 @@ def create_task(title: str, description: str, task_type: str, reward: int,
     insert_sql = (
         "INSERT INTO tasks "
         "(title, description, type, reward, active, task_data, "
-        " repeat_policy, repeat_hours) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        " repeat_policy, repeat_hours, reward_units) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     values = (title.strip(), description.strip(), task_type.strip(), reward,
-              int(active), task_data, repeat_policy, repeat_hours)
+              int(active), task_data, repeat_policy, repeat_hours,
+              reward_units)
 
     if conn is not None:
         cursor = conn.execute(insert_sql, values)
@@ -878,8 +941,9 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
     """Get a task by ID."""
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT id, title, description, type, reward, active, task_data, "
-            "repeat_policy, repeat_hours, created_at FROM tasks WHERE id = ?",
+            "SELECT id, title, description, type, reward, reward_units, "
+            "active, task_data, repeat_policy, repeat_hours, created_at "
+            "FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
         if row:
@@ -889,6 +953,7 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
                 "description": row["description"],
                 "type": row["type"],
                 "reward": row["reward"],
+                "reward_units": row["reward_units"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],
@@ -962,6 +1027,16 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
     if reward is not None:
         fields.append("reward = ?")
         values.append(reward)
+        # MT-ADMIN-13: keep the authoritative atomic value in step with
+        # an edited whole-USDT reward (exact int math; a non-integer
+        # reward clears the column to NULL so settlement's legacy
+        # validation rejects the row exactly as before).
+        fields.append("reward_units = ?")
+        values.append(
+            reward * wallet.USDT_SCALE
+            if isinstance(reward, int) and not isinstance(reward, bool)
+            else None
+        )
     if active is not None:
         fields.append("active = ?")
         values.append(int(active))
