@@ -346,17 +346,35 @@ async def _safe_answer(answer: AnswerFunc, text: str) -> None:
         logger.debug("Could not answer manual proof callback", exc_info=True)
 
 
-async def _edit_all(
-    edit: EditFunc, links, text: str
-) -> None:
-    """Make every admin copy of the notification inert (no buttons)."""
-    for link in links:
+def _edit_targets(
+    links, pressed_chat_id, pressed_message_id
+) -> list[tuple[int, int]]:
+    """Message edit targets: every linked admin copy PLUS the message
+    the button was actually pressed on — de-duplicated, stable order.
+
+    MT-ADMIN-04: a review card opened from the /reviews queue may not
+    have its own linkage row (UNIQUE is per operation+chat), so the
+    pressed message must be inerted directly as well.
+    """
+    targets = [(l.admin_chat_id, l.message_id) for l in links]
+    if isinstance(pressed_chat_id, int) and isinstance(
+        pressed_message_id, int
+    ):
+        pressed = (pressed_chat_id, pressed_message_id)
+        if pressed not in targets:
+            targets.append(pressed)
+    return targets
+
+
+async def _edit_all(edit: EditFunc, targets, text: str) -> None:
+    """Make every target message inert (no buttons)."""
+    for chat_id, message_id in targets:
         try:
-            await edit(link.admin_chat_id, link.message_id, text)
+            await edit(chat_id, message_id, text)
         except Exception:
             logger.debug(
                 "Could not edit admin notification %s/%s",
-                link.admin_chat_id, link.message_id,
+                chat_id, message_id,
                 exc_info=True,
             )
 
@@ -367,6 +385,8 @@ async def handle_callback(
     *,
     answer: AnswerFunc,
     edit: EditFunc,
+    pressed_chat_id: int | None = None,
+    pressed_message_id: int | None = None,
 ) -> str:
     """Resolve an Approve/Reject press through server-side state.
 
@@ -375,9 +395,13 @@ async def handle_callback(
         actor_user_id: Verified Telegram user id of the presser —
             never taken from the payload.
         answer: Toast the pressed chat (``async (text) -> None``).
-        edit: Replace one linked admin message with inert text
+        edit: Replace one target admin message with inert text
             (``async (chat_id, message_id, text) -> None``); the edit
             surface carries no keyboard, so buttons cannot survive.
+        pressed_chat_id / pressed_message_id: The message the button
+            was actually pressed on (MT-ADMIN-04) — added to the edit
+            targets so a queue-opened review card also goes inert
+            after a decision.  Optional; never trusted as identity.
 
     Returns:
         One of ``invalid``, ``stale``, ``unauthorized``, ``approved``,
@@ -411,8 +435,11 @@ async def handle_callback(
         await _safe_answer(answer, MSG_ERROR)
         return "error"
 
+    targets = _edit_targets(links, pressed_chat_id, pressed_message_id)
+
     if not links or record is None:
         await _safe_answer(answer, MSG_STALE)
+        await _edit_all(edit, targets, MSG_EDIT_CLOSED)
         return "stale"
 
     # ── 2. The linked claim must still be a manual approval-gated claim
@@ -422,14 +449,14 @@ async def handle_callback(
         or record.approval_status is None
     ):
         await _safe_answer(answer, MSG_STALE)
-        await _edit_all(edit, links, MSG_EDIT_CLOSED)
+        await _edit_all(edit, targets, MSG_EDIT_CLOSED)
         return "stale"
 
     approver_id = manual_task_approver_user_id(task)
     if approver_id is None:
         # Broken/malformed definition: fail closed, buttons go inert.
         await _safe_answer(answer, MSG_STALE)
-        await _edit_all(edit, links, MSG_EDIT_CLOSED)
+        await _edit_all(edit, targets, MSG_EDIT_CLOSED)
         return "stale"
 
     # ── 3. Authorization: verified actor == task approver, NO bypass ─
@@ -457,10 +484,12 @@ async def handle_callback(
             await _safe_answer(answer, MSG_ALREADY_DECIDED)
             if current is not None:
                 await _edit_all(
-                    edit, links, build_decided_text(task, record, approved_now)
+                    edit,
+                    targets,
+                    build_decided_text(task, record, approved_now),
                 )
             else:
-                await _edit_all(edit, links, MSG_EDIT_CLOSED)
+                await _edit_all(edit, targets, MSG_EDIT_CLOSED)
             return "already_decided"
         if "authorized approver" in reason:
             # task_data changed under us — still no admin fallback.
@@ -477,7 +506,7 @@ async def handle_callback(
                 record.submission_id, reason,
             )
             await _safe_answer(answer, MSG_STALE)
-            await _edit_all(edit, links, MSG_EDIT_CLOSED)
+            await _edit_all(edit, targets, MSG_EDIT_CLOSED)
             return "stale"
         # Transient/ambiguous failure: fail closed — keep the buttons,
         # change nothing, let the approver retry.
@@ -501,7 +530,7 @@ async def handle_callback(
     await _safe_answer(
         answer, MSG_APPROVED_TOAST if approved else MSG_REJECTED_TOAST
     )
-    await _edit_all(edit, links, build_decided_text(task, record, approved))
+    await _edit_all(edit, targets, build_decided_text(task, record, approved))
     logger.info(
         "Manual proof decided via Telegram: submission=%d actor=%d "
         "decision=%s status=%s",
@@ -567,9 +596,22 @@ async def proof_callback_handler(update, context) -> None:
 
     actor = getattr(query, "from_user", None)
     actor_id = getattr(actor, "id", 0)
+
+    # The pressed message joins the inert-edit set (MT-ADMIN-04), so a
+    # review card opened from the /reviews queue also loses its buttons.
+    pressed = getattr(query, "message", None)
+    pressed_chat = getattr(pressed, "chat", None)
+    pressed_chat_id = getattr(pressed_chat, "id", None)
+    pressed_message_id = getattr(pressed, "message_id", None)
+
     try:
         status = await handle_callback(
-            query.data, actor_id, answer=_answer, edit=_edit
+            query.data,
+            actor_id,
+            answer=_answer,
+            edit=_edit,
+            pressed_chat_id=pressed_chat_id,
+            pressed_message_id=pressed_message_id,
         )
     except Exception:
         logger.exception(

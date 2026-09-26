@@ -40,6 +40,7 @@ from flask import Flask, send_from_directory
 from waitress import create_server
 
 import db
+import admin_review_queue
 import manual_proof_inbox
 from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
@@ -1895,6 +1896,12 @@ def main() -> None:
     app.add_handler(CommandHandler("addtask", add_task), group=0)
     app.add_handler(CommandHandler("listtasks", list_tasks), group=0)
     app.add_handler(CommandHandler("offtask", off_task), group=0)
+    # MT-ADMIN-04: /reviews — admin pending manual-review queue.
+    #    Private chat only; authorization enforced inside the command
+    #    (admin gate for access, task approver for the actual review).
+    app.add_handler(CommandHandler(
+        "reviews", admin_review_queue.reviews_command,
+    ), group=0)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
@@ -1914,6 +1921,13 @@ def main() -> None:
     #    handler; ADMINS membership grants no decision authority.
     app.add_handler(CallbackQueryHandler(
         manual_proof_inbox.proof_callback_handler, pattern=r"^mproof:",
+    ), group=5)
+
+    # MT-ADMIN-04: queue Review buttons + page navigation (discovery
+    #    only — decisions still flow through the mproof handlers above
+    #    into ManualReviewService.decide with task-specific authority.
+    app.add_handler(CallbackQueryHandler(
+        admin_review_queue.review_queue_callback, pattern=r"^mr(view|vp):",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
