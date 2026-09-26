@@ -567,6 +567,92 @@ def init_db(db_path: str | None = None) -> None:
             ON admin_task_drafts (admin_user_id) WHERE status = 'open'
         """)
 
+        # ── Persistent Telegram user support (MT-ADMIN-06) ─────────
+        # Additive migration only: brand-new tables.  A support
+        # inquiry is ONE active conversation between one Telegram user
+        # and the admins; every message is stored forever, the user's
+        # in-progress category selection and the admin's reply context
+        # also live here.  There is NO in-memory conversation state
+        # anywhere, so a bot restart keeps inquiries, messages,
+        # status, admin/user linkage and pending reply context.
+        #   status  'open' (active) | 'closed' (terminal)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_inquiries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'closed')),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # DB-enforced one active inquiry per user: closed inquiries do
+        # not count, so a user may always start one new thread later.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_support_inquiries_active_user
+            ON support_inquiries (user_id) WHERE status != 'closed'
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS ix_support_inquiries_status
+            ON support_inquiries (status, id)
+        """)
+        # Every support message is stored exactly once, in order.
+        #   sender_type   'user' | 'admin'
+        #   source_message_id  the Telegram message id of the sender's
+        #                   private chat — NULL for synthetic rows;
+        #                   the UNIQUE index below makes a replayed
+        #                   Telegram update insert nothing twice
+        #   delivered_at  admin→user delivery marker (NULL = preserved
+        #                 but NOT delivered yet — never faked)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inquiry_id INTEGER NOT NULL
+                    REFERENCES support_inquiries(id) ON DELETE CASCADE,
+                sender_type TEXT NOT NULL
+                    CHECK (sender_type IN ('user', 'admin')),
+                sender_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                source_message_id INTEGER,
+                delivered_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS ix_support_messages_inquiry
+            ON support_messages (inquiry_id, id)
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_support_messages_source
+            ON support_messages
+                (sender_type, sender_id, source_message_id)
+            WHERE source_message_id IS NOT NULL
+        """)
+        # User-side flow state: /support → category → message.  Lives
+        # in SQLite (not handler memory) so the flow survives restart.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_user_states (
+                user_id INTEGER PRIMARY KEY,
+                category TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Admin reply context: WHICH inquiry an admin is answering.
+        # One active context per admin, resolved from DB by admin id +
+        # private chat id — never from client-provided data.  Closing
+        # an inquiry deletes the contexts that point at it.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_reply_contexts (
+                admin_user_id INTEGER PRIMARY KEY,
+                admin_chat_id INTEGER NOT NULL,
+                inquiry_id INTEGER NOT NULL
+                    REFERENCES support_inquiries(id) ON DELETE CASCADE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 

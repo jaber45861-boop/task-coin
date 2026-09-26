@@ -43,6 +43,7 @@ import db
 import admin_review_queue
 import admin_task_wizard
 import manual_proof_inbox
+import support_service
 import task_creation
 import task_taxonomy
 from admin_notifier import AdminNotifier
@@ -1640,10 +1641,14 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
     def _schedule_notification(coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, loop)
 
+    # MT-ADMIN-06: the support flow shares the SAME AdminNotifier —
+    # ADMINS private chats only, never channels/groups.
+    _admin_notifier = AdminNotifier(_send_text, markup_send=_send_markup)
     manual_proof_inbox.bind(
-        AdminNotifier(_send_text, markup_send=_send_markup),
+        _admin_notifier,
         _schedule_notification,
     )
+    support_service.bind(_admin_notifier)
 
     def _error_callback(exc: TelegramError) -> None:
         application.create_task(application.process_error(error=exc, update=None))
@@ -1675,7 +1680,10 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
     finally:
         # MT-ADMIN-03: detach the notification bridge before the loop
         # goes away so late submissions fail soft (inbox unbound)
-        # instead of scheduling onto a dead loop.
+        # instead of scheduling onto a dead loop.  MT-ADMIN-06: the
+        # support service unbinds with the inbox so a stopped bot
+        # never notifies.
+        support_service.unbind()
         manual_proof_inbox.unbind()
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -1916,6 +1924,13 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "reviews", admin_review_queue.reviews_command,
     ), group=0)
+    # MT-ADMIN-06: /support — ONE deterministic entry point:
+    #    private admin -> admin support queue; private non-admin ->
+    #    user support flow (category selection).  Group/channel
+    #    invocations are silent (isolation enforced inside).
+    app.add_handler(CommandHandler(
+        "support", support_service.support_command,
+    ), group=0)
     # MT-ADMIN-05: wizard free-text answers (title, target,
     #    instructions, reward, repeat hours).  Registered LAST in
     #    group 0 so the add/remove-channel conversations consume their
@@ -1925,6 +1940,17 @@ def main() -> None:
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         admin_task_wizard.wizard_text_input,
     ), group=0)
+
+    # MT-ADMIN-06: support text input (user message after category
+    #    selection, or an admin's persisted reply).  Registered in its
+    #    OWN handler group so the group-0 wizard catch-all cannot
+    #    shadow it (and vice versa); the body stays silent unless the
+    #    sender's own persisted support state matches, so ordinary
+    #    chat, the anti-bot conversation and the wizard are unaffected.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        support_service.support_text_input,
+    ), group=2)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
@@ -1959,6 +1985,17 @@ def main() -> None:
     #    handler re-reads actor, ownership and state from the DB.
     app.add_handler(CallbackQueryHandler(
         admin_task_wizard.wizard_callback, pattern=r"^atw:",
+    ), group=5)
+
+    # MT-ADMIN-06: user category buttons + admin queue/open/reply/
+    #    close/cancel/page callbacks.  Payloads carry only an opaque
+    #    category or positive inquiry/page id — every authorization
+    #    fact and the recipient are re-read server-side.
+    app.add_handler(CallbackQueryHandler(
+        support_service.support_category_callback, pattern=r"^supcat:",
+    ), group=5)
+    app.add_handler(CallbackQueryHandler(
+        support_service.support_admin_callback, pattern=r"^sup:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
