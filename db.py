@@ -653,6 +653,47 @@ def init_db(db_path: str | None = None) -> None:
             )
         """)
 
+        # ── Dynamic payment methods (MT-ADMIN-08) ─────────────────
+        # Additive migration only: a brand-new table.  Admin-defined
+        # payout destinations — provider, network, asset and the
+        # destination itself are FREE-FORM TEXT so a new exchange,
+        # chain or cash provider never needs a migration.  Only
+        # category is a closed taxonomy (crypto | cash: the two
+        # payment concepts), never a provider/network list.
+        #   is_active     admin toggle (0/1); inactive = hidden from
+        #                 users but preserved
+        #   sort_order    display ordering (defaults to insertion
+        #                 order; see payment_method_store)
+        #   created_by / updated_by   admin audit columns (no FK: an
+        #                 admin may not have a users row yet)
+        # NO provider addresses are seeded here — addresses are
+        # runtime admin configuration, never source constants.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_methods (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL
+                    CHECK (category IN ('crypto', 'cash')),
+                display_name TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                network TEXT,
+                provider TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                instructions TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+                    CHECK (is_active IN (0, 1)),
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER,
+                updated_by INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Deterministic display order (sort_order ASC, id ASC).
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_payment_methods_order
+            ON payment_methods (sort_order, id)
+        """)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 

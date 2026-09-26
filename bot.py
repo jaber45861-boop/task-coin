@@ -43,6 +43,7 @@ import db
 import admin_review_queue
 import admin_task_wizard
 import manual_proof_inbox
+import payment_method_admin
 import support_service
 import task_creation
 import task_taxonomy
@@ -1931,6 +1932,20 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "support", support_service.support_command,
     ), group=0)
+    # MT-ADMIN-08: payment-method management — private admin chat ONLY.
+    #    /paymethods panel; /addpm + /editpm use the stateless
+    #    pipe-form convention (same as /addchannel).  Authorization is
+    #    enforced inside every handler; group/channel invocations stay
+    #    silent (MT-ADMIN-02 isolation).
+    app.add_handler(CommandHandler(
+        "paymethods", payment_method_admin.paymethods_command,
+    ), group=0)
+    app.add_handler(CommandHandler(
+        "addpm", payment_method_admin.add_pm_command,
+    ), group=0)
+    app.add_handler(CommandHandler(
+        "editpm", payment_method_admin.edit_pm_command,
+    ), group=0)
     # MT-ADMIN-05: wizard free-text answers (title, target,
     #    instructions, reward, repeat hours).  Registered LAST in
     #    group 0 so the add/remove-channel conversations consume their
@@ -1996,6 +2011,14 @@ def main() -> None:
     ), group=5)
     app.add_handler(CallbackQueryHandler(
         support_service.support_admin_callback, pattern=r"^sup:",
+    ), group=5)
+
+    # MT-ADMIN-08: payment-method buttons (list/help/edit/state-
+    #    toggle/delete-confirm).  Payloads are pm:<op>[:<positive
+    #    id>] lookup pointers only — actor authorization and every
+    #    field are re-read server-side from SQLite.
+    app.add_handler(CallbackQueryHandler(
+        payment_method_admin.payment_method_callback, pattern=r"^pm:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
