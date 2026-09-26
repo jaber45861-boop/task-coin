@@ -780,6 +780,46 @@ def init_db(db_path: str | None = None) -> None:
             ON payment_methods (sort_order, id)
         """)
 
+        # ── Admin platform settings (MT-ADMIN-15) ─────────────────
+        # Additive migration only: a brand-new table — no existing
+        # table, column or row is touched, and no financial data is
+        # rewritten.  The platform's genuinely mutable business knobs
+        # (minimum withdrawal, minimum deposit, withdrawal fee,
+        # advertiser commission) become DATA instead of constants:
+        #   key      stable string key; the registry of valid keys,
+        #            bounds and defaults lives in ``platform_settings``
+        #   value    the EXACT integer representation of the setting:
+        #            USDT atomic units for the ``*_units`` keys
+        #            (1 USDT = 100,000,000 units, 8 dp — sub-cent
+        #            values are exact) and integer basis points for
+        #            ``advertiser_commission`` (10,000 bp = 100 %).
+        #            The ``typeof(value) = 'integer'`` CHECK keeps a
+        #            REAL/float out of the table permanently; there is
+        #            deliberately no REAL column anywhere in the
+        #            schema (money is never a float).
+        #   updated_by  acting admin id — same no-FK convention as
+        #            payment_methods.created_by / updated_by
+        # Re-running init_db on a fresh or an already-migrated database
+        # is a harmless no-op (IF NOT EXISTS + INSERT OR IGNORE), and
+        # an admin-saved value is never overwritten by a migration.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS platform_settings (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL CHECK (typeof(value) = 'integer'),
+                updated_by INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Seed the audited defaults for keys that have no row yet.
+        # The key -> default registry is the single source of truth in
+        # ``platform_settings``; the import is function-local on purpose
+        # so db <-> platform_settings can never become an import cycle
+        # (platform_settings imports db at module level for its
+        # connection/transaction helpers).
+        from platform_settings import ensure_default_settings
+        ensure_default_settings(conn)
+
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
