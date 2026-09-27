@@ -21,10 +21,11 @@ Scope (MT-2 only, plus MT-REWARD-01's injected-connection support):
     - lazy wallet creation (``ensure_wallet``)
     - available-balance read (``balance_of`` -> Decimal, available only)
     - ``reserve`` / ``release_units`` / ``settle_units`` primitives
-    - connection-injected availability credit (``credit_units``,
-      MT-REWARD-01) so a caller's outer transaction can move units
-      atomically with its own writes — no nested transactions, and
-      this scope never commits/rolls back a caller-owned connection
+    - connection-injected mutations (``credit_units`` MT-REWARD-01;
+      ``reserve`` / ``release_units`` / ``settle_units`` MT-ADMIN-18)
+      so a caller's outer transaction can move units atomically with
+      its own writes — no nested transactions, and this scope never
+      commits/rolls back a caller-owned connection
 
 Deliberately NOT implemented here (future micro-tasks):
 
@@ -426,7 +427,12 @@ def balance_of(user_id: int) -> Decimal:
     return units_to_decimal(wallet_units(user_id).available_units)
 
 
-def reserve(user_id: int, amount: object) -> int:
+def reserve(
+    user_id: int,
+    amount: object,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
     """Atomically move ``amount`` USDT from available to held.
 
     ``available -= amount`` and ``held += amount`` happen as ONE
@@ -437,10 +443,20 @@ def reserve(user_id: int, amount: object) -> int:
     Only the ``wallets`` table is touched: no ledger entry, no
     withdrawal row (MT-3 / MT-4 own those).
 
+    Connection ownership (MT-ADMIN-18, same convention as
+    ``credit_units``): with ``connection`` the UPDATE runs on THAT
+    exact caller-owned connection inside the caller's open
+    transaction — no other connection is opened, and this scope never
+    commits, rolls back or closes it; the reserve commits or vanishes
+    together with the caller's other writes.  Without it, the standard
+    ``db.get_connection()`` scope owns commit/rollback/close per call,
+    exactly as before.
+
     Args:
         user_id: existing Telegram user id.
         amount: USDT amount as ``Decimal``/``str``/``int``; positive,
             at most 8 decimal places.
+        connection: optional caller-owned connection to join.
 
     Returns:
         The reserved amount in integer wallet units.
@@ -450,25 +466,43 @@ def reserve(user_id: int, amount: object) -> int:
         InsufficientBalanceError.
     """
     units = _amount_to_units(amount, field="amount")
-    ensure_wallet(user_id)
-    with db.get_connection() as conn:
-        cursor = conn.execute(
-            _RESERVE_SQL, (units, units, user_id, units)
+    if connection is None:
+        with db.get_connection() as conn:
+            return _reserve_on(conn, user_id, units)
+    return _reserve_on(connection, user_id, units)
+
+
+def _reserve_on(
+    conn: sqlite3.Connection, user_id: int, units: int
+) -> int:
+    """``reserve`` body on an explicit connection.
+
+    The connection is borrowed: statements run on it, but it is never
+    committed, rolled back or closed here.
+    """
+    ensure_wallet(user_id, connection=conn)
+    cursor = conn.execute(
+        _RESERVE_SQL, (units, units, user_id, units)
+    )
+    if cursor.rowcount != 1:
+        row = conn.execute(
+            "SELECT available_units FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        available = row["available_units"] if row else 0
+        raise InsufficientBalanceError(
+            f"reserve of {units} units exceeds available balance "
+            f"{available} units for user {user_id}"
         )
-        if cursor.rowcount != 1:
-            row = conn.execute(
-                "SELECT available_units FROM wallets WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            available = row["available_units"] if row else 0
-            raise InsufficientBalanceError(
-                f"reserve of {units} units exceeds available balance "
-                f"{available} units for user {user_id}"
-            )
     return units
 
 
-def release_units(user_id: int, amount_units: object) -> int:
+def release_units(
+    user_id: int,
+    amount_units: object,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
     """Atomically move ``amount_units`` from held back to available.
 
     Exact inverse of ``reserve``: a matching release restores the wallet
@@ -477,30 +511,59 @@ def release_units(user_id: int, amount_units: object) -> int:
     Only the ``wallets`` table is touched: no ledger entry, no
     withdrawal status change.
 
+    Connection ownership (MT-ADMIN-18): with ``connection`` the UPDATE
+    runs on that exact caller-owned connection inside the caller's open
+    transaction — no other connection is opened, and this scope never
+    commits, rolls back or closes it.  Without it, the standard
+    ``db.get_connection()`` scope commits per call, exactly as before.
+
+    Args:
+        user_id: existing Telegram user id.
+        amount_units: positive int of USDT units (bool/float rejected).
+        connection: optional caller-owned connection to join.
+
+    Returns:
+        The released amount in integer wallet units.
+
     Raises:
         UserNotFoundError, InvalidWalletAmountError,
         InsufficientHeldBalanceError.
     """
     units = _require_positive_units(amount_units, field="amount_units")
-    ensure_wallet(user_id)
-    with db.get_connection() as conn:
-        cursor = conn.execute(
-            _RELEASE_SQL, (units, units, user_id, units)
+    if connection is None:
+        with db.get_connection() as conn:
+            return _release_on(conn, user_id, units)
+    return _release_on(connection, user_id, units)
+
+
+def _release_on(
+    conn: sqlite3.Connection, user_id: int, units: int
+) -> int:
+    """``release_units`` body on an explicit (borrowed) connection —
+    never committed, rolled back or closed here."""
+    ensure_wallet(user_id, connection=conn)
+    cursor = conn.execute(
+        _RELEASE_SQL, (units, units, user_id, units)
+    )
+    if cursor.rowcount != 1:
+        row = conn.execute(
+            "SELECT held_units FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        held = row["held_units"] if row else 0
+        raise InsufficientHeldBalanceError(
+            f"release of {units} units exceeds held balance "
+            f"{held} units for user {user_id}"
         )
-        if cursor.rowcount != 1:
-            row = conn.execute(
-                "SELECT held_units FROM wallets WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            held = row["held_units"] if row else 0
-            raise InsufficientHeldBalanceError(
-                f"release of {units} units exceeds held balance "
-                f"{held} units for user {user_id}"
-            )
     return units
 
 
-def settle_units(user_id: int, amount_units: object) -> int:
+def settle_units(
+    user_id: int,
+    amount_units: object,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
     """Permanently remove ``amount_units`` from held (funds leave).
 
     ``held -= amount_units`` only — ``available`` is deliberately NOT
@@ -510,22 +573,46 @@ def settle_units(user_id: int, amount_units: object) -> int:
     Only the ``wallets`` table is touched: no ledger entry, no
     withdrawal state change.
 
+    Connection ownership (MT-ADMIN-18): with ``connection`` the UPDATE
+    runs on that exact caller-owned connection inside the caller's open
+    transaction — no other connection is opened, and this scope never
+    commits, rolls back or closes it.  Without it, the standard
+    ``db.get_connection()`` scope commits per call, exactly as before.
+
+    Args:
+        user_id: existing Telegram user id.
+        amount_units: positive int of USDT units (bool/float rejected).
+        connection: optional caller-owned connection to join.
+
+    Returns:
+        The settled amount in integer wallet units.
+
     Raises:
         UserNotFoundError, InvalidWalletAmountError,
         InsufficientHeldBalanceError.
     """
     units = _require_positive_units(amount_units, field="amount_units")
-    ensure_wallet(user_id)
-    with db.get_connection() as conn:
-        cursor = conn.execute(_SETTLE_SQL, (units, user_id, units))
-        if cursor.rowcount != 1:
-            row = conn.execute(
-                "SELECT held_units FROM wallets WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            held = row["held_units"] if row else 0
-            raise InsufficientHeldBalanceError(
-                f"settlement of {units} units exceeds held balance "
-                f"{held} units for user {user_id}"
-            )
+    if connection is None:
+        with db.get_connection() as conn:
+            return _settle_on(conn, user_id, units)
+    return _settle_on(connection, user_id, units)
+
+
+def _settle_on(
+    conn: sqlite3.Connection, user_id: int, units: int
+) -> int:
+    """``settle_units`` body on an explicit (borrowed) connection —
+    never committed, rolled back or closed here."""
+    ensure_wallet(user_id, connection=conn)
+    cursor = conn.execute(_SETTLE_SQL, (units, user_id, units))
+    if cursor.rowcount != 1:
+        row = conn.execute(
+            "SELECT held_units FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        held = row["held_units"] if row else 0
+        raise InsufficientHeldBalanceError(
+            f"settlement of {units} units exceeds held balance "
+            f"{held} units for user {user_id}"
+        )
     return units
