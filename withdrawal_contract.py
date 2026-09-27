@@ -66,6 +66,7 @@ source error                                 withdrawal-domain target
 ``wallet.InsufficientHeldBalanceError``      ``InsufficientHeldBalanceError`` (held)
 ``wallet.InvalidWalletAmountError``          ``InvalidAmountError``
 ``rate_quote.RateQuoteError`` family         ``InvalidRateError``
+``ledger.InvalidLedgerEntryError``           ``ValidationError``
 ``payment_method_store...NotFoundError``     ``PaymentMethodUnavailableError``
 ``payment_method_store...InactiveError``     ``PaymentMethodUnavailableError``
 ``payment_method_store...ValidationError``   ``ValidationError``
@@ -102,6 +103,7 @@ import payment_method_store
 import rate_quote
 import wallet
 import withdrawal_rules
+from ledger import InvalidLedgerEntryError
 from rate_quote import RateQuote
 
 # ── Unit scales (single sources of truth live elsewhere) ─────────────
@@ -401,6 +403,14 @@ _TRANSLATIONS: tuple[tuple[tuple[type, ...], type], ...] = (
         # whole RateQuoteError family → domain rate error
         (rate_quote.RateQuoteError,),
         withdrawal_rules.InvalidRateError,
+    ),
+    (
+        # invalid ledger entry data (bad ids/amounts) → domain input
+        # error.  Ledger reference/idempotency CONFLICTS are deliberately
+        # left unmapped: they are already precise ledger-domain errors
+        # and re-labeling them would lose fidelity.
+        (InvalidLedgerEntryError,),
+        withdrawal_rules.ValidationError,
     ),
     (
         (

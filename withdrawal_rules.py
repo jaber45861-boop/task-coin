@@ -142,6 +142,15 @@ class PaymentMethodUnavailableError(WithdrawalError):
     not-found / inactive errors."""
 
 
+class DuplicateRequestError(WithdrawalError):
+    """A withdrawal request with this id already exists (MT-ADMIN-22).
+
+    Raised by the SQLite repository when an INSERT hits the primary
+    key — distinct from ``PendingWithdrawalExistsError`` (which guards
+    one pending request per user) and from ``InvalidStateError``.
+    """
+
+
 class InvalidStateError(WithdrawalError):
     """Settlement called on a request that is no longer PENDING."""
 
@@ -190,6 +199,20 @@ class WithdrawalRequest:
     # phone number) — never the platform's ``payment_methods.destination``.
     rejected_at: datetime | None = None
     completed_at: datetime | None = None
+    # ── MT-ADMIN-22 persistence facts (SQLite row fields; optional so
+    # every existing constructor keeps working, stored/exposed EXACTLY
+    # as persisted — the repository never invents or rewrites them) ──
+    native_unit: str | None = None          # 'EGP' | 'USDT' (schema CHECK)
+    payment_method_id: int | None = None    # FK -> payment_methods(id)
+    pm_display_name: str | None = None      # payment-method snapshot
+    pm_category: str | None = None
+    pm_asset: str | None = None
+    pm_network: str | None = None
+    pm_provider: str | None = None
+    pm_destination: str | None = None       # platform destination snapshot
+    wallet_rate_usdt_egp: str | None = None  # exact stored TEXT (NOT NULL)
+    rate_captured_at: str | None = None       # exact stored TEXT (NOT NULL)
+    rate_provider: str | None = None          # exact stored TEXT (NOT NULL)
 
     @property
     def total_egp(self) -> Decimal:
