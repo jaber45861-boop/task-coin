@@ -116,6 +116,32 @@ class InsufficientBalanceError(WithdrawalError):
     """Balance cannot cover amount + fee; nothing was held."""
 
 
+class InsufficientHeldBalanceError(WithdrawalError):
+    """Held units cannot cover a release/settlement (MT-ADMIN-21).
+
+    Distinct from ``InsufficientBalanceError`` (available balance too
+    low): the money exists but is not currently held.  This is the
+    withdrawal-domain target for ``wallet.InsufficientHeldBalanceError``
+    through ``withdrawal_contract.translate_to_domain_error``.
+    """
+
+
+class PendingWithdrawalExistsError(WithdrawalError):
+    """A pending withdrawal already exists for this user (MT-ADMIN-21).
+
+    The DB-enforced counterpart of ``ux_withdrawals_one_pending`` —
+    stricter than the 24 h ``CooldownError`` (which is time-based and
+    counts rejected requests).  Translated from the SQLite UNIQUE
+    violation by ``withdrawal_contract``.
+    """
+
+
+class PaymentMethodUnavailableError(WithdrawalError):
+    """The selected payment method is missing or deactivated
+    (MT-ADMIN-21).  Domain target for the payment-method store's
+    not-found / inactive errors."""
+
+
 class InvalidStateError(WithdrawalError):
     """Settlement called on a request that is no longer PENDING."""
 
