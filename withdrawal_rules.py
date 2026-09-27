@@ -135,7 +135,13 @@ class RequestStatus(str, Enum):
 
 @dataclass(frozen=True)
 class WithdrawalRequest:
-    """An immutable withdrawal request; the pinned rate never changes."""
+    """An immutable withdrawal request; the pinned rate never changes.
+
+    The last four fields are the MT-ADMIN-19 additive facts.  They
+    default to ``None`` so every existing constructor and test keeps
+    working, and a legacy value of ``None`` is legitimate — it means
+    "not established yet", never zero.
+    """
 
     request_id: str
     user_id: int
@@ -147,6 +153,17 @@ class WithdrawalRequest:
     fee_native: Decimal          # fee in payout units (rule 5)
     status: RequestStatus
     created_at: datetime
+    # ── MT-ADMIN-19 additive facts (stored, never computed here) ──
+    wallet_debit_units: int | None = None
+    # Exact USDT atomic units (1 USDT = 100,000,000) a future service
+    # will reserve/settle from the wallet — the wallet/ledger financial
+    # authority.  NOT derived from the amount/fee fields above; None
+    # until that service explicitly establishes the relationship.
+    user_destination: str | None = None
+    # The USER's own payout destination (crypto address or cash-provider
+    # phone number) — never the platform's ``payment_methods.destination``.
+    rejected_at: datetime | None = None
+    completed_at: datetime | None = None
 
     @property
     def total_egp(self) -> Decimal:

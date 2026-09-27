@@ -504,6 +504,20 @@ def init_db(db_path: str | None = None) -> None:
         # as canonical TEXT decimal strings (never REAL).  rate_usdt_egp may
         # be NULL for Vodafone Cash exactly as the existing withdrawal rules
         # define it; wallet_rate_usdt_egp is always required.
+        # MT-ADMIN-19 additive facts (nullable at schema level — SQLite
+        # cannot ADD a NOT NULL column without a default, and legacy rows
+        # legitimately have none; future withdrawal code populates them):
+        #   wallet_debit_units  INTEGER — exact USDT atomic units
+        #       (1 USDT = 100,000,000) that a future service will
+        #       reserve/settle from the wallet: the wallet/ledger
+        #       financial authority.  NULL on legacy rows is NOT zero and
+        #       is never derived from the amount/fee columns here.
+        #   user_destination  TEXT — the USER's own payout destination
+        #       (crypto address or cash-provider phone number), never
+        #       payment_methods.destination (the platform destination)
+        #       and never logged raw.
+        #   rejected_at / completed_at  TIMESTAMP — status-transition
+        #       audit stamps, NULL until the matching transition happens.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS withdrawal_requests (
                 request_id TEXT PRIMARY KEY,
@@ -532,6 +546,10 @@ def init_db(db_path: str | None = None) -> None:
                 pm_network TEXT,
                 pm_provider TEXT,
                 pm_destination TEXT,
+                wallet_debit_units INTEGER,
+                user_destination TEXT,
+                rejected_at TIMESTAMP,
+                completed_at TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
@@ -570,6 +588,32 @@ def init_db(db_path: str | None = None) -> None:
                 conn.execute(
                     "ALTER TABLE withdrawal_requests ADD COLUMN "
                     + _linkage_column
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # ── Withdrawal financial facts + user destination (MT-ADMIN-19) ──
+        # Additive migration only: four NULLABLE columns on
+        # withdrawal_requests.  wallet_debit_units is INTEGER (USDT
+        # atomic units — never REAL, no default invented: SQLite cannot
+        # ADD a NOT NULL column without one, and a fake default would
+        # pretend legacy rows carry a debit amount).  user_destination
+        # is the USER's payout destination, deliberately distinct from
+        # payment_methods.destination.  rejected_at/completed_at are
+        # status-transition stamps.  Legacy rows keep NULL in all four;
+        # no existing column, CHECK, index or row is touched, and
+        # re-running init_db on an already-migrated database is a
+        # harmless no-op.
+        for _facts_column in (
+            "wallet_debit_units INTEGER",
+            "user_destination TEXT",
+            "rejected_at TIMESTAMP",
+            "completed_at TIMESTAMP",
+        ):
+            try:
+                conn.execute(
+                    "ALTER TABLE withdrawal_requests ADD COLUMN "
+                    + _facts_column
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
@@ -837,6 +881,30 @@ def init_db(db_path: str | None = None) -> None:
         ensure_default_settings(conn)
 
         logger.info("Database initialized: %s", db_path or DB_PATH)
+
+
+def get_withdrawal_request(
+    request_id: str, db_path: str | None = None
+) -> dict | None:
+    """Read one withdrawal request by id (MT-ADMIN-19 read mapping).
+
+    Returns every stored column — including the additive facts
+    ``wallet_debit_units`` (USDT atomic units; NULL on legacy rows and
+    never reinterpreted), ``user_destination``, ``rejected_at`` and
+    ``completed_at`` — or None when the id is unknown.
+
+    Read-only mapping helper: no repository, status-transition or
+    money logic lives here (a future withdrawal service owns those).
+    ``user_destination`` is the USER's payout destination; it is never
+    logged raw and never merged with the platform's
+    ``payment_methods.destination``.
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def load_channels(db_path: str | None = None) -> None:
