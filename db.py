@@ -238,6 +238,7 @@ def init_db(db_path: str | None = None) -> None:
                 repeat_hours INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 reward_units INTEGER,
+                commission_units INTEGER,
                 CHECK (repeat_policy IN ('one_time', 'repeatable')),
                 CHECK (
                     (repeat_policy = 'one_time' AND repeat_hours IS NULL)
@@ -307,6 +308,21 @@ def init_db(db_path: str | None = None) -> None:
                 "UPDATE tasks SET reward_units = ? WHERE id = ?",
                 (units, row["id"]),
             )
+
+        # ── Advertiser commission snapshot (MT-ADMIN-16) ──────────
+        # Additive migration: ``commission_units`` is the EXACT atomic
+        # advertiser commission resolved from the platform setting
+        # ``advertiser_commission`` at task CREATION time — an integer
+        # snapshot written once and never recomputed (an admin setting
+        # change never alters an already-created task).  Rows created
+        # before this column stay NULL: their commission was never
+        # resolved, and inventing one here would rewrite history.
+        try:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN commission_units INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # ── User task state table ────────────────────────────────
         conn.execute("""
@@ -918,7 +934,8 @@ def create_task(title: str, description: str, task_type: str, reward: int,
                 repeat_policy: str = REPEAT_POLICY_ONE_TIME,
                 repeat_hours: int | None = None,
                 conn: sqlite3.Connection | None = None,
-                reward_units: int | None = None) -> int:
+                reward_units: int | None = None,
+                commission_units: int | None = None) -> int:
     """Create a new task definition. Returns the new task ID.
 
     Args:
@@ -936,6 +953,12 @@ def create_task(title: str, description: str, task_type: str, reward: int,
             the canonical reward parser — stored verbatim as the
             accounting authority.  When None, the MT-ADMIN-13
             whole-USDT derivation from ``reward`` still applies.
+        commission_units: Optional EXACT atomic advertiser-commission
+            snapshot (MT-ADMIN-16) resolved by the canonical creation
+            service from the runtime platform setting — stored
+            VERBATIM, never derived, never recomputed.  When None
+            (legacy/direct callers, pre-MT-ADMIN-16 rows) the column
+            stays NULL; nothing is invented.
     """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
@@ -966,6 +989,15 @@ def create_task(title: str, description: str, task_type: str, reward: int,
         or reward_units > _SQLITE_INT64_MAX
     ):
         raise ValueError("reward_units must be a non-negative int64")
+    # MT-ADMIN-16: the commission snapshot is an exact non-negative
+    # int64 of atomic units — validated, never coerced, never rounded.
+    if commission_units is not None and (
+        isinstance(commission_units, bool)
+        or not isinstance(commission_units, int)
+        or commission_units < 0
+        or commission_units > _SQLITE_INT64_MAX
+    ):
+        raise ValueError("commission_units must be a non-negative int64")
     repeat_policy, repeat_hours = validate_repeat_policy(
         repeat_policy, repeat_hours
     )
@@ -973,12 +1005,12 @@ def create_task(title: str, description: str, task_type: str, reward: int,
     insert_sql = (
         "INSERT INTO tasks "
         "(title, description, type, reward, active, task_data, "
-        " repeat_policy, repeat_hours, reward_units) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " repeat_policy, repeat_hours, reward_units, commission_units) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     values = (title.strip(), description.strip(), task_type.strip(), reward,
               int(active), task_data, repeat_policy, repeat_hours,
-              reward_units)
+              reward_units, commission_units)
 
     if conn is not None:
         cursor = conn.execute(insert_sql, values)
@@ -998,7 +1030,8 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT id, title, description, type, reward, reward_units, "
-            "active, task_data, repeat_policy, repeat_hours, created_at "
+            "commission_units, active, task_data, repeat_policy, "
+            "repeat_hours, created_at "
             "FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
@@ -1010,6 +1043,7 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
                 "type": row["type"],
                 "reward": row["reward"],
                 "reward_units": row["reward_units"],
+                "commission_units": row["commission_units"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],
@@ -1023,7 +1057,8 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
     """List all tasks, optionally filtering to active only."""
     with get_connection(db_path) as conn:
         columns = (
-            "id, title, description, type, reward, reward_units, active, "
+            "id, title, description, type, reward, reward_units, "
+            "commission_units, active, "
             "task_data, repeat_policy, repeat_hours, created_at"
         )
         if active_only:
@@ -1040,6 +1075,7 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
                 "type": row["type"],
                 "reward": row["reward"],
                 "reward_units": row["reward_units"],
+                "commission_units": row["commission_units"],
                 "active": bool(row["active"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],

@@ -26,6 +26,12 @@ What it guarantees on every call:
   (``parse_reward_units``, MT-ADMIN-14): decimal text → atomic
   ``reward_units`` int (the accounting authority written at creation);
   ``reward`` stays the whole-USDT compatibility/display field.
+- the advertiser commission is resolved from the admin-mutable
+  platform setting ``advertiser_commission`` on EVERY creation (fresh
+  read, no global cache, no restart) and snapshotted as the exact
+  atomic ``commission_units`` value for THIS task (MT-ADMIN-16):
+  integer basis points (10,000 = 100 %), ceiling rounding, no float;
+  a later setting change never alters an already-created task.
 - the produced task_data is proven by the very validator the reader
   side uses (``validate_telegram_channel_task_data`` /
   ``validate_manual_task_data``): the writer can never persist a
@@ -50,6 +56,7 @@ import re
 from dataclasses import dataclass
 
 import db
+import platform_settings
 import wallet
 from config import CHANNELS
 from manual_task import MANUAL_TASK_TYPE, validate_manual_task_data
@@ -196,6 +203,77 @@ def reward_payload_value(units: int) -> int | str:
     return reward_units_to_text(units)
 
 
+# ── Advertiser commission snapshot (MT-ADMIN-16) ────────────────────
+# The commission RATE is admin-mutable DATA — platform_settings key
+# ``advertiser_commission``, integer basis points on the MT-ADMIN-15
+# scale (COMMISSION_SCALE = 10,000 bp = 100 %, 3000 bp = 30 %).  It is
+# read fresh from SQLite on every creation (the settings service never
+# caches), so an admin change applies to the NEXT task with no bot
+# restart.  The value written to ``tasks.commission_units`` is the
+# exact atomic commission for THIS task's reward, resolved ONCE at
+# creation — an immutable snapshot: changing the setting later never
+# alters an existing task.
+#
+# This is the READ-PATH integration only.  Charging/collecting the
+# commission (advertiser funding, wallet movement — "commission on top
+# of the worker reward pool") is NOT implemented here: that belongs to
+# a later micro-task.  No float, no round(): exact Python int math.
+
+def commission_units_for(reward_units: int, commission_bp: int) -> int:
+    """Exact advertiser commission in atomic units for a reward.
+
+    Integer math only — never a float, never ``round()``:
+
+        commission_units = ceil(reward_units * commission_bp / 10,000)
+
+    computed exactly as ``(r * bp + SCALE - 1) // SCALE`` (a ceiling,
+    so the platform never under-collects — the same "round UP"
+    convention as ``withdrawal_rules.egp_to_usdt``).  The rule is
+    deterministic at every boundary:
+
+    * an exact multiple is NEVER bumped (``r * bp`` divisible by
+      10,000 → the quotient, unchanged);
+    * a partial unit always rounds UP to exactly 1 unit
+      (``commission_units_for(1, 3000) == 1``);
+    * zero rate or zero reward → exactly 0;
+    * ``commission_bp == 10000`` (100 %) → exactly ``reward_units``.
+
+    Args:
+        reward_units: exact atomic reward — non-negative ``int``.
+        commission_bp: commission in basis points, ``0..10,000``.
+            The caller resolves it from platform_settings
+            (``get_required_setting``), which already range-checks;
+            the guard here keeps this helper total and coercion-free.
+
+    Returns:
+        int — exact atomic commission units (always ≤ reward_units).
+
+    Raises:
+        ValueError: bool / float / negative / non-int / out-of-range
+            input — rejected, never coerced, never rounded.
+    """
+    if (
+        isinstance(reward_units, bool)
+        or not isinstance(reward_units, int)
+        or reward_units < 0
+        or reward_units > _SQLITE_INT64_MAX
+    ):
+        raise ValueError(
+            "reward_units must be a non-negative int of atomic units"
+        )
+    scale = platform_settings.COMMISSION_SCALE
+    if (
+        isinstance(commission_bp, bool)
+        or not isinstance(commission_bp, int)
+        or commission_bp < 0
+        or commission_bp > scale
+    ):
+        raise ValueError(
+            f"commission_bp must be an int in 0..{scale} basis points"
+        )
+    return (reward_units * commission_bp + scale - 1) // scale
+
+
 @dataclass(frozen=True)
 class TaskSpec:
     """Fully-resolved task definition — server-side, validated here.
@@ -334,8 +412,29 @@ def create_task_from_spec(
     zero rows.  With ``conn`` the INSERT joins the caller's open
     transaction (wizard publish CAS); without it this is a classic
     self-contained creation.
+
+    MT-ADMIN-16: before the write, the advertiser commission is
+    resolved from the runtime platform setting (fresh read on ``conn``
+    when given, so the wizard's transaction reads its own snapshot)
+    and computed into this task's exact ``commission_units`` snapshot.
+    A missing setting raises ``platform_settings.SettingNotFoundError``
+    BEFORE any row is written — explicit and safe, never a silent 0.
     """
     task_type, task_data = build_task_definition(spec)
+
+    # Resolve the admin-mutable commission (no global cache: runtime
+    # changes affect NEW creations only) and compute the snapshot —
+    # still pre-write, so any failure leaves zero rows behind.
+    commission_bp = platform_settings.get_required_setting(
+        platform_settings.ADVERTISER_COMMISSION, conn=conn
+    )
+    effective_units = spec.reward_units
+    if effective_units is None:
+        # Legacy TaskSpec(reward=...) without explicit units: the same
+        # exact whole-USDT derivation db.create_task applies (int math).
+        effective_units = spec.reward * wallet.USDT_SCALE
+    commission_units = commission_units_for(effective_units, commission_bp)
+
     task_id = db.create_task(
         spec.title,
         spec.description,
@@ -346,11 +445,14 @@ def create_task_from_spec(
         repeat_hours=spec.repeat_hours,
         conn=conn,
         reward_units=spec.reward_units,
+        commission_units=commission_units,
     )
     logger.info(
         "Task created from spec: id=%d type=%s provider=%s "
-        "action=%s verification=%s reward=%d reward_units=%s",
+        "action=%s verification=%s reward=%d reward_units=%s "
+        "commission_units=%d (commission_bp=%d)",
         task_id, task_type, spec.provider, spec.action,
         spec.verification, spec.reward, spec.reward_units,
+        commission_units, commission_bp,
     )
     return task_id
