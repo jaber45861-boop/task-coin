@@ -35,7 +35,11 @@ Design rules (MT-ADMIN-08):
   ``PaymentMethodInUseError`` — no archival machinery is invented.
 
 Conventions: writes go through ``db.transaction()`` (BEGIN IMMEDIATE);
-reads open their own ``db.get_connection()`` scope.  Every mutation
+reads open their own ``db.get_connection()`` scope — except
+``get_active_payment_method``, which also accepts a caller-owned
+``connection=`` (MT-ADMIN-23) so an atomic workflow can resolve its
+method inside its own transaction without a hidden second connection.
+Every mutation
 carries the acting admin id in ``created_by``/``updated_by`` plus a
 structured log line (method id + operation + admin — never the
 destination).
@@ -456,7 +460,10 @@ def get_payment_method(
 
 
 def get_active_payment_method(
-    method_id: object, db_path: str | None = None
+    method_id: object,
+    db_path: str | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> PaymentMethod:
     """Fetch ONE active payment method by id (strict lookup).
 
@@ -470,13 +477,26 @@ def get_active_payment_method(
     Read-only: listing/mutating nothing.  It exists so callers that
     must never surface a deactivated payout destination fail loudly
     instead of silently falling back.
+
+    Connection ownership (MT-ADMIN-23): with ``connection`` the lookup
+    runs on that exact caller-owned connection — borrowed, never
+    committed, rolled back or closed here — so an atomic workflow can
+    resolve its method inside its own transaction without opening a
+    hidden second connection.  Without it, the standard
+    ``db.get_connection()`` read scope opens exactly as before.
     """
     mid = _require_id(method_id, "method_id")
-    with db.get_connection(db_path) as conn:
-        row = conn.execute(
+    if connection is not None:
+        row = connection.execute(
             f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
             (mid,),
         ).fetchone()
+    else:
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
+                (mid,),
+            ).fetchone()
     if row is None:
         raise PaymentMethodNotFoundError(
             f"لا توجد وسيلة دفع بالمعرّف {mid}"
