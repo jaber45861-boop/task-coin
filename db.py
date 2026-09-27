@@ -871,6 +871,34 @@ def init_db(db_path: str | None = None) -> None:
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # ── MT-ADMIN-26: authoritative manual EGP-per-USDT rate ──────
+        # A DEDICATED singleton table — deliberately NOT
+        # platform_settings (integer-only by contract: fractional
+        # rates have no business there) and no REAL column anywhere.
+        #   id          singleton identity: exactly one row, id = 1
+        #   rate_usdt_egp  canonical plain-decimal TEXT (rate_quote
+        #               contract: "48", "48.5", "48.5001" — never
+        #               scientific notation, never a float)
+        #   provider    approved source id ("manual" only today)
+        #   captured_at server-generated aware UTC ISO-8601 instant
+        #               the rate applies from
+        #   updated_by  acting admin Telegram id (no-FK convention,
+        #               same as payment_methods/platform_settings)
+        #   updated_at  server-generated aware UTC ISO-8601 instant of
+        #               the last replace
+        # Additive + startup-safe: CREATE TABLE IF NOT EXISTS preserves
+        # an existing row on every restart; re-running init_db never
+        # overwrites the admin's current rate.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS current_rate (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                rate_usdt_egp TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                captured_at TIMESTAMP NOT NULL,
+                updated_by INTEGER NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # Seed the audited defaults for keys that have no row yet.
         # The key -> default registry is the single source of truth in
         # ``platform_settings``; the import is function-local on purpose
