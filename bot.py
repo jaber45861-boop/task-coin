@@ -48,6 +48,7 @@ import rate_admin
 import support_service
 import task_creation
 import task_taxonomy
+import withdrawal_admin
 from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
@@ -1960,6 +1961,15 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "setrate", rate_admin.setrate_command,
     ), group=0)
+    # MT-ADMIN-27: /withdrawals — admin review queue for pending
+    #    payout requests.  Private admin chat ONLY; authorization is
+    #    enforced inside the handler (config.is_admin) and every
+    #    mutation delegates to the existing WithdrawalService.
+    #    Not added to the BotCommand menu, same as the other admin
+    #    commands.
+    app.add_handler(CommandHandler(
+        "withdrawals", withdrawal_admin.withdrawals_command,
+    ), group=0)
     # MT-ADMIN-05: wizard free-text answers (title, target,
     #    instructions, reward, repeat hours).  Registered LAST in
     #    group 0 so the add/remove-channel conversations consume their
@@ -2033,6 +2043,15 @@ def main() -> None:
     #    field are re-read server-side from SQLite.
     app.add_handler(CallbackQueryHandler(
         payment_method_admin.payment_method_callback, pattern=r"^pm:",
+    ), group=5)
+
+    # MT-ADMIN-27: withdrawal review buttons (list/detail/confirm/
+    #    complete/reject).  Payloads are wd:<op>:<request id> lookup
+    #    pointers only — actor authorization and every fact are
+    #    re-read server-side, and the sole mutation path is the
+    #    existing WithdrawalService.
+    app.add_handler(CallbackQueryHandler(
+        withdrawal_admin.withdrawal_callback, pattern=r"^wd:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
