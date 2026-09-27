@@ -16,8 +16,12 @@ payment-method selection:
 - ``withdrawal_contract``         — wallet-debit calculators + error
                                     translation boundary (MT-ADMIN-21)
 - ``payment_method_store``        — strict active-method resolver
-- ``withdrawal_rules``            — approved policy (minimum, fee,
-                                    cooldown) — rules 1-11 unchanged
+- ``withdrawal_rules``            — approved policy (cooldown; the
+                                    Vodafone EGP minimum/fee) — rules
+                                    1-11 unchanged
+- ``platform_settings``           — configured withdrawal minimum/fee
+                                    (MT-ADMIN-24, read on the same
+                                    transaction connection)
 
 Deliberately NOT in this task: Mini App endpoints, Telegram handlers,
 admin review UI, deposit processing, live rate fetching (the caller
@@ -26,9 +30,11 @@ here), provider auto-routing and notifications.
 
 Create flow — ONE atomic transaction (part B)
 ---------------------------------------------
-    validate user + amount -> validate method -> resolve rate quote
-    -> resolve active payment method -> minimum/fee from the approved
-    contract -> exact facts + ``wallet_debit_units`` -> request_id
+    validate user + amount -> (inside the transaction) read the
+    platform withdrawal settings on the SAME connection -> validate
+    method -> resolve rate quote -> resolve active payment method ->
+    exact minimum/fee facts (configured settings for USDT, approved
+    EGP contract for Vodafone) + ``wallet_debit_units`` -> request_id
     -> cooldown check -> wallet reserve -> ledger hold -> repository
     insert -> COMMIT (the ``db.transaction()`` scope owns it).
 
@@ -45,13 +51,13 @@ wallet/ledger movement:
   ROUND_CEILING (never under-hold), via
   ``withdrawal_contract.egp_minor_to_wallet_debit`` — an explicit
   ``RateQuote`` is required.
-- USDT: ``amount_units + fee_units`` as a plain integer sum via
-  ``withdrawal_contract.usdt_wallet_debit`` — no rate enters the debit,
-  structurally no USDT -> EGP -> USDT round trip.  A quote is still
-  required for this method because the approved contract denominates
-  the minimum and fee in EGP (rules 3/5: 10 EGP minimum, 1 EGP fee,
-  converted once at the pinned rate) — that cross-currency step is the
-  fee/minimum path, never the wallet debit.
+- USDT: ``amount_units + withdrawal_fee_units`` as a plain integer
+  sum via ``withdrawal_contract.usdt_wallet_debit`` — no rate enters
+  the debit, structurally no USDT -> EGP -> USDT round trip.  The
+  configured fee (MT-ADMIN-24) is already exact atomic units, so no
+  conversion exists anywhere on this path.  A quote is still required
+  because the schema pins the rate columns and the EGP display facts
+  need it — display only, never the wallet debit.
 
 Rate snapshot (part E, F)
 -------------------------
@@ -80,11 +86,24 @@ destination is ever logged.
 
 Minimum / fee settings (part G)
 -------------------------------
-``platform_settings.minimum_withdrawal_units`` and
-``withdrawal_fee_units`` are NOT read here — their denomination is
-still open until MT-ADMIN-24.  The minimum/fee come solely from the
-already-approved ``withdrawal_rules`` contract (10 EGP / 1 EGP at the
-pinned rate for USDT), preserving the existing product boundary.
+Both settings are read INSIDE the create transaction on the same
+connection via ``platform_settings.get_required_setting(conn=...)`` —
+no fallback and no invented default: a missing key raises the
+existing ``SettingNotFoundError`` before any write, exactly per the
+platform-settings contract.
+
+- USDT BEP-20: ``minimum_withdrawal_units`` is authoritative and
+  compared with EXACT integer atomic units (the requested amount is
+  converted once to units; no Decimal/display comparison decides the
+  minimum), and ``withdrawal_fee_units`` is the exact fee added to
+  the debit (``wallet_debit_units = amount_units +
+  withdrawal_fee_units``, persisted as ``fee_native_minor``).
+- Vodafone Cash: the approved EGP contract is UNCHANGED (10 EGP
+  minimum, 1 EGP fee, one ceiling conversion).  Both settings are
+  denominated in USDT atomic units while that contract is
+  EGP-denominated, so applying them there would add a second fee in
+  the wrong unit — the unit conflict is reported with MT-ADMIN-24
+  rather than a silent contract change.
 
 Cooldown / one-pending (part H)
 -------------------------------
@@ -115,13 +134,16 @@ wallet errors become domain ``InsufficientBalanceError`` /
 method errors become ``PaymentMethodUnavailableError``; duplicate
 pending becomes ``PendingWithdrawalExistsError``; missing request /
 invalid state / legacy missing debit raise their domain errors;
-unexpected exceptions propagate unchanged (never swallowed).
+platform-settings failures (``SettingNotFoundError``) propagate
+unchanged — configuration is never silently substituted; unexpected
+exceptions propagate unchanged (never swallowed).
 
 Connection ownership (part M)
 -----------------------------
 The service owns the outer transaction.  Repository, wallet adapter,
-ledger adapter and the payment-method resolver all receive that exact
-``connection`` — no nested commit, no hidden ``db.get_connection()``
+ledger adapter, the payment-method resolver and the settings reads
+all receive that exact ``connection`` — no nested commit, no hidden
+``db.get_connection()``
 while a flow is active, rollback restores the complete
 pre-operation state.
 
@@ -139,6 +161,7 @@ from typing import Protocol
 
 import db
 import payment_method_store
+import platform_settings
 import rate_quote
 import wallet
 import withdrawal_contract
@@ -365,10 +388,12 @@ class WithdrawalService:
     ) -> WithdrawalRequest:
         """Create a PENDING withdrawal atomically (parts B-F).
 
-        One ``db.transaction()``: validate -> rate -> payment method ->
-        minimum/fee -> exact facts + ``wallet_debit_units`` ->
-        cooldown -> wallet reserve -> ledger hold -> repository insert.
-        Any failure rolls the WHOLE flow back.
+        One ``db.transaction()``: validate -> read the platform
+        withdrawal settings on the transaction connection -> rate ->
+        payment method -> exact minimum/fee facts + the authoritative
+        ``wallet_debit_units`` -> cooldown -> wallet reserve -> ledger
+        hold -> repository insert.  Any failure rolls the WHOLE flow
+        back.
 
         Args:
             user_id: existing Telegram user id (positive int).
@@ -382,8 +407,8 @@ class WithdrawalService:
                 naive or timezone-aware, normalized to UTC wall-clock.
             quote: explicit immutable ``RateQuote`` — required by both
                 methods (Vodafone for the wallet-debit conversion,
-                USDT for the EGP-denominated minimum/fee); never
-                fetched or invented here.
+                USDT for the pinned rate columns and the EGP display
+                facts); never fetched or invented here.
             request_id: optional explicit id (defaults to random hex).
 
         Returns:
@@ -398,6 +423,8 @@ class WithdrawalService:
             MissingRateError: no explicit ``RateQuote`` supplied.
             PaymentMethodUnavailableError: inactive/missing method.
             CooldownError: another request inside 24 hours.
+            SettingNotFoundError: a required platform withdrawal
+                setting has never been configured (no fallback).
             PendingWithdrawalExistsError: the one-pending invariant
                 won the race (everything rolled back).
             InsufficientBalanceError: wallet cannot cover the debit.
@@ -435,6 +462,24 @@ class WithdrawalService:
                 ):
                     raise ValidationError(f"no such user {user_id}")
 
+                # 1c. platform withdrawal settings — read on THIS
+                #     transaction connection so the create facts and
+                #     the configuration share one snapshot; a missing
+                #     key raises the platform-settings contract error
+                #     before anything is written (MT-ADMIN-24).
+                minimum_withdrawal_units = (
+                    platform_settings.get_required_setting(
+                        platform_settings.MINIMUM_WITHDRAWAL_UNITS,
+                        conn=conn,
+                    )
+                )
+                withdrawal_fee_units = (
+                    platform_settings.get_required_setting(
+                        platform_settings.WITHDRAWAL_FEE_UNITS,
+                        conn=conn,
+                    )
+                )
+
                 # 2. method (closed set, rules 8)
                 if method not in withdrawal_rules.SUPPORTED_METHODS:
                     raise InvalidMethodError(
@@ -471,20 +516,38 @@ class WithdrawalService:
                     payment_method_id, connection=conn
                 )
 
-                # 5. minimum/fee from the approved rules contract
-                #    (platform settings are deliberately NOT read —
-                #    denomination open until MT-ADMIN-24).
-                min_native = withdrawal_rules.min_native_for(
-                    method, quote.rate_usdt_egp
-                )
-                if dec_amount < min_native:
-                    raise InvalidAmountError(
-                        f"amount {dec_amount} is below the minimum "
-                        f"{min_native} for {method}"
+                # 5. minimum + fee: the configured USDT-unit settings
+                #    are authoritative for USDT (exact integers); the
+                #    Vodafone EGP contract is preserved unchanged
+                #    (part G — its units are incompatible with the
+                #    USDT-denominated settings).
+                if method == METHOD_VODAFONE_CASH:
+                    min_native = withdrawal_rules.min_native_for(
+                        method, quote.rate_usdt_egp
                     )
-                fee_native = withdrawal_rules.fee_native_for(
-                    method, quote.rate_usdt_egp
-                )
+                    if dec_amount < min_native:
+                        raise InvalidAmountError(
+                            f"amount {dec_amount} is below the minimum "
+                            f"{min_native} for {method}"
+                        )
+                    fee_native = withdrawal_rules.fee_native_for(
+                        method, quote.rate_usdt_egp
+                    )
+                else:  # METHOD_USDT_BEP20
+                    # exact integer atomic units — the authoritative
+                    # minimum check, never a Decimal comparison
+                    amount_units = wallet.decimal_to_units(
+                        dec_amount, field="amount"
+                    )
+                    if amount_units < minimum_withdrawal_units:
+                        raise InvalidAmountError(
+                            f"amount {dec_amount} is below the configured "
+                            f"minimum {minimum_withdrawal_units} atomic "
+                            "USDT units"
+                        )
+                    fee_native = wallet.units_to_decimal(
+                        withdrawal_fee_units
+                    )
 
                 # 6. exact facts + the authoritative wallet debit
                 rate_fields = rate_quote.rate_persistence_fields(quote)
@@ -517,14 +580,12 @@ class WithdrawalService:
                     )
                     fee_egp = withdrawal_rules.WITHDRAW_FEE_EGP
                     rate_usdt_egp = quote.rate_usdt_egp
+                    # plain integer sum: configured fee units, no rate
+                    # and no EGP conversion anywhere in the debit
                     wallet_debit = (
                         withdrawal_contract.usdt_wallet_debit(
-                            amount_units=wallet.decimal_to_units(
-                                amount_native, field="amount_native"
-                            ),
-                            fee_units=wallet.decimal_to_units(
-                                fee_native, field="fee_native"
-                            ),
+                            amount_units=amount_units,
+                            fee_units=withdrawal_fee_units,
                         )
                     )
 

@@ -89,8 +89,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
 
+import config
 import db
 import payment_method_store
+import platform_settings
 import wallet
 import withdrawal_rules
 import withdrawal_service
@@ -148,6 +150,10 @@ SUBCENT_AMOUNT_UNITS = 333_334
 SUBCENT_FEE_UNITS = 33_334
 SUBCENT_DEBIT = 366_668
 
+# Fixture admin for the MT-ADMIN-24 platform-settings writes (saved /
+# restored around every test, mirroring test_platform_settings).
+ADMIN_ID = 900_240
+
 USER_DEST = "+201001234567 (TEST)"
 PM_DESTINATION = "TEST-PLATFORM-DEST-9"
 USDT_SCALE = 100_000_000
@@ -155,6 +161,24 @@ USDT_SCALE = 100_000_000
 
 def _make_quote(rate) -> RateQuote:
     return RateQuote(rate, "manual", CAPTURED_AT)
+
+
+def _rate_derived_settings(rate) -> tuple[int, int]:
+    """MT-ADMIN-24 settings that match the approved EGP contract at
+    ``rate``: the 10 EGP minimum and 1 EGP fee expressed in exact USDT
+    atomic units.  The fixture configures these values so every
+    MT-ADMIN-23 expectation (amounts, fees, debits) stays byte-exact
+    while the service genuinely reads them from platform_settings.
+    """
+    minimum_units = wallet.decimal_to_units(
+        withdrawal_rules.min_native_for(METHOD_USDT_BEP20, rate),
+        field="minimum_withdrawal_units",
+    )
+    fee_units = wallet.decimal_to_units(
+        withdrawal_rules.fee_native_for(METHOD_USDT_BEP20, rate),
+        field="withdrawal_fee_units",
+    )
+    return minimum_units, fee_units
 
 
 class _FailingRepository(SqliteWithdrawalRepository):
@@ -191,6 +215,10 @@ class _Base(unittest.TestCase):
         db.init_db(self.db_path)
         self.svc = WithdrawalService(db_path=self.db_path)
         self.pm = self.create_method()
+        self._orig_admins = list(config.ADMINS)
+        config.ADMINS[:] = [ADMIN_ID]
+        self.addCleanup(self._restore_admins)
+        self.seed_withdrawal_settings(*_rate_derived_settings(RATE))
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -199,6 +227,9 @@ class _Base(unittest.TestCase):
             path = self.db_path + suffix
             if os.path.exists(path):
                 os.unlink(path)
+
+    def _restore_admins(self):
+        config.ADMINS[:] = self._orig_admins
 
     # ── seed helpers ───────────────────────────────────────────
 
@@ -230,6 +261,34 @@ class _Base(unittest.TestCase):
             )
         return method
 
+    def seed_withdrawal_settings(self, minimum_units: int,
+                                 fee_units: int) -> None:
+        """Configure minimum_withdrawal_units / withdrawal_fee_units
+        through the production platform-settings contract.
+
+        Runs on a caller-owned raw connection — deliberately NOT via
+        ``db.transaction()`` / ``db.get_connection()`` because some
+        tests spy on those while a create is in flight.  Values that
+        already match are left untouched, so a concurrent create only
+        ever reads.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            for key, value in (
+                (platform_settings.MINIMUM_WITHDRAWAL_UNITS,
+                 minimum_units),
+                (platform_settings.WITHDRAWAL_FEE_UNITS, fee_units),
+            ):
+                if platform_settings.get_setting(key, conn=conn) == value:
+                    continue
+                platform_settings.set_setting(
+                    key, value, admin_user_id=ADMIN_ID, conn=conn
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     def create_request(self, method=METHOD_VODAFONE_CASH, *,
                        user_id=501, now=NOW, quote=QUOTE, amount=None,
                        svc=None, **extra):
@@ -239,6 +298,15 @@ class _Base(unittest.TestCase):
                 if method == METHOD_VODAFONE_CASH
                 else Decimal("1.5")
             )
+        # MT-ADMIN-24: withdrawals read their minimum/fee from
+        # platform_settings — configure the rate-matching values for
+        # this quote before every create.
+        rate = (
+            quote.rate_usdt_egp
+            if isinstance(quote, RateQuote)
+            else RATE
+        )
+        self.seed_withdrawal_settings(*_rate_derived_settings(rate))
         kwargs = dict(
             payment_method_id=self.pm.id,
             user_destination=USER_DEST,
