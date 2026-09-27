@@ -140,13 +140,18 @@ const Wallet = (() => {
         // withdrawal form (withdrawal.js) — every API call and every
         // financial rule lives in that module and the backend, so
         // wallet.js still contains no fetch and no money handling.
-        // الإيداع stays UI-only (no deposit flow exists yet).
+        // MT-ADMIN-28: الإيداع likewise only OPENS the deposit panel
+        // (deposit.js); the backend owns every deposit rule.
         section.querySelectorAll('.wallet-action').forEach((btn) => {
             btn.addEventListener('click', () => {
                 _haptic();
                 if (btn.dataset.action === 'withdraw'
                         && typeof WithdrawalUI !== 'undefined') {
                     WithdrawalUI.open();
+                }
+                if (btn.dataset.action === 'deposit'
+                        && typeof DepositUI !== 'undefined') {
+                    DepositUI.open();
                 }
             });
         });

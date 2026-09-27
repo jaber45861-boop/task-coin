@@ -61,9 +61,13 @@ OP_PAGE = "page"
 OP_EDIT = "edit"
 OP_ON = "on"
 OP_OFF = "off"
+OP_DEPON = "depon"
+OP_DEPOFF = "depoff"
 OP_DEL = "del"
 OP_DEL_YES = "delyes"
-_OPS_WITH_ID = frozenset({OP_PAGE, OP_EDIT, OP_ON, OP_OFF, OP_DEL, OP_DEL_YES})
+_OPS_WITH_ID = frozenset(
+    {OP_PAGE, OP_EDIT, OP_ON, OP_OFF, OP_DEPON, OP_DEPOFF, OP_DEL, OP_DEL_YES}
+)
 _OPS_NO_ID = frozenset({OP_HELP, OP_LIST})
 _ALL_OPS = _OPS_WITH_ID | _OPS_NO_ID
 
@@ -86,6 +90,8 @@ BTN_EDIT = "✏️ تعديل"
 BTN_ACTIVATE = "🟢 تفعيل"
 BTN_DEACTIVATE = "🔴 تعطيل"
 BTN_DELETE = "🗑️ حذف"
+BTN_DEPOSIT_ON = "🟢 تفعيل الإيداع"
+BTN_DEPOSIT_OFF = "🔴 تعطيل الإيداع"
 BTN_DELETE_CONFIRM = "🗑️ تأكيد الحذف"
 BTN_CANCEL = "↩️ إلغاء"
 PAGE_NEXT = "التالي ▶️"
@@ -93,6 +99,8 @@ PAGE_PREV = "◀️ السابق"
 
 STATUS_ACTIVE = "🟢 نشطة"
 STATUS_INACTIVE = "🔴 متوقفة"
+DEPOSIT_ON = "الإيداع: 🟢 متاح"
+DEPOSIT_OFF = "الإيداع: 🔴 غير متاح"
 
 DEST_LABEL = {"crypto": "العنوان", "cash": "الحساب"}
 
@@ -249,6 +257,9 @@ def _method_lines(
         lines.append(
             f"   {STATUS_ACTIVE if method.is_active else STATUS_INACTIVE}"
         )
+        lines.append(
+            f"   {DEPOSIT_ON if method.deposits_enabled else DEPOSIT_OFF}"
+        )
         lines.append("")
     return lines
 
@@ -272,6 +283,14 @@ def _method_buttons(method: PaymentMethod) -> list[InlineKeyboardButton]:
         toggle,
         InlineKeyboardButton(
             BTN_DELETE, callback_data=f"{CB_PREFIX}:{OP_DEL}:{method.id}"
+        ),
+        InlineKeyboardButton(
+            BTN_DEPOSIT_ON if not method.deposits_enabled else BTN_DEPOSIT_OFF,
+            callback_data=(
+                f"{CB_PREFIX}:"
+                f"{OP_DEPON if not method.deposits_enabled else OP_DEPOFF}:"
+                f"{method.id}"
+            ),
         ),
     ]
 
@@ -618,6 +637,27 @@ async def payment_method_callback(update, context) -> None:
                 return
             await _safe_answer(query, None)
             state = "تم تفعيل" if updated.is_active else "تم تعطيل"
+            await _safe_edit(
+                query,
+                f"✅ {state} الوسيلة #{updated.id}",
+                _list_again_button(),
+            )
+            return
+
+        # MT-ADMIN-28: explicit deposit availability — the ONLY way a
+        # method becomes a user deposit destination.
+        if op in (OP_DEPON, OP_DEPOFF):
+            updated = store.set_payment_method_deposits_enabled(
+                method.id, op == OP_DEPON, updated_by=actor
+            )
+            if updated is None:
+                await _safe_answer(query, MSG_NOT_FOUND)
+                return
+            await _safe_answer(query, None)
+            state = (
+                "تم تفعيل الإيداع لـ" if op == OP_DEPON
+                else "تم تعطيل الإيداع لـ"
+            )
             await _safe_edit(
                 query,
                 f"✅ {state} الوسيلة #{updated.id}",

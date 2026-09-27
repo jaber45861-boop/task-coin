@@ -827,6 +827,8 @@ def init_db(db_path: str | None = None) -> None:
                 instructions TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1
                     CHECK (is_active IN (0, 1)),
+                deposits_enabled INTEGER NOT NULL DEFAULT 0
+                    CHECK (deposits_enabled IN (0, 1)),
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_by INTEGER,
                 updated_by INTEGER,
@@ -834,10 +836,66 @@ def init_db(db_path: str | None = None) -> None:
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # ── Deposit availability (MT-ADMIN-28) ──────────────────────
+        # Additive migration only: ONE new column on payment_methods.
+        # `category` is the crypto/cash payment concept and is NOT
+        # overloaded — deposit availability is its own explicit flag,
+        # defaulting to 0 so NO existing method silently becomes a
+        # deposit method.  Existing rows/columns and every pre-existing
+        # CHECK are untouched; re-running init_db is a harmless no-op.
+        try:
+            conn.execute(
+                "ALTER TABLE payment_methods ADD COLUMN "
+                "deposits_enabled INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (deposits_enabled IN (0, 1))"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Deterministic display order (sort_order ASC, id ASC).
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_payment_methods_order
             ON payment_methods (sort_order, id)
+        """)
+
+        # ── User deposit intents (MT-ADMIN-28) ──────────────────────
+        # Additive migration only: a brand-new table — no existing
+        # table, column or row is touched.  This is the deposit
+        # REQUEST/instruction record only: creating a row never moves
+        # money.  amount_units is integer USDT atomic units (never
+        # REAL, never 2-decimal accounting).  status starts at
+        # 'pending' (unverified) from the user flow and may only
+        # become 'credited'/'rejected' through a future authoritative
+        # verification event — no such source exists yet.  The pm_*
+        # columns snapshot the configured method's user-relevant facts
+        # (including the PLATFORM deposit destination) at request time
+        # so later admin edits never rewrite historical instructions.
+        # external_tx_id is the future idempotency key: NULL now —
+        # never fabricated — with a partial UNIQUE index so one
+        # external transaction can never be credited twice.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deposit_requests (
+                request_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                payment_method_id INTEGER NOT NULL,
+                amount_units INTEGER NOT NULL CHECK (amount_units > 0),
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'credited', 'rejected')),
+                pm_display_name TEXT NOT NULL,
+                pm_asset TEXT NOT NULL,
+                pm_network TEXT,
+                pm_provider TEXT NOT NULL,
+                pm_destination TEXT NOT NULL,
+                external_tx_id TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (payment_method_id) REFERENCES payment_methods(id)
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_deposit_requests_tx
+            ON deposit_requests (external_tx_id)
+            WHERE external_tx_id IS NOT NULL
         """)
 
         # ── Admin platform settings (MT-ADMIN-15) ─────────────────

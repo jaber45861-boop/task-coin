@@ -136,6 +136,13 @@ class PaymentMethod:
     updated_by: int | None
     created_at: str
     updated_at: str
+    # MT-ADMIN-28 additive flag: explicitly configured as a USER
+    # DEPOSIT method (the platform receives funds here).  Defaults to
+    # False so no method ever silently becomes a deposit method —
+    # an admin opts a method in through the existing control plane.
+    # Deliberately NOT expressed through `category` (crypto/cash is
+    # the payment concept, not deposit/withdrawal availability).
+    deposits_enabled: bool = False
 
 
 # ── Generic validation (no network/provider knowledge) ────────────────
@@ -318,8 +325,8 @@ def validate_form(
 
 _COLUMNS = (
     "id, category, display_name, asset, network, provider, destination, "
-    "instructions, is_active, sort_order, created_by, updated_by, "
-    "created_at, updated_at"
+    "instructions, is_active, deposits_enabled, sort_order, created_by, "
+    "updated_by, created_at, updated_at"
 )
 
 
@@ -334,6 +341,7 @@ def _row_to_method(row) -> PaymentMethod:
         destination=row["destination"],
         instructions=row["instructions"],
         is_active=bool(row["is_active"]),
+        deposits_enabled=bool(row["deposits_enabled"]),
         sort_order=row["sort_order"],
         created_by=row["created_by"],
         updated_by=row["updated_by"],
@@ -632,6 +640,56 @@ def set_payment_method_active(
     logger.info(
         "Payment method %s: id=%d admin=%r",
         "activated" if is_active else "deactivated",
+        changed.id, actor,
+    )
+    return changed
+
+
+# ── Deposit availability (MT-ADMIN-28; idempotent) ─────────────────
+
+
+def set_payment_method_deposits_enabled(
+    method_id: object,
+    deposits_enabled: object,
+    *,
+    updated_by: object = None,
+    db_path: str | None = None,
+) -> PaymentMethod | None:
+    """Set the explicit deposit-availability flag on one method.
+
+    This is the ONLY way a method becomes (or stops being) a user
+    deposit method — active status alone never implies deposits.
+    Returns the row afterwards, or None when the id does not exist.
+    Running the same toggle twice is a harmless no-op write.
+    """
+    mid = _require_id(method_id, "method_id")
+    if not isinstance(deposits_enabled, bool):
+        raise PaymentMethodValidationError(
+            "deposits_enabled: قيمة منطقية مطلوبة"
+        )
+    actor = _require_admin_id(updated_by, "updated_by")
+
+    with db.transaction(db_path) as conn:
+        existing = conn.execute(
+            "SELECT id FROM payment_methods WHERE id = ?", (mid,)
+        ).fetchone()
+        if existing is None:
+            return None
+        conn.execute(
+            "UPDATE payment_methods SET deposits_enabled = ?, "
+            "updated_by = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (1 if deposits_enabled else 0, actor, mid),
+        )
+        row = conn.execute(
+            f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
+            (mid,),
+        ).fetchone()
+
+    changed = _row_to_method(row)
+    logger.info(
+        "Payment method deposits %s: id=%d admin=%r",
+        "enabled" if deposits_enabled else "disabled",
         changed.id, actor,
     )
     return changed
