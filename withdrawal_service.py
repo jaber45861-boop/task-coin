@@ -217,6 +217,23 @@ class PaymentMethodResolver(Protocol):
     ) -> payment_method_store.PaymentMethod: ...
 
 
+class QuoteLoader(Protocol):
+    """Authoritative current-rate lookup on a caller-owned connection
+    (MT-ADMIN-25).
+
+    Implementations READ ONLY on the given connection — they never
+    commit, roll back or close it, and never open a second
+    transaction — so the loaded quote shares the EXACT snapshot of
+    the financial mutation that consumes it (no quote/transaction
+    race).  ``rate_store.get_current_quote`` satisfies this
+    boundary.
+    """
+
+    def __call__(
+        self, *, connection: sqlite3.Connection
+    ) -> RateQuote: ...
+
+
 # ── Exact input helpers (validation only — no business policy) ──────
 
 
@@ -343,6 +360,13 @@ class WithdrawalService:
         ledger_port: ledger boundary (default: ``SqliteLedgerAdapter``).
         payment_method_resolver: strict active-method lookup
             (default: ``payment_method_store.get_active_payment_method``).
+        quote_loader: optional authoritative current-rate boundary
+            (MT-ADMIN-25) — used only when ``create`` receives NO
+            explicit quote: the quote is loaded on the transaction's
+            OWN connection, inside the one financial transaction.
+            ``None`` (default) keeps the original explicit-quote-only
+            contract exactly (``MissingRateError`` when none is
+            supplied).
     """
 
     def __init__(
@@ -353,6 +377,7 @@ class WithdrawalService:
         wallet_port: WalletPort | None = None,
         ledger_port: LedgerPort | None = None,
         payment_method_resolver: PaymentMethodResolver | None = None,
+        quote_loader: QuoteLoader | None = None,
     ) -> None:
         self._db_path = db_path
         self._repository = (
@@ -371,6 +396,10 @@ class WithdrawalService:
             if payment_method_resolver is not None
             else payment_method_store.get_active_payment_method
         )
+        # MT-ADMIN-25: no default loader — the authoritative source is
+        # an INJECTED boundary (same pattern as wallet/ledger/resolver),
+        # so a service built without one behaves exactly as before.
+        self._quote_loader = quote_loader
 
     # ── create (part B) ──────────────────────────────────────────
 
@@ -408,7 +437,16 @@ class WithdrawalService:
             quote: explicit immutable ``RateQuote`` — required by both
                 methods (Vodafone for the wallet-debit conversion,
                 USDT for the pinned rate columns and the EGP display
-                facts); never fetched or invented here.
+                facts); never fetched or invented here.  When None
+                AND the service was built with a ``quote_loader``
+                (MT-ADMIN-25), the authoritative current quote is
+                loaded instead — on THIS transaction's connection,
+                inside the same ``BEGIN IMMEDIATE`` scope, so the
+                pinned rate and the financial facts always share one
+                snapshot and no second transaction exists.  A quote
+                is NEVER taken from the client.  With neither an
+                explicit quote nor a loader, the original
+                ``MissingRateError`` contract applies unchanged.
             request_id: optional explicit id (defaults to random hex).
 
         Returns:
@@ -420,7 +458,8 @@ class WithdrawalService:
             InvalidMethodError: unsupported method.
             InvalidAmountError: non-positive, float, wrong precision,
                 below minimum, out of range.
-            MissingRateError: no explicit ``RateQuote`` supplied.
+            MissingRateError: no explicit ``RateQuote`` supplied and
+                no ``quote_loader`` boundary is configured.
             PaymentMethodUnavailableError: inactive/missing method.
             CooldownError: another request inside 24 hours.
             SettingNotFoundError: a required platform withdrawal
@@ -498,8 +537,18 @@ class WithdrawalService:
                 )
 
                 # 3. rate: BOTH methods cross the currency boundary
-                #    exactly once (wallet debit / minimum+fee) and a
-                #    quote is never fetched or invented here.
+                #    exactly once (wallet debit / minimum+fee).
+                #    An explicit quote (MT-ADMIN-23) always wins; with
+                #    none, the optional quote_loader boundary
+                #    (MT-ADMIN-25) reads the authoritative rate on
+                #    THIS transaction's connection — same snapshot as
+                #    every other read above, so quote freshness and
+                #    the mutation cannot race and no second
+                #    transaction is opened.  With neither, the
+                #    contract is unchanged: rates are never fetched
+                #    or invented here.
+                if quote is None and self._quote_loader is not None:
+                    quote = self._quote_loader(connection=conn)
                 if quote is None:
                     raise MissingRateError(
                         f"{method} requires an explicit RateQuote — "

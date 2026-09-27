@@ -18,6 +18,7 @@ from flask import Flask, send_from_directory
 
 from social_routes import social_bp
 from task_routes import tasks_bp
+from withdrawal_routes import withdrawal_bp
 
 app = Flask(__name__)
 
@@ -26,6 +27,9 @@ app = Flask(__name__)
 app.register_blueprint(social_bp)
 # Production Task pipeline wiring (MT-TASK-03): list/start/submit.
 app.register_blueprint(tasks_bp)
+# User withdrawal flow (MT-ADMIN-25): methods + create via
+# WithdrawalService — the HTTP layer owns no transaction.
+app.register_blueprint(withdrawal_bp)
 
 MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp")
 

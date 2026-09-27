@@ -135,9 +135,20 @@ const Wallet = (() => {
             </div>
         `;
 
-        // UI-only in MT-UI-03: haptic acknowledgement, no financial logic.
+        // MT-UI-03 haptic acknowledgement, no financial logic in this
+        // file.  MT-ADMIN-25: the السحب button only OPENS the
+        // withdrawal form (withdrawal.js) — every API call and every
+        // financial rule lives in that module and the backend, so
+        // wallet.js still contains no fetch and no money handling.
+        // الإيداع stays UI-only (no deposit flow exists yet).
         section.querySelectorAll('.wallet-action').forEach((btn) => {
-            btn.addEventListener('click', _haptic);
+            btn.addEventListener('click', () => {
+                _haptic();
+                if (btn.dataset.action === 'withdraw'
+                        && typeof WithdrawalUI !== 'undefined') {
+                    WithdrawalUI.open();
+                }
+            });
         });
 
         return section;

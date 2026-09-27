@@ -1534,9 +1534,12 @@ def create_mini_app() -> Flask:
     process serves the Tasks page API as well.
     """
     from task_routes import tasks_bp
+    # MT-ADMIN-25: user withdrawal API (methods + create).
+    from withdrawal_routes import withdrawal_bp
 
     mini_app = Flask(__name__)
     mini_app.register_blueprint(tasks_bp)
+    mini_app.register_blueprint(withdrawal_bp)
     miniapp_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "miniapp"
     )
