@@ -43,6 +43,7 @@ import db
 import admin_review_queue
 import admin_task_wizard
 import manual_proof_inbox
+import deposit_proof_admin
 import payment_method_admin
 import rate_admin
 import support_service
@@ -1973,6 +1974,16 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "withdrawals", withdrawal_admin.withdrawals_command,
     ), group=0)
+    # MT-ADMIN-31: /deposits — admin review queue for manual deposit
+    #    proof screenshots.  Private admin chat ONLY; authorization
+    #    is enforced inside the handler (config.is_admin) and the
+    #    sole financial credit path is the existing trusted manual
+    #    review service — a screenshot alone credits nothing.  Not
+    #    added to the BotCommand menu, same as the other admin
+    #    commands.
+    app.add_handler(CommandHandler(
+        "deposits", deposit_proof_admin.deposits_command,
+    ), group=0)
     # MT-ADMIN-05: wizard free-text answers (title, target,
     #    instructions, reward, repeat hours).  Registered LAST in
     #    group 0 so the add/remove-channel conversations consume their
@@ -2055,6 +2066,15 @@ def main() -> None:
     #    existing WithdrawalService.
     app.add_handler(CallbackQueryHandler(
         withdrawal_admin.withdrawal_callback, pattern=r"^wd:",
+    ), group=5)
+
+    # MT-ADMIN-31: deposit proof review buttons (list/detail/
+    #    confirm/approve/reject).  Payloads are dp:<op>:<proof id>
+    #    lookup pointers only — actor authorization and every fact
+    #    are re-read server-side; the screenshot is evidence for the
+    #    admin's manual verification and never credits by itself.
+    app.add_handler(CallbackQueryHandler(
+        deposit_proof_admin.proof_callback, pattern=r"^dp:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.

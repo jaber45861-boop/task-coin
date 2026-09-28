@@ -16,6 +16,12 @@ Endpoints (all under ``/api/deposit``):
                                   included — it is where the user must
                                   SEND funds)
 - ``POST /api/deposit``          persist one PENDING deposit intent
+- ``POST /api/deposit/proof``    upload a payment screenshot for
+                                  MANUAL admin review (MT-ADMIN-31)
+                                  — evidence only: it never credits
+                                  a wallet, never writes the ledger
+                                  and never changes the deposit's
+                                  financial status
 
 Architecture boundary (critical):
 
@@ -49,10 +55,13 @@ Security rules enforced here:
 
 import logging
 import os
+import uuid
 
 from flask import Blueprint, jsonify, request
 
 import db
+import deposit_proof_storage
+import deposit_proof_store
 import deposit_store
 import miniapp_auth
 import payment_method_store
@@ -85,6 +94,20 @@ _MSG_PM_UNAVAILABLE = "وسيلة الدفع غير متاحة حالياً"
 _MSG_NOT_DEPOSIT_METHOD = "هذه الوسيلة غير متاحة للإيداع حالياً"
 _MSG_SETTINGS_MISSING = "إعدادات الإيداع غير مكتملة، تواصل مع الإدارة"
 _MSG_CREATED = "تم إنشاء طلب الإيداع — بانتظار التحقق من الدفع"
+
+# ── Manual proof upload messages (MT-ADMIN-31) ────────────────────
+
+# The ONLY success claim of this endpoint — review pending, nothing
+# more.  "تم استلام الأموال" / "تم إضافة الرصيد" / "تم اعتماد الدفع"
+# are deliberately absent: funds are never claimed by an upload.
+_MSG_PROOF_SUBMITTED = "تم إرسال إثبات الدفع للمراجعة"
+_MSG_INVALID_UPLOAD = "صورة الإثبات غير صالحة"
+_MSG_UNSUPPORTED_TYPE = "الملف ليس صورة مدعومة (PNG أو JPG أو GIF)"
+_MSG_FILE_TOO_LARGE = "حجم الصورة كبير جداً"
+_MSG_PROOF_REQUEST_NOT_FOUND = "طلب الإيداع غير موجود"
+_MSG_PROOF_FORBIDDEN = "لا يمكنك إرسال إثبات لهذا الطلب"
+_MSG_PROOF_REQUEST_PROCESSED = "تمت معالجة طلب الإيداع بالفعل"
+_MSG_PROOF_PENDING = "إثبات الدفع قيد المراجعة بالفعل"
 
 
 # ── Authentication (existing miniapp_auth initData validation) ────────
@@ -340,5 +363,165 @@ def create_deposit():
             "ok": True,
             "message": _MSG_CREATED,
             "request": _request_payload(created),
+        }
+    ), 200
+
+
+# ── POST /api/deposit/proof — manual proof evidence (MT-ADMIN-31) ─
+
+
+def _proof_error(exc: Exception):
+    """Translate a proof upload error into a safe API error.
+
+    Returns ``None`` for unexpected exceptions (the caller falls
+    back to the generic server error).  Subclasses are checked
+    before their bases; internal details never reach the client.
+    """
+    if isinstance(exc, deposit_proof_storage.UnsupportedImageTypeError):
+        return _error(exc.code, _MSG_UNSUPPORTED_TYPE, 400)
+    if isinstance(exc, deposit_proof_storage.ImageTooLargeError):
+        return _error(exc.code, _MSG_FILE_TOO_LARGE, 400)
+    if isinstance(exc, deposit_proof_storage.ProofImageError):
+        return _error(exc.code, _MSG_INVALID_UPLOAD, 400)
+    if isinstance(exc, deposit_proof_store.ProofRequestNotFoundError):
+        return _error(exc.code, _MSG_PROOF_REQUEST_NOT_FOUND, 404)
+    if isinstance(exc, deposit_proof_store.ProofOwnershipError):
+        return _error(exc.code, _MSG_PROOF_FORBIDDEN, 403)
+    if isinstance(exc, deposit_proof_store.ProofDepositNotPendingError):
+        return _error(exc.code, _MSG_PROOF_REQUEST_PROCESSED, 409)
+    if isinstance(exc, deposit_proof_store.ProofAlreadyPendingError):
+        return _error(exc.code, _MSG_PROOF_PENDING, 409)
+    if isinstance(exc, deposit_proof_store.DepositProofError):
+        return _error(exc.code, _MSG_INVALID_UPLOAD, 400)
+    return None
+
+
+@deposit_bp.post("/api/deposit/proof")
+def submit_deposit_proof():
+    """Upload one payment screenshot as MANUAL review evidence.
+
+    Identity comes only from cryptographically verified initData — a
+    ``user_id`` anywhere in the body/form/query is ignored.  The
+    content is validated by MAGIC BYTES (PNG/JPEG/GIF) with bounded
+    size and dimensions; the client filename and claimed MIME type
+    are never trusted or stored.  The bytes go to the server-side
+    evidence store, the row records request/user/metadata — this
+    handler opens NO financial transaction and can never credit a
+    wallet, write the ledger or change the deposit's status.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    # ── transport validation (shapes only, no policy invention) ──
+    request_id = request.form.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+    request_id = request_id.strip()
+
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return _error("invalid_upload", _MSG_INVALID_UPLOAD, 400)
+
+    # ── ownership + financial state BEFORE reading the payload ───
+    deposit_request = deposit_store.get_deposit_request(request_id)
+    if deposit_request is None:
+        return _error(
+            "request_not_found", _MSG_PROOF_REQUEST_NOT_FOUND, 404
+        )
+    if deposit_request.user_id != user_id:
+        return _error("request_forbidden", _MSG_PROOF_FORBIDDEN, 403)
+    if deposit_request.status != deposit_store.STATUS_PENDING:
+        return _error(
+            "request_processed", _MSG_PROOF_REQUEST_PROCESSED, 409
+        )
+    if deposit_proof_store.get_pending_proof(request_id) is not None:
+        return _error("proof_pending_review", _MSG_PROOF_PENDING, 409)
+
+    # ── bounded read + content sniffing (client MIME ignored) ────
+    try:
+        data = upload.read(deposit_proof_storage.MAX_IMAGE_BYTES + 1)
+        if not data:
+            return _error("invalid_upload", _MSG_INVALID_UPLOAD, 400)
+        if len(data) > deposit_proof_storage.MAX_IMAGE_BYTES:
+            return _error(
+                "file_too_large", _MSG_FILE_TOO_LARGE, 400
+            )
+        mime, ext, width, height = deposit_proof_storage.probe_image(
+            data
+        )
+    except deposit_proof_storage.ProofImageError as exc:
+        return _proof_error(exc)
+    except Exception:
+        logger.exception(
+            "Deposit proof read failed: request=%s user=%s",
+            request_id, user_id,
+        )
+        return _server_error()
+
+    # ── evidence file + row (server-generated key; client name
+    #    never used).  A store failure removes the just-written
+    #    file — no orphan evidence, no partial row. ────────────────
+    proof_id = uuid.uuid4().hex
+    try:
+        storage_key = deposit_proof_storage.save_image(
+            data, proof_id=proof_id, ext=ext
+        )
+    except Exception:
+        logger.exception(
+            "Deposit proof storage failed: request=%s user=%s",
+            request_id, user_id,
+        )
+        return _server_error()
+
+    try:
+        proof = deposit_proof_store.submit_proof(
+            request_id=request_id,
+            user_id=user_id,
+            storage_key=storage_key,
+            mime_type=mime,
+            size_bytes=len(data),
+            width=width,
+            height=height,
+        )
+    except deposit_proof_store.DepositProofError as exc:
+        deposit_proof_storage.delete_image(storage_key)
+        api_error = _proof_error(exc)
+        if api_error is not None:
+            logger.info(
+                "Deposit proof rejected: request=%s user=%s — %s",
+                request_id, user_id, type(exc).__name__,
+            )
+            return api_error
+        logger.exception(
+            "Deposit proof persist failed: request=%s user=%s",
+            request_id, user_id,
+        )
+        return _server_error()
+    except Exception:
+        deposit_proof_storage.delete_image(storage_key)
+        logger.exception(
+            "Deposit proof persist failed unexpectedly: "
+            "request=%s user=%s",
+            request_id, user_id,
+        )
+        return _server_error()
+
+    logger.info(
+        "Deposit proof uploaded: request=%s user=%s proof=%s "
+        "bytes=%d",
+        request_id, user_id, proof.proof_id, len(data),
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "message": _MSG_PROOF_SUBMITTED,
+            "proof": {
+                "proof_id": proof.proof_id,
+                "request_id": proof.request_id,
+                "status": proof.status,
+                "created_at": proof.created_at,
+            },
         }
     ), 200

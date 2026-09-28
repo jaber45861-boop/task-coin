@@ -898,6 +898,54 @@ def init_db(db_path: str | None = None) -> None:
             WHERE external_tx_id IS NOT NULL
         """)
 
+        # ── Manual deposit proof evidence (MT-ADMIN-31) ──────────────
+        # Additive migration only: a brand-new EVIDENCE table — no
+        # existing table, column, row, financial CHECK constraint or
+        # unique index is touched.  A proof row associates an
+        # admin-reviewable screenshot reference with a deposit
+        # REQUEST; it is never a financial fact: submitting a proof
+        # never changes deposit_requests.status (still exactly
+        # pending/credited/rejected) and no credit path exists here.
+        # storage_key is a server-generated relative filename — image
+        # bytes live on disk (never in SQLite) and client filenames
+        # are never stored.  The partial UNIQUE index allows at most
+        # ONE pending-review proof per request, so a repeat upload is
+        # a deterministic business response while a reviewed proof
+        # (approved/rejected evidence) is never overwritten or
+        # deleted.  reviewed_by/reviewed_at record WHO decided and
+        # WHEN; review_note optionally records a safe reason.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deposit_proofs (
+                proof_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                storage_key TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+                width INTEGER,
+                height INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending_review'
+                    CHECK (status IN
+                        ('pending_review', 'approved', 'rejected')),
+                review_note TEXT,
+                reviewed_by INTEGER,
+                reviewed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (request_id)
+                    REFERENCES deposit_requests(request_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_deposit_proofs_pending
+            ON deposit_proofs (request_id)
+            WHERE status = 'pending_review'
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_deposit_proofs_status
+            ON deposit_proofs (status, created_at)
+        """)
+
         # ── Admin platform settings (MT-ADMIN-15) ─────────────────
         # Additive migration only: a brand-new table — no existing
         # table, column or row is touched, and no financial data is

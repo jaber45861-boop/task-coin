@@ -25,6 +25,10 @@ task_coin.db
 task_coin.db-wal
 task_coin.db-shm
 
+# Manual deposit proof screenshots (MT-ADMIN-31) — evidence files
+# live on disk, never in git
+deposit_proof_uploads/
+
 # IDE
 .vscode/
 .idea/

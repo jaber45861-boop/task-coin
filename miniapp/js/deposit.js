@@ -20,12 +20,19 @@
  * - a created deposit request is ALWAYS pending/unverified: this UI
  *   never claims funds were received — there is no
  *   blockchain/confirmation UI here by design.
+ * - POST /api/deposit/proof → upload ONE payment screenshot for
+ *   MANUAL admin review (MT-ADMIN-31).  The image is EVIDENCE only:
+ *   the only success claim this flow may show is
+ *   “تم إرسال إثبات الدفع للمراجعة” — never that funds arrived or
+ *   were added.  Identity still comes only from initData; no user id,
+ *   amount, decision or verification fact is ever sent from here.
  * - server Arabic messages (with stable-code fallbacks) decide every
  *   error state; no request payload is ever logged.
  */
 const DepositUI = (() => {
     const METHODS_URL = '/api/deposit/methods';
     const CREATE_URL = '/api/deposit';
+    const PROOF_URL = '/api/deposit/proof';
     const INIT_DATA_HEADER = 'X-Telegram-Init-Data';
 
     // Arabic fallbacks keyed by the backend's stable error codes.
@@ -39,6 +46,13 @@ const DepositUI = (() => {
         payment_method_unavailable: 'وسيلة الدفع غير متاحة حالياً',
         deposit_method_unavailable: 'هذه الوسيلة غير متاحة للإيداع حالياً',
         deposit_settings_missing: 'إعدادات الإيداع غير مكتملة، تواصل مع الإدارة',
+        request_not_found: 'طلب الإيداع غير موجود',
+        request_forbidden: 'لا يمكنك إرسال إثبات لهذا الطلب',
+        request_processed: 'تمت معالجة طلب الإيداع بالفعل',
+        proof_pending_review: 'إثبات الدفع قيد المراجعة بالفعل',
+        invalid_upload: 'صورة الإثبات غير صالحة',
+        unsupported_image_type: 'الملف ليس صورة مدعومة (PNG أو JPG أو GIF)',
+        file_too_large: 'حجم الصورة كبير جداً',
         server_error: 'حدث خطأ غير متوقع، حاول مرة أخرى',
         network: 'تعذر الاتصال بالخادم، حاول مرة أخرى'
     };
@@ -396,6 +410,20 @@ const DepositUI = (() => {
                         data-testid="deposit-created-at"
                         >${_esc(request.created_at)}</dd></div>
                 </dl>
+                <div class="withdrawal-field"
+                     data-testid="deposit-proof-section">
+                    <span class="withdrawal-label">إثبات الدفع
+                        (صورة الإيصال)</span>
+                    <input type="file"
+                           accept="image/png,image/jpeg,image/gif"
+                           data-testid="deposit-proof-file">
+                    <div class="withdrawal-error"
+                         data-testid="deposit-proof-error"
+                         hidden></div>
+                    <button type="button" class="withdrawal-submit"
+                            data-testid="deposit-proof-submit"
+                            >📤 إرسال إثبات الدفع</button>
+                </div>
                 <button type="button" class="withdrawal-submit"
                         data-testid="deposit-done">تم</button>
             </div>`;
@@ -403,6 +431,94 @@ const DepositUI = (() => {
             '[data-testid="deposit-done"]'
         );
         done.addEventListener('click', close);
+        overlay.querySelector('[data-testid="deposit-proof-submit"]')
+            .addEventListener('click', () => _uploadProof(request));
+    }
+
+    /* ── Manual proof upload (EVIDENCE ONLY — MT-ADMIN-31) ─────── */
+
+    function _proofError(message) {
+        const box = overlay.querySelector(
+            '[data-testid="deposit-proof-error"]'
+        );
+        if (box) {
+            box.textContent = message;
+            box.hidden = !message;
+        }
+    }
+
+    /**
+     * Upload ONE payment screenshot for manual admin review.
+     * Sends only the server-issued request id plus the image — no
+     * user id, no amount, no decision.  The server replies with the
+     * ONLY permitted confirmation (review pending).
+     */
+    async function _uploadProof(request) {
+        if (busy) {
+            return;
+        }
+        const input = overlay.querySelector(
+            '[data-testid="deposit-proof-file"]'
+        );
+        const file = input && input.files ? input.files[0] : null;
+        if (!file) {
+            _proofError('اختر صورة إثبات الدفع أولاً');
+            return;
+        }
+
+        busy = true;
+        _proofError('');
+        const button = overlay.querySelector(
+            '[data-testid="deposit-proof-submit"]'
+        );
+        button.disabled = true;
+        button.textContent = 'جارٍ الإرسال…';
+
+        try {
+            const form = new FormData();
+            form.append('request_id', request.request_id);
+            form.append('file', file);
+            // initData header ONLY — never a JSON content type (the
+            // browser must set the multipart boundary), never a
+            // client-supplied user id.
+            const headers = {};
+            headers[INIT_DATA_HEADER] = _initData();
+            const response = await fetch(PROOF_URL, {
+                method: 'POST',
+                headers: headers,
+                body: form
+            });
+            const data = await response.json().catch(() => ({}));
+            busy = false;
+            if (!response.ok || !data.ok) {
+                button.disabled = false;
+                button.textContent = '📤 إرسال إثبات الدفع';
+                _proofError(_messageFor(data));
+                return;
+            }
+            _renderProofSent(data.message);
+        } catch (err) {
+            busy = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '📤 إرسال إثبات الدفع';
+            }
+            _proofError(_messageFor(null));
+        }
+    }
+
+    /** The ONLY success state of an upload: review pending. */
+    function _renderProofSent(message) {
+        const section = overlay.querySelector(
+            '[data-testid="deposit-proof-section"]'
+        );
+        if (section) {
+            section.innerHTML =
+                `<div class="withdrawal-success" ` +
+                `data-testid="deposit-proof-sent">` +
+                `${_esc(message || 'تم إرسال إثبات الدفع للمراجعة')}` +
+                `</div>`;
+        }
     }
 
     return { open, close };
