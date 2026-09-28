@@ -835,7 +835,9 @@ class TestUsersRegression(UsersTestBase):
         import admin_review_queue
 
         target_map = {
-            "tasks": (bot_mod, "list_tasks"),
+            # "tasks" is delegated no more (MT-ADMIN-36 renders the
+            # task panel in place) — its surface is covered by
+            # test_admin_tasks.py.
             "reviews": (admin_review_queue, "reviews_command"),
             "withdrawals": (withdrawal_admin, "withdrawals_command"),
             "deposits": (deposit_proof_admin, "deposits_command"),

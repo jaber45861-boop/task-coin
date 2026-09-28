@@ -45,6 +45,15 @@ this module itself over a small closed ``ctl:users[:…]`` sub-grammar
 (bounded digits only — never JSON, never free text, never amounts or
 destinations) built strictly on the authoritative read-only store
 interfaces: ``db.count_users`` / ``db.list_users`` / ``db.get_user``.
+The ``tasks`` module (MT-ADMIN-36) is likewise rendered in place
+over its own closed ``ctl:tasks[:…]`` grammar (fixed operation
+tokens + bounded digits): reads from ``db.list_tasks`` /
+``db.get_task``; the ONLY mutation is the existing
+``db.update_task`` store contract, reached solely through a
+confirmation card plus a fresh re-read (stale presses never write,
+confirmations are single-use); creation delegates to the canonical
+``/addtask`` wizard → ``task_creation`` service.  Authorization
+runs BEFORE payload parsing, so a non-admin never reaches a read.
 
 Back navigation
 ---------------
@@ -70,6 +79,11 @@ Data rules (authoritative reads only)
   ``db.list_users()`` (one bounded, deterministically ordered page)
   and ``db.get_user()`` (detail) — identity fields only; no wallet,
   no destinations, no fabricated activity/new-user classifications
+* tasks               → ``db.list_tasks()`` (panel; sorted by id
+  HERE for deterministic pagination) and ``db.get_task()`` (detail);
+  mutations only via the existing ``db.update_task()`` contract
+  (the same call ``/offtask`` makes) after confirmation + re-read;
+  creation → the existing ``/addtask`` wizard delegation
 
 No aggregate without an authoritative interface is invented (deposit
 store exposes no list-query for raw pending deposits, so none is
@@ -92,6 +106,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import MessageHandler, filters
 
 import admin_review_queue
 import db
@@ -101,6 +116,7 @@ import payment_method_admin
 import payment_method_store
 import rate_admin
 import rate_store
+import task_taxonomy
 import withdrawal_admin
 import withdrawal_store
 from config import is_admin
@@ -115,6 +131,17 @@ MSG_INVALID = "⛔ طلب غير صالح."
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 MSG_MODULE_UNAVAILABLE = "🔒 هذه الوحدة غير متاحة بعد."
 MSG_USER_NOT_FOUND = "⛔ المستخدم غير موجود."
+# MT-ADMIN-36 task-management messages — stable Arabic answers, never
+# a traceback, SQL or filesystem detail.
+MSG_TASK_NOT_FOUND = "⚠️ المهمة غير موجودة."
+MSG_STALE_TASK = (
+    "⚠️ تغيّرت حالة المهمة. حدّث القائمة وحاول مرة أخرى."
+)
+MSG_NO_PENDING = "⚠️ لا توجد عملية معلّقة للتأكيد."
+TOAST_ENABLED = "✅ تم التفعيل"
+TOAST_DISABLED = "✅ تم التعطيل"
+TOAST_EDITED = "✅ تم التعديل"
+TOAST_CANCELLED = "❌ تم الإلغاء"
 BACK_HINT = "↩️ للعودة اكتب: /control"
 
 NA = "غير متاح"
@@ -136,12 +163,21 @@ USER_DETAIL_HEADER = "👤 المستخدم"
 # Small fixed page: bounded reads, mobile-friendly rendering.  The
 # page INDEX is clamped server-side, never trusted from the payload.
 USERS_PAGE_SIZE = 5
+TASKS_PANEL_HEADER = "📋 إدارة المهام"
+TASK_DETAIL_HEADER = "📋 تفاصيل المهمة"
+# Same small-fixed-page convention as the users module: bounded rows
+# per render, page index clamped server-side (MT-ADMIN-36).
+TASKS_PAGE_SIZE = 5
+# The ONLY task fields the edit flow exposes — both explicitly safe
+# in the existing db.update_task contract (no reward, no type, no
+# repeat policy — see the MT-ADMIN-36 report for the exact blockers).
+_TASK_EDIT_FIELDS = {"title": "عنوان المهمة", "desc": "وصف المهمة"}
 
 # ── Module registry (MT-ADMIN-34) ─────────────────────────────────────
 # Static navigation metadata for ONE admin module.  ``command`` is the
-# EXISTING command the Control Center delegates to; ``None`` reserves
-# the slot with a safe unavailable state — except ``users``
-# (MT-ADMIN-35), which this module renders in place itself.  No
+# EXISTING command the Control Center delegates to; ``None`` marks a
+# slot this module renders in place itself (``users`` MT-ADMIN-35,
+# ``tasks`` MT-ADMIN-36) or a reserved unavailable slot.  No
 # financial state, no secrets, no ids — deliberately NOT a database
 # and NOT a framework.
 
@@ -155,11 +191,11 @@ class AdminModule:
 
 
 MODULES: tuple[AdminModule, ...] = (
-    # ``command=None``: users has no separate command — it is
-    # rendered in place by this module (MT-ADMIN-35), unlike the
-    # reserved slots below which answer a safe unavailable notice.
+    # ``command=None``: users and tasks have no delegation command —
+    # this module renders BOTH in place (MT-ADMIN-35 / MT-ADMIN-36),
+    # unlike the reserved slots below which answer a safe notice.
     AdminModule("users", "👥 المستخدمون", "إدارة مستخدمين (قراءة فقط)"),
-    AdminModule("tasks", "📋 المهام", "قائمة المهام الحالية", "/listtasks"),
+    AdminModule("tasks", "📋 المهام", "إدارة المهام (عرض/تفعيل/تعطيل)"),
     AdminModule(
         "reviews", "📋 مراجعات المهام", "طابور المراجعة اليدوية", "/reviews"
     ),
@@ -201,6 +237,37 @@ OP_USERS = "users"
 USERS_BACK_OP = "users:back"
 _USERS_PAGE_RE = re.compile(r"users:p:([0-9]{1,9})")
 _USERS_DETAIL_RE = re.compile(r"users:v:([0-9]{1,15})")
+
+# MT-ADMIN-36: the in-place tasks module owns its own closed
+# sub-grammar under the SAME ctl: namespace — fixed operation tokens
+# and bounded digits only, never JSON, never free text, never
+# amounts, destinations or SQL fragments:
+#   ctl:tasks                                 task panel + first page
+#   ctl:tasks:p:<page>                        one page (clamped)
+#   ctl:tasks:v:<task_id>                     task detail
+#   ctl:tasks:back                            back to the task list
+#   ctl:tasks:new                             delegate to /addtask
+#   ctl:tasks:enable:<task_id>                enable confirmation
+#   ctl:tasks:disable:<task_id>               disable confirmation
+#   ctl:tasks:edit:<task_id>                  edit field menu
+#   ctl:tasks:field:<title|desc>:<task_id>    arm one text input
+#   ctl:tasks:confirm:<enable|disable|edit>:<task_id>  confirmation
+#   ctl:tasks:cancel:<task_id>                cancel pending / back
+# Bounds keep stale/oversized presses out of the handler entirely:
+# pages ≤ 9 digits, ids ≤ 15 digits, operations from fixed sets.
+OP_TASKS = "tasks"
+TASKS_BACK_OP = "tasks:back"
+TASKS_NEW_OP = "tasks:new"
+_TASKS_PAGE_RE = re.compile(r"tasks:p:([0-9]{1,9})")
+_TASKS_VIEW_RE = re.compile(r"tasks:v:([0-9]{1,15})")
+_TASKS_ENABLE_RE = re.compile(r"tasks:enable:([0-9]{1,15})")
+_TASKS_DISABLE_RE = re.compile(r"tasks:disable:([0-9]{1,15})")
+_TASKS_EDIT_RE = re.compile(r"tasks:edit:([0-9]{1,15})")
+_TASKS_FIELD_RE = re.compile(r"tasks:field:(title|desc):([0-9]{1,15})")
+_TASKS_CONFIRM_RE = re.compile(
+    r"tasks:confirm:(enable|disable|edit):([0-9]{1,15})"
+)
+_TASKS_CANCEL_RE = re.compile(r"tasks:cancel:([0-9]{1,15})")
 
 
 # ── Shared MT-ADMIN-02 isolation helpers (inlined, no import cycle) ───
@@ -456,13 +523,15 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
 
 
 def parse_callback(data: object) -> str | None:
-    """Registry key, ``refresh`` or a canonical users sub-op, else None.
+    """Registry key, ``refresh`` or a canonical users/tasks sub-op,
+    else None.
 
     The closed op set is the static registry plus the bounded-digits
-    ``users`` grammar (MT-ADMIN-35).  Unknown, malformed, oversized and
-    foreign-namespace payloads (``wd:``, ``dp:``, ...) fail safely with
-    None.  Numeric payloads are canonicalized (``users:p:007`` →
-    ``users:p:7``) so one page/id has exactly one spelling.
+    ``users`` (MT-ADMIN-35) and ``tasks`` (MT-ADMIN-36) grammars.
+    Unknown, malformed, oversized and foreign-namespace payloads
+    (``wd:``, ``dp:``, ...) fail safely with None.  Numeric payloads
+    are canonicalized (``tasks:p:007`` → ``tasks:p:7``) so one
+    page/id/op has exactly one spelling.
     """
     if not isinstance(data, str):
         return None
@@ -471,6 +540,7 @@ def parse_callback(data: object) -> str | None:
     op = data[len(CALLBACK_PREFIX):]
     if op in _KNOWN_OPS:
         return op
+    # ── users grammar (MT-ADMIN-35) ──
     if op == USERS_BACK_OP:
         return op
     match = _USERS_PAGE_RE.fullmatch(op)
@@ -479,6 +549,28 @@ def parse_callback(data: object) -> str | None:
     match = _USERS_DETAIL_RE.fullmatch(op)
     if match:
         return f"{OP_USERS}:v:{int(match.group(1))}"
+    # ── tasks grammar (MT-ADMIN-36) ──
+    if op in (TASKS_BACK_OP, TASKS_NEW_OP):
+        return op
+    for pattern, template in (
+        (_TASKS_PAGE_RE, f"{OP_TASKS}:p:%d"),
+        (_TASKS_VIEW_RE, f"{OP_TASKS}:v:%d"),
+        (_TASKS_ENABLE_RE, f"{OP_TASKS}:enable:%d"),
+        (_TASKS_DISABLE_RE, f"{OP_TASKS}:disable:%d"),
+        (_TASKS_EDIT_RE, f"{OP_TASKS}:edit:%d"),
+        (_TASKS_CANCEL_RE, f"{OP_TASKS}:cancel:%d"),
+    ):
+        match = pattern.fullmatch(op)
+        if match:
+            return template % int(match.group(1))
+    match = _TASKS_FIELD_RE.fullmatch(op)
+    if match:
+        return f"{OP_TASKS}:field:{match.group(1)}:{int(match.group(2))}"
+    match = _TASKS_CONFIRM_RE.fullmatch(op)
+    if match:
+        return (
+            f"{OP_TASKS}:confirm:{match.group(1)}:{int(match.group(2))}"
+        )
     return None
 
 
@@ -511,14 +603,6 @@ def _nav_update(update, command_text: str):
     )
 
 
-async def _open_tasks(shim, context) -> None:
-    # Local import: bot.py imports this module — a top-level import
-    # would cycle.  bot is fully loaded by the time a press happens.
-    import bot
-
-    await bot.list_tasks(shim, context)
-
-
 async def _open_reviews(shim, context) -> None:
     await admin_review_queue.reviews_command(shim, context)
 
@@ -540,7 +624,6 @@ async def _open_rate(shim, context) -> None:
 
 
 _NAVIGATORS = {
-    "tasks": _open_tasks,
     "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
     "deposits": _open_deposits,
@@ -702,15 +785,16 @@ def build_user_detail_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _edit_view_or_skip(query, text: str, markup, actor: int,
-                             view: str) -> None:
+                             view: str, toast: str | None = None) -> None:
     """Edit in place; a stale/unchanged message degrades to a safe
-    no-op — a read-only view never fails loudly (refresh convention)."""
+    no-op — a view never fails loudly (refresh convention).
+    *toast* optionally answers the press with a short result note."""
     try:
         await query.edit_message_text(text, reply_markup=markup)
     except Exception:
         logger.info("Control view edit skipped: admin=%d view=%s",
                     actor, view)
-    await _safe_answer(query, None)
+    await _safe_answer(query, toast)
 
 
 async def _render_users_view(query, op: str, actor: int) -> None:
@@ -807,15 +891,19 @@ async def _refresh_dashboard(query, actor: int) -> None:
 async def control_callback(update, context) -> None:
     """``ctl:`` callbacks — private admin chat ONLY, server re-reads all.
 
+    AUTH + READ ORDER (MT-ADMIN-36): private chat first, then the
+    CENTRALIZED ``config.is_admin`` gate, THEN payload grammar — so a
+    non-admin can never even reach payload parsing, let alone a read.
     Payloads are static registry keys plus the bounded ``users``
-    sub-grammar (no amounts, no destinations, no secrets); the
-    CENTRALIZED gate re-runs ``config.is_admin`` before any read;
-    unknown/stale presses fail safely; reserved modules answer a safe
-    unavailable notice; the ``users`` module renders in place from
-    authoritative reads; and the remaining implemented modules
-    DELEGATE to the existing command handlers (which re-check
-    authorization themselves).  ``ctl:refresh`` re-renders read-only.
-    Every path opens no transaction and mutates nothing — ever.
+    (MT-ADMIN-35) and ``tasks`` (MT-ADMIN-36) sub-grammars (no
+    amounts, no destinations, no secrets); unknown/stale presses
+    fail safely; reserved modules answer a safe unavailable notice;
+    the ``users`` and ``tasks`` modules render in place from
+    authoritative reads (``tasks`` mutates only via confirmation +
+    the existing ``db.update_task`` contract); and the remaining
+    implemented modules DELEGATE to the existing command handlers
+    (which re-check authorization themselves).  ``ctl:refresh``
+    re-renders read-only.  No path owns a financial transaction.
     """
     query = getattr(update, "callback_query", None)
     if query is None:
@@ -823,12 +911,12 @@ async def control_callback(update, context) -> None:
     if _non_private_chat(update):
         await _safe_answer(query, None)
         return
+    actor = await _authorize_actor(query)  # auth BEFORE grammar/reads
+    if actor is None:
+        return
     op = parse_callback(getattr(query, "data", None))
     if op is None:
         await _safe_answer(query, MSG_INVALID)
-        return
-    actor = await _authorize_actor(query)
-    if actor is None:
         return
 
     if op == OP_REFRESH:
@@ -840,6 +928,16 @@ async def control_callback(update, context) -> None:
         # gate above already re-checked config.is_admin BEFORE any
         # user data was read.
         await _render_users_view(query, op, actor)
+        return
+
+    if op == OP_TASKS or op.startswith(f"{OP_TASKS}:"):
+        # MT-ADMIN-36: rendered in place by this module — the auth
+        # gate above already re-checked config.is_admin BEFORE any
+        # task data was read or any mutation was confirmed.  First
+        # tasks press also attaches the edit-text catch-all ONCE
+        # (lazy, idempotent — no extra bot.py registration).
+        _ensure_text_input_handler(context)
+        await _handle_tasks_op(update, context, query, op, actor)
         return
 
     module = MODULES_BY_KEY[op]
@@ -868,3 +966,655 @@ async def control_callback(update, context) -> None:
         return
     await _safe_answer(query, BACK_HINT)
     logger.info("Control navigation opened: admin=%d module=%s", actor, op)
+
+
+# ── Tasks module (MT-ADMIN-36): management, rendered in place ───────
+# Authorization is re-checked by the caller BEFORE any read here.
+# Reads come from the authoritative task store (db.list_tasks /
+# db.get_task); the ONLY mutation this module ever performs is the
+# EXISTING store contract ``db.update_task`` — the very call
+# ``/offtask`` makes — and only after a confirmation step plus a
+# fresh re-read of the row (a pressed state is never trusted and a
+# confirmation is single-use).  No SQL, no financial primitive and
+# no reward semantics lives here: reward/type/repeat editing are
+# deliberately NOT exposed (no safe contract — see the MT-ADMIN-36
+# report), and creation delegates to the canonical ``/addtask``
+# wizard → ``task_creation`` service (one creation path, never two).
+
+# One pending text edit per private chat — the in-memory bridge
+# between a field prompt and its confirmation.  It holds ONLY the
+# bounded task id, the fixed field token, the admin id and the
+# validated new text — never financial values, never secrets.
+_PENDING_TASK_EDITS: dict[int, dict] = {}
+
+
+def _task_ref(task: dict) -> str:
+    """Truncated title + id — the only task identity in buttons and
+    confirmation cards (never the full description, never payloads)."""
+    title = str(task.get("title") or NA)
+    if len(title) > 40:
+        title = title[:40] + "…"
+    return f"{title} · #{task.get('id')}"
+
+
+def _task_row_label(task: dict) -> str:
+    """One tappable task row for the list."""
+    return f"📋 {_task_ref(task)}"
+
+
+def _task_page_count(total: int) -> int:
+    """Pages for *total* tasks — always at least one so an empty
+    state still renders a stable page label."""
+    return max(1, -(-int(total) // TASKS_PAGE_SIZE))
+
+
+def collect_tasks_page(page: int) -> dict:
+    """Read-only task-page snapshot from the authoritative store.
+
+    ``db.list_tasks()`` is the ONE existing task list read (the same
+    operation ``/listtasks`` and the dashboard use); rows are sorted
+    by id HERE so pagination order is deterministic, and the page
+    index is CLAMPED so oversized/stale presses land on the last
+    page instead of failing.  Read-only: no write of any kind.
+    """
+    if isinstance(page, bool) or not isinstance(page, int):
+        raise TypeError("page must be an int")
+    tasks = sorted(db.list_tasks(), key=lambda t: t["id"])
+    total = len(tasks)
+    pages = _task_page_count(total)
+    page = min(max(page, 0), pages - 1)
+    start = page * TASKS_PAGE_SIZE
+    return {
+        "total": total,
+        "active": sum(1 for t in tasks if t["active"]),
+        "page": page,
+        "pages": pages,
+        "rows": tasks[start:start + TASKS_PAGE_SIZE],
+    }
+
+
+def build_tasks_text(view: dict) -> str:
+    """Arabic task-management panel built from the authoritative
+    list — counts are derived from the same read, never cached."""
+    lines = [
+        TASKS_PANEL_HEADER,
+        "",
+        f"📊 إجمالي المهام: {view['total']}",
+        f"🟢 النشطات: {view['active']}",
+        f"🔴 المعطلات: {view['total'] - view['active']}",
+        "",
+        "اختر مهمة لعرض التفاصيل:",
+    ]
+    if not view["rows"]:
+        lines.append("📭 لا توجد مهام بعد.")
+    lines += [
+        "",
+        SEPARATOR,
+        f"صفحة {view['page'] + 1}/{view['pages']}",
+    ]
+    return "\n".join(lines)
+
+
+def build_tasks_keyboard(view: dict) -> InlineKeyboardMarkup:
+    """Tappable task rows + bounded page nav + create + canonical
+    control-center back.  Payloads come from store rows only."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                _task_row_label(task),
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_TASKS}:v:{task['id']}"
+                ),
+            )
+        ]
+        for task in view["rows"]
+    ]
+    nav = []
+    if view["page"] > 0:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ السابق",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_TASKS}:p:{view['page'] - 1}"
+                ),
+            )
+        )
+    if view["page"] + 1 < view["pages"]:
+        nav.append(
+            InlineKeyboardButton(
+                "التالي ➡️",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_TASKS}:p:{view['page'] + 1}"
+                ),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "➕ مهمة جديدة",
+                callback_data=f"{CALLBACK_PREFIX}{TASKS_NEW_OP}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ مركز الإدارة",
+                callback_data=f"{CALLBACK_PREFIX}{OP_REFRESH}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_task_detail_text(task: dict | None) -> str:
+    """Task card from the authoritative ``db.get_task`` row —
+    persisted administrative fields only.
+
+    Missing/unreadable fields read ``غير متاح``; an unknown task
+    answers the safe fixed notice.  Reward is displayed with the
+    EXISTING whole-USDT contract value — never recomputed here.
+    """
+    if not task:
+        return MSG_TASK_NOT_FOUND
+    reward = task.get("reward")
+    reward_text = (
+        f"{reward} USDT"
+        if isinstance(reward, int) and not isinstance(reward, bool)
+        else NA
+    )
+    state = "🟢 مفعّلة" if task.get("active") else "🔴 معطلة"
+    policy = task.get("repeat_policy")
+    hours = task.get("repeat_hours")
+    if policy == "repeatable" and isinstance(hours, int):
+        repeat = f"🔁 التكرار: كل {hours} ساعة"
+    elif policy in ("one_time", "repeatable"):
+        repeat = "🔁 التكرار: مرة واحدة"
+    else:
+        repeat = f"🔁 التكرار: {NA}"
+    description = str(task.get("description") or "")
+    if len(description) > 500:
+        description = description[:500] + "…"
+    return "\n".join(
+        [
+            TASK_DETAIL_HEADER,
+            "",
+            f"🆔 المعرف: #{task.get('id')}",
+            f"📌 العنوان: {task.get('title') or NA}",
+            f"📝 الوصف: {description or NA}",
+            f"💰 المكافأة: {reward_text}",
+            f"⚡ الحالة: {state}",
+            f"📡 النوع: {task.get('type') or NA}",
+            repeat,
+            f"📅 تاريخ الإنشاء: {task.get('created_at') or NA}",
+        ]
+    )
+
+
+def build_task_detail_keyboard(task_id: int, task: dict | None):
+    """Only mutations the repository can safely perform: the state
+    toggle (existing ``db.update_task(active=...)``) and the bounded
+    title/description edit menu.  No reward, no type, no delete."""
+    rows = []
+    if task is not None:
+        if task.get("active"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🔴 تعطيل",
+                        callback_data=(
+                            f"{CALLBACK_PREFIX}{OP_TASKS}"
+                            f":disable:{task_id}"
+                        ),
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🟢 تفعيل",
+                        callback_data=(
+                            f"{CALLBACK_PREFIX}{OP_TASKS}"
+                            f":enable:{task_id}"
+                        ),
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✏️ تعديل",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:edit:{task_id}"
+                    ),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ رجوع",
+                callback_data=f"{CALLBACK_PREFIX}{TASKS_BACK_OP}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _tasks_back_keyboard() -> InlineKeyboardMarkup:
+    """Back-to-list button for stale/not-found/pending cards."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ رجوع",
+                    callback_data=f"{CALLBACK_PREFIX}{TASKS_BACK_OP}",
+                )
+            ]
+        ]
+    )
+
+
+def build_task_edit_menu_text(task: dict) -> str:
+    """Field chooser — only fields the existing update contract
+    supports for administrative edits (title, description)."""
+    return "\n".join(
+        [
+            "✏️ تعديل المهمة",
+            "",
+            f"المهمة: {_task_ref(task)}",
+            "",
+            "اختر الحقل المراد تعديله:",
+            "ستُعرض المراجعة قبل الحفظ.",
+        ]
+    )
+
+
+def build_task_edit_menu_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📌 العنوان",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}"
+                        f":field:title:{task_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📝 الوصف",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}"
+                        f":field:desc:{task_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ رجوع",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:v:{task_id}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def build_task_prompt_text(task: dict, field: str) -> str:
+    """Input prompt after a field press — arms ONE pending edit."""
+    label = _TASK_EDIT_FIELDS.get(field, NA)
+    return "\n".join(
+        [
+            f"✏️ أرسل النص الجديد لـ{label}:",
+            "",
+            f"المهمة: {_task_ref(task)}",
+            "ستُعرض المراجعة قبل الحفظ.",
+        ]
+    )
+
+
+def build_task_prompt_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ إلغاء",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:cancel:{task_id}"
+                    ),
+                )
+            ]
+        ]
+    )
+
+
+def build_task_confirm_text(task: dict, op_label: str,
+                            value: str | None = None) -> str:
+    """Confirmation card — the callback carries ONLY the fixed
+    operation + bounded id; the reviewed value lives in the card
+    text (server-side pending state), never in the payload."""
+    lines = [
+        "⚠️ تأكيد العملية",
+        "",
+        f"المهمة: {_task_ref(task)}",
+        f"العملية: {op_label}",
+    ]
+    if value is not None:
+        preview = value if len(value) <= 200 else value[:200] + "…"
+        lines += ["القيمة الجديدة:", preview]
+    lines += ["", "هل تريد المتابعة؟"]
+    return "\n".join(lines)
+
+
+def build_task_confirm_keyboard(op_kind: str, task_id: int):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تأكيد",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}"
+                        f":confirm:{op_kind}:{task_id}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ إلغاء",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:cancel:{task_id}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+# Marker on Application.bot_data: the edit-text catch-all has been
+# attached to the LIVE application (single-shot, idempotent).
+_TEXT_HANDLER_MARK = "admin_tasks_edit_text_handler"
+
+
+def _ensure_text_input_handler(context) -> None:
+    """Attach ``task_edit_text_input`` to the live Application ONCE.
+
+    python-telegram-bot documents ``Application.add_handler`` as
+    safe to call at any time, so the text catch-all is registered
+    LAZY and idempotent (bot_data marker) from the first Control
+    Center tasks press — no second static registration in bot.py is
+    needed, and ``^ctl:`` stays the single callback entry.  A
+    context without a live Application (unit-test shims) degrades to
+    a no-op.  Group 3 mirrors the wizard (0) / support (2)
+    catch-all pattern; the body stays silent without pending state.
+    """
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None)
+    if app is None or not isinstance(bot_data, dict):
+        return  # no live application (or a test shim) — no-op
+    if bot_data.get(_TEXT_HANDLER_MARK):
+        return  # single-shot: never double-register
+    bot_data[_TEXT_HANDLER_MARK] = True
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            task_edit_text_input,
+        ),
+        group=3,
+    )
+
+
+def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
+    """Confirmation step → the EXISTING ``db.update_task`` contract.
+
+    Fresh re-read first: a pressed card whose state already changed
+    (or whose task vanished, or whose edit value was already
+    consumed) returns the safe notice and writes NOTHING — double
+    confirmations can never double-apply.  Returns
+    ``(text, markup, toast)`` for the caller to render.
+    """
+    text: str = MSG_INVALID
+    markup = _tasks_back_keyboard()
+    toast: str | None = None
+    result = "invalid"
+    if kind in ("enable", "disable"):
+        desired = kind == "enable"
+        task = db.get_task(task_id)
+        if task is None:
+            text, result = MSG_TASK_NOT_FOUND, "missing"
+        elif bool(task["active"]) == desired:
+            # The row already matches the pressed operation — the
+            # state changed since the card was rendered.
+            text, result = MSG_STALE_TASK, "stale-state"
+        elif not db.update_task(task_id, active=desired):
+            text, result = MSG_STALE_TASK, "stale-race"
+        else:
+            toast = TOAST_ENABLED if desired else TOAST_DISABLED
+            result = "applied"
+    elif kind == "edit":
+        pending = (
+            _PENDING_TASK_EDITS.pop(chat_id, None)
+            if isinstance(chat_id, int)
+            else None
+        )
+        if (
+            not pending
+            or pending.get("task_id") != task_id
+            or "value" not in pending
+        ):
+            # Single-use: a second confirm finds no staged value.
+            text, result = MSG_NO_PENDING, "no-pending"
+        else:
+            task = db.get_task(task_id)
+            if task is None:
+                text, result = MSG_TASK_NOT_FOUND, "missing"
+            else:
+                field = pending.get("field")
+                kwargs = (
+                    {"title": pending["value"]}
+                    if field == "title"
+                    else {"description": pending["value"]}
+                )
+                if not db.update_task(task_id, **kwargs):
+                    text, result = MSG_STALE_TASK, "stale-race"
+                else:
+                    toast, result = TOAST_EDITED, "applied"
+    if result == "applied":
+        # Render the refreshed card from the authoritative re-read.
+        task = db.get_task(task_id)
+        text = build_task_detail_text(task)
+        markup = build_task_detail_keyboard(task_id, task)
+    logger.info(
+        "Task management: admin=%d task=%d op=%s result=%s",
+        actor, task_id, kind, result,
+    )
+    return text, markup, toast
+
+
+async def _handle_tasks_op(update, context, query, op: str,
+                           actor: int) -> None:
+    """``ctl:tasks*`` — the task-management surface (MT-ADMIN-36).
+
+    The caller has ALREADY re-checked authorization (private chat +
+    config.is_admin) before any read here.  Reads use the
+    authoritative store; mutations go through confirmation + fresh
+    re-read into ``db.update_task`` only.  Failures degrade to a safe
+    error answer.  Logs carry the admin id + view kind only — never
+    task contents, payloads or tracebacks.
+    """
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    view = "tasks:list"
+    toast: str | None = None
+    try:
+        if op == TASKS_NEW_OP:
+            # Creation delegates to the EXISTING /addtask entry →
+            # admin_task_wizard → task_creation service.  The target
+            # re-checks admin + private chat itself.
+            view = "tasks:new"
+            shim = _nav_update(update, "/addtask")
+            if shim is None:
+                await _safe_answer(query, MSG_INVALID)
+                return
+            import bot  # local: bot.py imports this module (cycle)
+
+            await bot.add_task(shim, context)
+            await _safe_answer(query, BACK_HINT)
+            logger.info("Task creation opened: admin=%d", actor)
+            return
+        if op == OP_TASKS or op == TASKS_BACK_OP:
+            snapshot = collect_tasks_page(0)
+            text = build_tasks_text(snapshot)
+            markup = build_tasks_keyboard(snapshot)
+        elif op.startswith(f"{OP_TASKS}:p:"):
+            snapshot = collect_tasks_page(int(op.rsplit(":", 1)[1]))
+            text = build_tasks_text(snapshot)
+            markup = build_tasks_keyboard(snapshot)
+        elif op.startswith(f"{OP_TASKS}:v:"):
+            view = "tasks:detail"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            text = build_task_detail_text(task)
+            markup = build_task_detail_keyboard(task_id, task)
+        elif (
+            op.startswith(f"{OP_TASKS}:enable:")
+            or op.startswith(f"{OP_TASKS}:disable:")
+        ):
+            view = "tasks:confirm"
+            kind = "enable" if ":enable:" in op else "disable"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            desired = kind == "enable"
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            elif bool(task["active"]) == desired:
+                # State already changed since the detail was rendered.
+                text, markup = MSG_STALE_TASK, _tasks_back_keyboard()
+            else:
+                label = "تفعيل المهمة" if desired else "تعطيل المهمة"
+                text = build_task_confirm_text(task, label)
+                markup = build_task_confirm_keyboard(kind, task_id)
+        elif op.startswith(f"{OP_TASKS}:edit:"):
+            view = "tasks:editmenu"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            else:
+                text = build_task_edit_menu_text(task)
+                markup = build_task_edit_menu_keyboard(task_id)
+        elif op.startswith(f"{OP_TASKS}:field:"):
+            view = "tasks:input"
+            parts = op.split(":")  # tasks / field / <f> / <id>
+            field, task_id = parts[2], int(parts[3])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            elif not isinstance(chat_id, int):
+                text, markup = MSG_ERROR, _tasks_back_keyboard()
+            else:
+                # Arm ONE pending edit for this chat (a later field
+                # choice replaces an abandoned one).  NO mutation —
+                # the confirm callback applies it after re-reading.
+                _PENDING_TASK_EDITS[chat_id] = {
+                    "task_id": task_id,
+                    "field": field,
+                    "admin": actor,
+                }
+                text = build_task_prompt_text(task, field)
+                markup = build_task_prompt_keyboard(task_id)
+        elif op.startswith(f"{OP_TASKS}:confirm:"):
+            view = "tasks:result"
+            parts = op.split(":")  # tasks / confirm / <kind> / <id>
+            kind, task_id = parts[2], int(parts[3])
+            text, markup, toast = _apply_task_confirm(
+                task_id, kind, chat_id, actor
+            )
+        elif op.startswith(f"{OP_TASKS}:cancel:"):
+            view = "tasks:detail"
+            task_id = int(op.rsplit(":", 1)[1])
+            if isinstance(chat_id, int):
+                _PENDING_TASK_EDITS.pop(chat_id, None)
+            task = db.get_task(task_id)
+            text = build_task_detail_text(task)
+            markup = build_task_detail_keyboard(task_id, task)
+            toast = TOAST_CANCELLED
+        else:
+            # Defense in depth — the parser already rejects this.
+            await _safe_answer(query, MSG_INVALID)
+            return
+    except Exception:
+        logger.exception(
+            "Control tasks view failed: admin=%d view=%s", actor, view
+        )
+        await _safe_answer(query, MSG_ERROR)
+        return
+    await _edit_view_or_skip(query, text, markup, actor, view, toast)
+    logger.info("Control tasks view: admin=%d view=%s", actor, view)
+
+
+async def task_edit_text_input(update, context) -> None:
+    """Pending task-edit text (MT-ADMIN-36).
+
+    Registered in bot.py in its OWN handler group — the same
+    catch-all pattern as the wizard (group 0) and support (group 2).
+    Completely SILENT unless THIS private chat holds a pending edit,
+    so ordinary chat, the anti-bot flow, the wizard and support are
+    untouched.  Authorization is re-checked before anything is
+    validated or staged; NOTHING is mutated here — the text only
+    arms the confirmation step, and the confirm callback re-reads
+    the task and calls the existing ``db.update_task`` contract.
+    """
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    if _non_private_chat(update):
+        return
+    actor = _actor_id(
+        getattr(getattr(update, "effective_user", None), "id", None)
+    )
+    if actor is None:
+        return
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if not isinstance(chat_id, int):
+        return
+    pending = _PENDING_TASK_EDITS.get(chat_id)
+    if not pending:
+        return  # not our state — stay silent like the other catch-alls
+    if not is_admin(actor):
+        return  # never validate or arm a mutation without auth
+    field = pending.get("field")
+    raw = message.text or ""
+    try:
+        value = (
+            task_taxonomy.validate_title(raw)
+            if field == "title"
+            else task_taxonomy.validate_instructions(raw)
+        )
+    except ValueError as exc:
+        # The EXISTING validator's Arabic message; the pending state
+        # is KEPT so the admin can simply retry with a valid text.
+        await message.reply_text(str(exc))
+        return
+    task_id = pending.get("task_id")
+    task = db.get_task(task_id) if isinstance(task_id, int) else None
+    if task is None:
+        _PENDING_TASK_EDITS.pop(chat_id, None)
+        await message.reply_text(MSG_TASK_NOT_FOUND)
+        return
+    pending["value"] = value  # arms the single-use confirmation
+    label = f"تعديل {_TASK_EDIT_FIELDS.get(field, NA)}"
+    await message.reply_text(
+        build_task_confirm_text(task, label, value=value),
+        reply_markup=build_task_confirm_keyboard("edit", task_id),
+    )
+    logger.info(
+        "Task edit staged: admin=%d task=%d field=%s",
+        actor, task_id, field,
+    )

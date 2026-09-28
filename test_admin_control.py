@@ -32,8 +32,8 @@ C. NAVIGATION (17-24)
   17  keyboard carries exactly the fixed ``ctl:<surface>`` set
   18  admin press ctl:withdrawals lands on the EXISTING /withdrawals queue
   19  admin press ctl:deposits lands on the EXISTING /deposits queue
-  20  admin press ctl:tasks lands on the EXISTING /listtasks surface
-      (and ctl:rate on the EXISTING /setrate surface)
+  20  MT-ADMIN-36: ctl:tasks renders the in-place task panel;
+      ctl:rate / ctl:paymethods still land on their existing surfaces
   21  delegated handler receives the real identity + private chat
   22  non-admin press refused; target handler never invoked
   23  group press answered with no data; target handler never invoked
@@ -136,6 +136,7 @@ from admin_control import (
 from test_payment_methods import (
     _answered,
     _callback,
+    _edited,
     _reply,
     _run,
     _update,
@@ -627,11 +628,15 @@ class TestNavigation(ControlTestBase):
     def test_20_press_tasks_and_rate_land_on_existing_surfaces(
         self,
     ) -> None:
-        """20. ctl:tasks -> /listtasks; ctl:rate -> /setrate."""
+        """20. MT-ADMIN-36: ctl:tasks renders the in-place Task
+        Management Panel; ctl:rate -> /setrate; ctl:paymethods ->
+        the existing payment-method panel."""
         self._seed_tasks()
         update = self._press("ctl:tasks")
-        reply = update.callback_query.message.reply_text
-        self.assertIn("قائمة المهام", reply.call_args[0][0])
+        self.assertIn(
+            admin_control.TASKS_PANEL_HEADER,
+            _edited(update.callback_query),
+        )
 
         update2 = self._press("ctl:rate")
         reply2 = update2.callback_query.message.reply_text
@@ -1027,7 +1032,8 @@ class TestAdminSystemFoundation(ControlTestBase):
             {"key", "label", "description", "command"},
         )
         expected_commands = {
-            "tasks": "/listtasks",
+            # "tasks" has command=None — MT-ADMIN-36 renders the
+            # task-management panel in place (like "users").
             "reviews": "/reviews",
             "withdrawals": "/withdrawals",
             "deposits": "/deposits",
@@ -1046,7 +1052,9 @@ class TestAdminSystemFoundation(ControlTestBase):
         import bot as bot_mod
 
         target_map = {
-            "tasks": (bot_mod, "list_tasks"),
+            # "tasks" is NOT delegated anymore (MT-ADMIN-36): it has
+            # command=None and renders in place — covered by
+            # test_admin_tasks.py instead.
             "reviews": (admin_review_queue, "reviews_command"),
             "withdrawals": (withdrawal_admin, "withdrawals_command"),
             "deposits": (deposit_proof_admin, "deposits_command"),
