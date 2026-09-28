@@ -67,6 +67,19 @@ G. MT-ADMIN-33 — OPERATIONAL EXTENSION
     task-review decision entry points
   - registration still exactly once for /control and ^ctl:
 
+H. MT-ADMIN-34 — ADMIN SYSTEM FOUNDATION (35-42)
+  - frozen module registry contract: unique bounded keys, exactly
+    the module set, NO financial state / secrets / id fields
+  - every implemented module delegates to ITS existing command
+  - reserved modules answer a safe unavailable notice — no reads,
+    no render, no claim of working functionality
+  - ctl:refresh re-renders read-only; same centralized auth gate
+  - foreign callback families (wd/dp/pm/mr/atw/mproof) still
+    registered exactly once; this module builds no foreign payload
+  - successful navigation answers with the /control back hint
+  - sectioned dashboard layout; the users slot honestly shows
+    غير متاح (no fake metric, no user records)
+
 Temp databases only; no production destinations or balances are used.
 
 Run:
@@ -75,6 +88,7 @@ Run:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import sqlite3
@@ -568,16 +582,24 @@ class TestMetrics(ControlTestBase):
 class TestNavigation(ControlTestBase):
 
     def test_17_keyboard_carries_fixed_ctl_set(self) -> None:
-        """17. Exactly the five fixed surfaces, payloads are static."""
+        """17. Exactly the registry modules + refresh; payloads static."""
         data = self._buttons(build_dashboard_keyboard())
         self.assertEqual(
             sorted(data),
             [
+                "ctl:admins",
+                "ctl:broadcast",
                 "ctl:deposits",
+                "ctl:health",
+                "ctl:logs",
                 "ctl:paymethods",
                 "ctl:rate",
+                "ctl:refresh",
                 "ctl:reviews",
+                "ctl:rewards",
+                "ctl:settings",
                 "ctl:tasks",
+                "ctl:users",
                 "ctl:withdrawals",
             ],
         )
@@ -691,29 +713,38 @@ class TestNavigation(ControlTestBase):
 
     # ── MT-ADMIN-33 operational extension ──────────────────────
 
-    def test_17b_attention_first_keyboard(self) -> None:
-        """MT-ADMIN-33: decision queues lead with explicit labels."""
+    def test_17b_keyboard_follows_registry_sections(self) -> None:
+        """MT-ADMIN-34: registry-driven rows — every module labeled,
+        management section first, refresh closes the keyboard."""
         markup = build_dashboard_keyboard()
         data = self._buttons(markup)
         self.assertEqual(
-            data[:3], ["ctl:withdrawals", "ctl:deposits", "ctl:reviews"]
+            data,
+            [
+                "ctl:users",
+                "ctl:tasks",
+                "ctl:reviews",
+                "ctl:withdrawals",
+                "ctl:deposits",
+                "ctl:paymethods",
+                "ctl:rate",
+                "ctl:rewards",
+                "ctl:broadcast",
+                "ctl:settings",
+                "ctl:admins",
+                "ctl:logs",
+                "ctl:health",
+                "ctl:refresh",
+            ],
         )
         labels = [
             button.text
             for row in markup.inline_keyboard
             for button in row
         ]
-        self.assertEqual(
-            labels[:3],
-            [
-                admin_control.BTN_WITHDRAWALS,
-                admin_control.BTN_DEPOSITS,
-                admin_control.BTN_REVIEWS,
-            ],
-        )
-        self.assertIn(admin_control.BTN_TASKS, labels)
-        self.assertIn(admin_control.BTN_PAYMETHODS, labels)
-        self.assertIn(admin_control.BTN_RATE, labels)
+        for module in admin_control.MODULES:
+            self.assertIn(module.label, labels)
+        self.assertIn("🔄 تحديث", labels)
 
     def test_19b_press_reviews_lands_on_existing_queue(self) -> None:
         """ctl:reviews invokes the EXISTING /reviews surface."""
@@ -810,15 +841,10 @@ class TestSafety(ControlTestBase):
 
         before = self._dump_state()
         self._cmd()
-        for surface in (
-            "tasks",
-            "reviews",
-            "withdrawals",
-            "deposits",
-            "paymethods",
-            "rate",
-        ):
-            self._press(f"ctl:{surface}")
+        for key in [m.key for m in admin_control.MODULES] + [
+            admin_control.OP_REFRESH
+        ]:
+            self._press(f"ctl:{key}")
 
         txn.assert_not_called()
         for label, spy in spies.items():
@@ -827,22 +853,18 @@ class TestSafety(ControlTestBase):
 
     def test_28_payloads_carry_only_fixed_identifiers(self) -> None:
         """28. Callback data never carries ids, input or secrets."""
-        for surface in (
-            "tasks",
-            "reviews",
-            "withdrawals",
-            "deposits",
-            "paymethods",
-            "rate",
-        ):
-            self.assertEqual(parse_callback(f"ctl:{surface}"), surface)
+        for key in [m.key for m in admin_control.MODULES] + [
+            admin_control.OP_REFRESH
+        ]:
+            self.assertEqual(parse_callback(f"ctl:{key}"), key)
         for bad in (
             "ctl:",
             "ctl:tasks:501",
-            "ctl:users",
+            "ctl:nope",
             "ctl:TASKS",
             "ctl:tasks ",
             "ctl:../../etc",
+            "wd:list:x",
             None,
             5,
             True,
@@ -953,6 +975,216 @@ class TestBotRegistration(unittest.TestCase):
         source = open(bot_mod.__file__, encoding="utf-8").read()
         self.assertEqual(source.count('"control"'), 1)
         self.assertEqual(source.count("^ctl:"), 1)
+
+
+# ══════════════════════════════════════════════════════════════════
+# H. MT-ADMIN-34 — ADMIN SYSTEM FOUNDATION (registry/slots/refresh)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestAdminSystemFoundation(ControlTestBase):
+    """MT-ADMIN-34 — module registry, reserved slots, refresh, back
+    navigation, sectioned layout and namespace integrity."""
+
+    PLACEHOLDERS = (
+        "users",
+        "rewards",
+        "broadcast",
+        "settings",
+        "admins",
+        "logs",
+        "health",
+    )
+
+    def test_35_registry_contract(self) -> None:
+        """35. Static frozen registry: unique bounded keys, exactly
+        the module set, no financial state/secret/id fields."""
+        keys = [m.key for m in admin_control.MODULES]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(
+            set(keys),
+            {
+                "users",
+                "tasks",
+                "reviews",
+                "withdrawals",
+                "deposits",
+                "paymethods",
+                "rate",
+                "rewards",
+                "broadcast",
+                "settings",
+                "admins",
+                "logs",
+                "health",
+            },
+        )
+        self.assertEqual(
+            {
+                f.name
+                for f in dataclasses.fields(admin_control.AdminModule)
+            },
+            {"key", "label", "description", "command"},
+        )
+        expected_commands = {
+            "tasks": "/listtasks",
+            "reviews": "/reviews",
+            "withdrawals": "/withdrawals",
+            "deposits": "/deposits",
+            "paymethods": "/paymethods",
+            "rate": "/setrate",
+        }
+        for module in admin_control.MODULES:
+            self.assertEqual(
+                module.command, expected_commands.get(module.key)
+            )
+            self.assertTrue(module.label)
+
+    def test_36_implemented_modules_delegate_to_their_command(self) -> None:
+        """7. Every implemented module navigates to ITS existing
+        command with the real identity + private chat."""
+        import bot as bot_mod
+
+        target_map = {
+            "tasks": (bot_mod, "list_tasks"),
+            "reviews": (admin_review_queue, "reviews_command"),
+            "withdrawals": (withdrawal_admin, "withdrawals_command"),
+            "deposits": (deposit_proof_admin, "deposits_command"),
+            "paymethods": (payment_method_admin, "paymethods_command"),
+            "rate": (rate_admin, "setrate_command"),
+        }
+        implemented = {
+            m.key for m in admin_control.MODULES if m.command is not None
+        }
+        self.assertEqual(implemented, set(target_map))
+
+        for key, (module, name) in target_map.items():
+            command = admin_control.MODULES_BY_KEY[key].command
+            with mock.patch.object(
+                module, name, new=mock.AsyncMock()
+            ) as target:
+                self._press(f"ctl:{key}")
+            target.assert_awaited_once()
+            shim = target.await_args[0][0]
+            self.assertEqual(shim.message.text, command)
+            self.assertEqual(shim.effective_user.id, ADMIN_ID)
+            self.assertEqual(shim.effective_chat.type, "private")
+
+    def test_37_reserved_modules_answer_unavailable_safely(self) -> None:
+        """8. Reserved modules never claim to work: safe notice, no
+        reads, no render — for admin, non-admin AND group presses."""
+        with mock.patch.object(admin_control, "collect_snapshot") as snap:
+            for key in self.PLACEHOLDERS:
+                update = self._press(f"ctl:{key}")
+                self.assertEqual(
+                    _answered(update.callback_query),
+                    admin_control.MSG_MODULE_UNAVAILABLE,
+                    key,
+                )
+                update.callback_query.message.reply_text.assert_not_called()
+                update.callback_query.edit_message_text.assert_not_called()
+        snap.assert_not_called()
+
+        for key in self.PLACEHOLDERS:
+            update = self._press(f"ctl:{key}", actor_id=STRANGER)
+            self.assertEqual(
+                _answered(update.callback_query), MSG_ADMIN_ONLY, key
+            )
+            update = self._press(f"ctl:{key}", chat_type="supergroup")
+            self.assertIsNone(_answered(update.callback_query), key)
+
+    def test_38_refresh_rerenders_read_only(self) -> None:
+        """ctl:refresh re-renders in place — reads only, no writes."""
+        self._seed_tasks()
+        before = self._dump_state()
+        with mock.patch.object(db, "transaction") as txn:
+            update = self._press("ctl:refresh")
+        txn.assert_not_called()
+        self.assertEqual(before, self._dump_state())
+
+        edit = update.callback_query.edit_message_text
+        edit.assert_awaited_once()
+        text = edit.call_args[0][0]
+        self.assertIn(HEADER, text)
+        self.assertIn("المهام النشطة: 2", text)
+        self.assertIsInstance(
+            edit.call_args[1]["reply_markup"], InlineKeyboardMarkup
+        )
+        update.callback_query.answer.assert_awaited()
+
+        # A stale edit degrades to a safe no-op — never a traceback.
+        stale = _callback(ADMIN_ID, "ctl:refresh")
+        stale.callback_query.message.reply_text = mock.AsyncMock()
+        stale.callback_query.edit_message_text = mock.AsyncMock(
+            side_effect=Exception("message too old")
+        )
+        _run(admin_control.control_callback(stale, mock.MagicMock()))
+        stale.callback_query.answer.assert_awaited()
+
+    def test_39_refresh_rechecks_authorization(self) -> None:
+        """ctl:refresh goes through the same centralized gate."""
+        update = self._press("ctl:refresh", actor_id=STRANGER)
+        self.assertEqual(_answered(update.callback_query), MSG_ADMIN_ONLY)
+        update.callback_query.edit_message_text.assert_not_called()
+
+        update = self._press("ctl:refresh", chat_type="channel")
+        self.assertIsNone(_answered(update.callback_query))
+        update.callback_query.edit_message_text.assert_not_called()
+
+    def test_40_existing_callback_namespaces_untouched(self) -> None:
+        """10-14. Foreign callback families stay registered exactly
+        once in bot.py; this module builds no foreign payload."""
+        import bot as bot_mod
+
+        source = open(bot_mod.__file__, encoding="utf-8").read()
+        for pattern in (
+            'pattern=r"^wd:"',
+            'pattern=r"^dp:"',
+            'pattern=r"^pm:"',
+            'pattern=r"^mr(view|vp):"',
+            'pattern=r"^atw:"',
+            'pattern=r"^mproof:"',
+            'pattern=r"^ctl:"',
+        ):
+            self.assertEqual(
+                source.count(pattern), 1, f"{pattern} must stay unique"
+            )
+
+        ctl_source = open(admin_control.__file__, encoding="utf-8").read()
+        for foreign in (
+            'callback_data="wd',
+            'callback_data="dp',
+            'callback_data="pm',
+            'callback_data="mr',
+            'callback_data="atw',
+        ):
+            self.assertNotIn(foreign, ctl_source)
+
+    def test_41_back_hint_after_successful_navigation(self) -> None:
+        """§7: successful delegation points back to /control."""
+        self._seed_pending_withdrawal(501)
+        update = self._press("ctl:withdrawals")
+        self.assertEqual(
+            _answered(update.callback_query), admin_control.BACK_HINT
+        )
+        self.assertIn("/control", admin_control.BACK_HINT)
+
+    def test_42_dashboard_layout_sections_and_users_slot(self) -> None:
+        """§9/§11: sectioned dashboard; users honestly unavailable."""
+        text = _reply(self._cmd())
+        self.assertIn(HEADER, text)
+        self.assertIn(admin_control.SEPARATOR, text)
+        self.assertIn(admin_control.OVERVIEW_HEADER, text)
+        self.assertIn(
+            f"{admin_control.ADMIN_SECTION} · "
+            f"{admin_control.SYSTEM_SECTION}",
+            text,
+        )
+        self.assertIn(f"{USERS_HEADER}\n{admin_control.NA}", text)
+        self.assertLess(
+            text.index(admin_control.OVERVIEW_HEADER),
+            text.index(TASKS_HEADER),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════

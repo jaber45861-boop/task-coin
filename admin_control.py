@@ -1,41 +1,57 @@
 """
-Admin Control Center (MT-ADMIN-32 foundation → MT-ADMIN-33 ops)
-==============================================================
+Admin System Foundation (MT-ADMIN-32/33 → MT-ADMIN-34)
+====================================================
 
-A deliberately thin, READ-ONLY dashboard over the EXISTING admin
-surfaces and stores, extended operationally (MT-ADMIN-33): attention-
-first queue navigation, richer rate status (value + provider +
-freshness) and an explicit task-review route — still with zero
-financial mutation of its own.
+The architectural foundation of the professional Telegram Admin
+System: a deliberately thin, READ-ONLY dashboard and navigation layer
+over the EXISTING admin surfaces, stores and services.
+
+Product boundary
+----------------
+The Mini App is the USER interface (wallet, tasks, withdrawals,
+deposits, proof upload, user history).  The Telegram private-chat
+admin surface — this module — is for administrators only.  No admin
+control moves into the Mini App and no user control moves into here.
 
 Entry point
 -----------
 ``/control`` — exactly one command, registered exactly once in
-``bot.main()`` (group 0, with the other admin commands).  Private admin
-chat ONLY; ``config.is_admin`` is the SOLE authorization model (the
-same model every other admin handler uses) — there is no second admin
-list, no username checks, no hardcoded ids and no client-supplied
-identity is ever trusted.  Group/channel invocations stay silent
-(MT-ADMIN-02 isolation) and non-admins get the standard refusal before
-any data is read.
+``bot.main()`` (group 0) — stays the CANONICAL Admin System entry
+(``/admin`` remains the pre-existing channel panel; no competing entry
+is created).  Private admin chat ONLY; ``config.is_admin`` is the
+SOLE authorization model, centralized in two choke-point helpers
+(``_authorize_command`` / ``_authorize_actor``) so future role
+separation can land in ONE place — while every target handler keeps
+re-checking its own authorization (a press is never trusted merely
+because it came from the Control Center).  Group/channel invocations
+stay silent (MT-ADMIN-02 isolation) and non-admins get the standard
+refusal before any data is read.
 
-Buttons (MT-ADMIN-33: attention-first)
---------------------------------------
-``ctl:<surface>`` — the payload is a FIXED surface identifier from a
-closed set (never user input, ids, secrets, amounts, destinations or
-proof references).  The callback re-checks ``config.is_admin`` on
-EVERY press, fails safely on stale/malformed presses, and DELEGATES
-to the existing command handler so navigation lands on the very same
-surface the command opens — the queues that need admin attention
-(withdrawals, deposit proofs, manual task reviews) are first-class
-buttons.  This module never reimplements those surfaces and never
-duplicates the ``wd:`` / ``dp:`` / ``mr(view|vp):`` / ``pm:`` /
-``atw:`` families.
+Module registry (MT-ADMIN-34)
+-----------------------------
+``MODULES`` is a small, static, frozen registry — stable key, Arabic
+label, optional description and the EXISTING command to navigate to
+(``None`` = reserved slot rendered with a safe unavailable state).  It
+holds NO financial state, NO secrets, NO ids and is NOT a second
+database.  ``ctl:<key>`` payloads are exactly the registry keys plus
+the fixed ``refresh`` operation — bounded and static, never amounts,
+destinations, rows, JSON or user input — and stay clear of every
+foreign namespace (``wd:`` / ``dp:`` / ``pm:`` / ``mr(view|vp):`` /
+``atw:`` / ``mproof:`` / ``sup:``).  Reserved modules (users, rewards,
+broadcast, settings, admins, logs, health) answer with a safe
+not-yet-available notice — never fake functionality, never fake
+metrics.
 
-Data rules
-----------
-Every metric comes from an existing authoritative read:
+Back navigation
+---------------
+Delegated surfaces own their own navigation; the predictable route
+back to ``🎛 مركز إدارة البوت`` is the canonical ``/control``
+(successful presses answer with a fixed back-hint toast).  The
+dashboard itself refreshes in place via ``ctl:refresh`` — a read-only
+re-render.  Fixed bounded callbacks only, no serialized objects.
 
+Data rules (authoritative reads only)
+-------------------------------------
 * active tasks        → ``db.list_tasks(active_only=True)``
 * pending review      → ``admin_review_queue.list_pending_manual_claims()``
 * pending withdrawals → ``withdrawal_store.SqliteWithdrawalRepository().list_pending()``
@@ -43,27 +59,28 @@ Every metric comes from an existing authoritative read:
 * payment methods     → ``payment_method_store.list_payment_methods()``
   (withdrawal-capable = active — exactly the read behind the
   user-facing payout list; deposit-enabled = active + opt-in)
-* rate                → ``rate_store.get_current_quote()``
-  (value + provider + freshness — the quote is fresh BY CONTRACT,
-  stale rows raise and render as ``غير متاح``)
+* rate                → ``rate_store.get_current_quote()`` — value,
+  provider and freshness; never constructed, never from
+  ``platform_settings`` (fresh BY CONTRACT; stale rows raise)
+* users               → no authoritative safe read exists → ``غير متاح``
 
 No aggregate without an authoritative interface is invented (deposit
 store exposes no list-query for raw pending deposits, so none is
-shown); no wallet or ledger balance is ever computed here; a rate is
-NEVER constructed by hand and NEVER read from ``platform_settings``.
-Opening the dashboard opens no financial transaction and mutates
-nothing — wallet/ledger/withdrawal/deposit/payment-method/rate/task
-state are untouched by construction.  Failures degrade to
-``غير متاح`` and are logged with the actor id only — tracebacks are
-never shown to administrators or users, and no secret, RPC credential,
-environment value, proof storage key or private payment destination
-can reach the dashboard output.
+shown); no wallet or ledger balance is ever computed here.  Opening
+the dashboard or a placeholder opens no transaction and mutates
+nothing — the sole financial authority stays inside the existing
+services (WithdrawalService, deposit review services, ``rate_store``,
+the payment-method store).  Failures degrade to ``غير متاح`` / safe
+callback answers and are logged with actor id + module key only —
+tracebacks are never shown to administrators or users, and no secret,
+RPC credential, environment value, proof storage key or private
+payment destination can reach the dashboard output.
 """
 
 from __future__ import annotations
 
 import logging
-import re
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -88,10 +105,16 @@ logger = logging.getLogger(__name__)
 MSG_ADMIN_ONLY = "⛔ هذا الأمر للمشرفين فقط."
 MSG_INVALID = "⛔ طلب غير صالح."
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
+MSG_MODULE_UNAVAILABLE = "🔒 هذه الوحدة غير متاحة بعد."
+BACK_HINT = "↩️ للعودة اكتب: /control"
 
 NA = "غير متاح"
 
-HEADER = "🎛️ لوحة التحكم"
+HEADER = "🎛️ مركز إدارة البوت"
+SEPARATOR = "━" * 18
+OVERVIEW_HEADER = "📊 نظرة عامة"
+ADMIN_SECTION = "🔧 الإدارة"
+SYSTEM_SECTION = "⚙️ النظام"
 
 TASKS_HEADER = "📋 المهام"
 WITHDRAWALS_HEADER = "💸 السحوبات"
@@ -100,32 +123,51 @@ PAYMETHODS_HEADER = "💳 طرق الدفع"
 RATE_HEADER = "💱 سعر USDT"
 USERS_HEADER = "👤 المستخدمون"
 
-# Button labels (MT-ADMIN-33) — attention-first: the queues that need
-# admin action lead; the remaining management surfaces follow.
-BTN_REVIEWS = "📋 مراجعات المهام"
-BTN_WITHDRAWALS = "💸 السحوبات المعلقة"
-BTN_DEPOSITS = "💵 إثباتات الدفع"
-BTN_PAYMETHODS = "💳 طرق الدفع"
-BTN_TASKS = "📋 المهام"
-BTN_RATE = "💱 إدارة السعر"
+# ── Module registry (MT-ADMIN-34) ─────────────────────────────────────
+# Static navigation metadata for ONE admin module.  ``command`` is the
+# EXISTING command the Control Center delegates to; ``None`` reserves
+# the slot with a safe unavailable state.  No financial state, no
+# secrets, no ids — deliberately NOT a database and NOT a framework.
 
-# Closed callback set — ``ctl:<surface>`` with a fixed surface id only.
-CALLBACK_PREFIX = "ctl:"
-_SURFACE_RE = re.compile(
-    r"ctl:(tasks|reviews|withdrawals|deposits|paymethods|rate)"
+
+@dataclass(frozen=True)
+class AdminModule:
+    key: str
+    label: str
+    description: str = ""
+    command: str | None = None
+
+
+MODULES: tuple[AdminModule, ...] = (
+    AdminModule("users", "👥 المستخدمون", "قراءة مستخدمين آمنة (قريباً)"),
+    AdminModule("tasks", "📋 المهام", "قائمة المهام الحالية", "/listtasks"),
+    AdminModule(
+        "reviews", "📋 مراجعات المهام", "طابور المراجعة اليدوية", "/reviews"
+    ),
+    AdminModule(
+        "withdrawals", "💸 السحوبات", "طابور مراجعة السحب", "/withdrawals"
+    ),
+    AdminModule(
+        "deposits", "💵 الإيداعات", "طابور إثباتات الإيداع", "/deposits"
+    ),
+    AdminModule(
+        "paymethods", "💳 طرق الدفع", "إدارة وسائل الدفع", "/paymethods"
+    ),
+    AdminModule("rate", "💱 سعر USDT", "ضبط سعر الصرف اليدوي", "/setrate"),
+    AdminModule("rewards", "🎁 المكافآت", "إدارة المكافآت (قريباً)"),
+    AdminModule("broadcast", "📢 الإعلانات", "الإعلانات العامة (قريباً)"),
+    AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة (قريباً)"),
+    AdminModule("admins", "🔐 المشرفون", "صلاحيات المشرفين (قريباً)"),
+    AdminModule("logs", "📝 السجلات", "سجل العمليات (قريباً)"),
+    AdminModule("health", "🩺 حالة النظام", "حالة الخدمات (قريباً)"),
 )
 
-# Navigation: surface → the EXISTING command text (for the shim) and
-# the existing handler that renders the real surface (looked up at
-# call time so tests can spy and imports never cycle).
-_NAV_COMMANDS = {
-    "tasks": "/listtasks",
-    "reviews": "/reviews",
-    "withdrawals": "/withdrawals",
-    "deposits": "/deposits",
-    "paymethods": "/paymethods",
-    "rate": "/setrate",
-}
+MODULES_BY_KEY: dict[str, AdminModule] = {m.key: m for m in MODULES}
+
+# Closed callback set — registry keys plus the fixed refresh op.
+CALLBACK_PREFIX = "ctl:"
+OP_REFRESH = "refresh"
+_KNOWN_OPS = frozenset(MODULES_BY_KEY) | {OP_REFRESH}
 
 
 # ── Shared MT-ADMIN-02 isolation helpers (inlined, no import cycle) ───
@@ -157,6 +199,47 @@ async def _safe_answer(query, text: str | None) -> None:
             await query.answer()
     except Exception:
         logger.debug("Could not answer control callback", exc_info=True)
+
+
+# ── Centralized authorization (MT-ADMIN-34: THE choke points) ────────
+# ``config.is_admin`` stays the SOLE model; both helpers funnel every
+# Control Center entry through it before any read.  Target handlers
+# still re-check authorization themselves — a press is never trusted
+# merely because it came from here — so future role separation can
+# land in these two places without touching every handler.
+
+
+async def _authorize_command(update) -> tuple[object, int] | None:
+    """``/control`` gate.  Returns ``(message, actor)`` to proceed,
+    or None — groups/channels and untrusted identities stay silent,
+    non-admins get the standard refusal (already sent here), and no
+    metric has been read yet.
+    """
+    if _non_private_chat(update):
+        return None
+    message = getattr(update, "message", None)
+    if message is None:
+        return None
+    actor = _actor_id(
+        getattr(getattr(update, "effective_user", None), "id", None)
+    )
+    if actor is None:
+        return None
+    if not is_admin(actor):
+        await message.reply_text(MSG_ADMIN_ONLY)
+        return None
+    return message, actor
+
+
+async def _authorize_actor(query) -> int | None:
+    """``ctl:`` gate.  Returns the trusted admin id, or None (a
+    refusal answer has already been sent).  Runs before any read.
+    """
+    actor = _actor_id(getattr(getattr(query, "from_user", None), "id", None))
+    if actor is None or not is_admin(actor):
+        await _safe_answer(query, MSG_ADMIN_ONLY)
+        return None
+    return actor
 
 
 # ── Read-only aggregates (existing authoritative interfaces ONLY) ────
@@ -268,6 +351,13 @@ def build_dashboard_text(snapshot: dict) -> str:
     lines = [
         HEADER,
         "",
+        SEPARATOR,
+        "",
+        OVERVIEW_HEADER,
+        "",
+        USERS_HEADER,
+        NA,  # no authoritative safe user read exists (§11) — honestly so.
+        "",
         TASKS_HEADER,
         f"المهام النشطة: {_num(snapshot.get('tasks_active'))}",
         f"بانتظار المراجعة: {_num(snapshot.get('tasks_pending_review'))}",
@@ -285,51 +375,57 @@ def build_dashboard_text(snapshot: dict) -> str:
         RATE_HEADER,
         *rate_lines,
         "",
-        USERS_HEADER,
-        f"الإحصائيات: {NA}",
+        SEPARATOR,
+        "",
+        f"{ADMIN_SECTION} · {SYSTEM_SECTION}",
     ]
     return "\n".join(lines)
 
 
 def build_dashboard_keyboard() -> InlineKeyboardMarkup:
-    """Attention-first navigation — fixed ``ctl:<surface>`` payloads.
+    """Registry-driven, section-grouped navigation (fixed payloads).
 
-    The queues requiring an admin decision lead the keyboard; every
-    button routes to the EXISTING operational surface (no review,
-    approval or rejection logic lives here).
+    Management modules lead, reserved/system modules follow, refresh
+    closes the keyboard.  Every button routes to the EXISTING
+    operational surface (or a safe unavailable notice) — no review,
+    approval or rejection logic lives here.
     """
-    return InlineKeyboardMarkup(
+
+    def _btn(key: str) -> InlineKeyboardButton:
+        module = MODULES_BY_KEY[key]
+        return InlineKeyboardButton(
+            module.label, callback_data=f"{CALLBACK_PREFIX}{key}"
+        )
+
+    rows = [
+        [_btn("users"), _btn("tasks")],
+        [_btn("reviews"), _btn("withdrawals")],
+        [_btn("deposits"), _btn("paymethods")],
+        [_btn("rate"), _btn("rewards")],
+        [_btn("broadcast")],
+        [_btn("settings"), _btn("admins")],
+        [_btn("logs"), _btn("health")],
         [
-            [
-                InlineKeyboardButton(
-                    BTN_WITHDRAWALS, callback_data="ctl:withdrawals"
-                ),
-                InlineKeyboardButton(
-                    BTN_DEPOSITS, callback_data="ctl:deposits"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    BTN_REVIEWS, callback_data="ctl:reviews"
-                ),
-                InlineKeyboardButton(
-                    BTN_PAYMETHODS, callback_data="ctl:paymethods"
-                ),
-            ],
-            [
-                InlineKeyboardButton(BTN_TASKS, callback_data="ctl:tasks"),
-                InlineKeyboardButton(BTN_RATE, callback_data="ctl:rate"),
-            ],
-        ]
-    )
+            InlineKeyboardButton(
+                "🔄 تحديث", callback_data=f"{CALLBACK_PREFIX}{OP_REFRESH}"
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def parse_callback(data: object) -> str | None:
-    """Fixed surface id from ``ctl:<surface>``, or None (stale/other)."""
+    """Registry key (or ``refresh``) from ``ctl:<op>``, else None.
+
+    The closed op set is the static registry — unknown, malformed and
+    foreign-namespace payloads (``wd:``, ``dp:``, ...) fail safely.
+    """
     if not isinstance(data, str):
         return None
-    match = _SURFACE_RE.fullmatch(data)
-    return match.group(1) if match else None
+    if not data.startswith(CALLBACK_PREFIX):
+        return None
+    op = data[len(CALLBACK_PREFIX):]
+    return op if op in _KNOWN_OPS else None
 
 
 # ── Navigation delegation to the EXISTING command handlers ───────────
@@ -403,27 +499,19 @@ _NAVIGATORS = {
 
 
 async def control_command(update, context) -> None:
-    """``/control`` — the Admin Control Center dashboard.
+    """``/control`` — the canonical Admin System dashboard entry.
 
     Private admin chat ONLY; group/channel invocations produce ZERO
-    replies.  Non-admins get the standard admin-only refusal before
-    any metric is read, so no administrative data leaks.  Read-only:
-    renders the aggregate snapshot + navigation keyboard; opens no
-    transaction and mutates nothing.
+    replies.  Non-admins get the standard admin-only refusal through
+    the CENTRALIZED gate before any metric is read, so no
+    administrative data leaks.  Read-only: renders the aggregate
+    snapshot + registry keyboard; opens no transaction and mutates
+    nothing.
     """
-    if _non_private_chat(update):
+    authorized = await _authorize_command(update)
+    if authorized is None:
         return
-    message = getattr(update, "message", None)
-    if message is None:
-        return
-    actor = _actor_id(
-        getattr(getattr(update, "effective_user", None), "id", None)
-    )
-    if actor is None:
-        return
-    if not is_admin(actor):
-        await message.reply_text(MSG_ADMIN_ONLY)
-        return
+    message, actor = authorized
 
     try:
         text = build_dashboard_text(collect_snapshot())
@@ -438,14 +526,40 @@ async def control_command(update, context) -> None:
     logger.info("Control center opened: admin=%d", actor)
 
 
+async def _refresh_dashboard(query, actor: int) -> None:
+    """``ctl:refresh`` — read-only in-place re-render of the dashboard.
+
+    Opens no transaction and mutates nothing; a stale or unchanged
+    message edit degrades to a safe no-op (logged with actor id only).
+    """
+    try:
+        text = build_dashboard_text(collect_snapshot())
+        markup = build_dashboard_keyboard()
+    except Exception:
+        logger.exception("Control refresh render failed: admin=%d", actor)
+        await _safe_answer(query, MSG_ERROR)
+        return
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception:
+        # Stale/unchanged message — a read-only refresh never fails
+        # loudly; log actor id only, no payloads.
+        logger.info("Control refresh edit skipped: admin=%d", actor)
+    await _safe_answer(query, None)
+    logger.info("Control dashboard refreshed: admin=%d", actor)
+
+
 async def control_callback(update, context) -> None:
     """``ctl:`` callbacks — private admin chat ONLY, server re-reads all.
 
-    The payload is a fixed surface identifier (no ids, no user input,
-    no secrets); authorization re-runs ``config.is_admin`` on every
-    press; stale/unknown presses fail safely; and the view is
-    DELEGATED to the existing command handler.  This handler renders
-    no data of its own and mutates nothing — ever.
+    Payloads are static registry keys (no ids, no user input, no
+    secrets, no amounts); the CENTRALIZED gate re-runs
+    ``config.is_admin`` before any read; unknown/stale presses fail
+    safely; reserved modules answer a safe unavailable notice; and
+    implemented modules DELEGATE to the existing command handlers
+    (which re-check authorization themselves).  ``ctl:refresh``
+    re-renders read-only.  This handler renders no data of its own
+    and mutates nothing — ever.
     """
     query = getattr(update, "callback_query", None)
     if query is None:
@@ -457,12 +571,24 @@ async def control_callback(update, context) -> None:
     if op is None:
         await _safe_answer(query, MSG_INVALID)
         return
-    actor = _actor_id(getattr(getattr(query, "from_user", None), "id", None))
-    if actor is None or not is_admin(actor):
-        await _safe_answer(query, MSG_ADMIN_ONLY)
+    actor = await _authorize_actor(query)
+    if actor is None:
         return
 
-    shim = _nav_update(update, _NAV_COMMANDS[op])
+    if op == OP_REFRESH:
+        await _refresh_dashboard(query, actor)
+        return
+
+    module = MODULES_BY_KEY[op]
+    if module.command is None:
+        # Reserved slot — safe not-yet-implemented state, NO reads.
+        await _safe_answer(query, MSG_MODULE_UNAVAILABLE)
+        logger.info(
+            "Control module unavailable: admin=%d module=%s", actor, op
+        )
+        return
+
+    shim = _nav_update(update, module.command)
     if shim is None:
         # Stale press: the message behind the button is gone.
         await _safe_answer(query, MSG_INVALID)
@@ -471,11 +597,11 @@ async def control_callback(update, context) -> None:
     try:
         await _NAVIGATORS[op](shim, context)
     except Exception:
-        # Log actor + surface only — never payloads or tracebacks.
+        # Log actor + module only — never payloads or tracebacks.
         logger.exception(
-            "Control navigation failed: admin=%d surface=%s", actor, op
+            "Control navigation failed: admin=%d module=%s", actor, op
         )
         await _safe_answer(query, MSG_ERROR)
         return
-    await _safe_answer(query, None)
-    logger.info("Control navigation opened: admin=%d surface=%s", actor, op)
+    await _safe_answer(query, BACK_HINT)
+    logger.info("Control navigation opened: admin=%d module=%s", actor, op)
