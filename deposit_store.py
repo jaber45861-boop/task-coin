@@ -55,6 +55,7 @@ never the destination.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -335,15 +336,82 @@ def create_deposit_request(
 
 
 def get_deposit_request(
-    request_id: object, db_path: str | None = None
+    request_id: object,
+    db_path: str | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> DepositRequest | None:
-    """Fetch one deposit intent by id; None for invalid/missing ids."""
+    """Fetch one deposit intent by id; None for invalid/missing ids.
+
+    Connection ownership (MT-ADMIN-29): with ``connection`` the lookup
+    runs on that exact caller-owned connection — borrowed, never
+    committed, rolled back or closed here — so an atomic workflow can
+    re-read its row inside its own transaction without opening a hidden
+    second connection.
+    """
     if not isinstance(request_id, str) or not request_id:
         return None
-    with db.get_connection(db_path) as conn:
-        row = conn.execute(
+    if connection is not None:
+        row = connection.execute(
             f"SELECT {_COLUMNS} FROM deposit_requests "
             "WHERE request_id = ?",
             (request_id,),
         ).fetchone()
+    else:
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM deposit_requests "
+                "WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
     return _row_to_request(row) if row else None
+
+
+def find_request_by_external_tx_id(
+    external_tx_id: str, *, connection: sqlite3.Connection
+) -> str | None:
+    """Request id that already owns ``external_tx_id``, or None.
+
+    Read-only, on the caller's transaction connection (MT-ADMIN-29):
+    one external transaction may credit AT MOST one deposit request —
+    backed by the partial ``ux_deposit_requests_tx`` UNIQUE index.
+    """
+    row = connection.execute(
+        "SELECT request_id FROM deposit_requests "
+        "WHERE external_tx_id = ?",
+        (external_tx_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def mark_credited(
+    request_id: str,
+    external_tx_id: str,
+    updated_at: str,
+    *,
+    connection: sqlite3.Connection,
+) -> bool:
+    """CAS ``pending → credited`` + persist the verified tx id.
+
+    The ONLY write that ever sets ``external_tx_id`` / ``credited``:
+    guarded by ``status = 'pending'`` AND ``external_tx_id IS NULL``
+    so a stale or repeated transition affects zero rows and the caller
+    must treat that as a state conflict (no partial write happens —
+    the surrounding transaction owns the outcome).
+
+    Returns True only when exactly one row transitioned.
+    """
+    cursor = connection.execute(
+        "UPDATE deposit_requests "
+        "SET status = ?, external_tx_id = ?, updated_at = ? "
+        "WHERE request_id = ? AND status = ? "
+        "AND external_tx_id IS NULL",
+        (
+            STATUS_CREDITED,
+            external_tx_id,
+            updated_at,
+            request_id,
+            STATUS_PENDING,
+        ),
+    )
+    return cursor.rowcount == 1
