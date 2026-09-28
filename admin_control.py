@@ -1,9 +1,12 @@
 """
-Admin Control Center Foundation (MT-ADMIN-32)
-=============================================
+Admin Control Center (MT-ADMIN-32 foundation → MT-ADMIN-33 ops)
+==============================================================
 
-The first, deliberately thin layer of a unified Admin Control Center:
-a READ-ONLY dashboard over the EXISTING admin surfaces and stores.
+A deliberately thin, READ-ONLY dashboard over the EXISTING admin
+surfaces and stores, extended operationally (MT-ADMIN-33): attention-
+first queue navigation, richer rate status (value + provider +
+freshness) and an explicit task-review route — still with zero
+financial mutation of its own.
 
 Entry point
 -----------
@@ -16,15 +19,18 @@ identity is ever trusted.  Group/channel invocations stay silent
 (MT-ADMIN-02 isolation) and non-admins get the standard refusal before
 any data is read.
 
-Buttons
--------
+Buttons (MT-ADMIN-33: attention-first)
+--------------------------------------
 ``ctl:<surface>`` — the payload is a FIXED surface identifier from a
-closed set (never user input, ids, secrets, destinations or proof
-references).  The callback re-checks ``config.is_admin`` on every
-press, fails safely on stale/malformed presses, and DELEGATES to the
-existing command handler so navigation lands on the very same surface
-the command opens.  This module never reimplements those surfaces and
-never duplicates the ``wd:`` / ``dp:`` / ``pm:`` / ``atw:`` families.
+closed set (never user input, ids, secrets, amounts, destinations or
+proof references).  The callback re-checks ``config.is_admin`` on
+EVERY press, fails safely on stale/malformed presses, and DELEGATES
+to the existing command handler so navigation lands on the very same
+surface the command opens — the queues that need admin attention
+(withdrawals, deposit proofs, manual task reviews) are first-class
+buttons.  This module never reimplements those surfaces and never
+duplicates the ``wd:`` / ``dp:`` / ``mr(view|vp):`` / ``pm:`` /
+``atw:`` families.
 
 Data rules
 ----------
@@ -35,7 +41,11 @@ Every metric comes from an existing authoritative read:
 * pending withdrawals → ``withdrawal_store.SqliteWithdrawalRepository().list_pending()``
 * pending proofs      → ``deposit_proof_store.list_pending_proofs()``
 * payment methods     → ``payment_method_store.list_payment_methods()``
+  (withdrawal-capable = active — exactly the read behind the
+  user-facing payout list; deposit-enabled = active + opt-in)
 * rate                → ``rate_store.get_current_quote()``
+  (value + provider + freshness — the quote is fresh BY CONTRACT,
+  stale rows raise and render as ``غير متاح``)
 
 No aggregate without an authoritative interface is invented (deposit
 store exposes no list-query for raw pending deposits, so none is
@@ -90,22 +100,27 @@ PAYMETHODS_HEADER = "💳 طرق الدفع"
 RATE_HEADER = "💱 سعر USDT"
 USERS_HEADER = "👤 المستخدمون"
 
-# Button labels — same glyphs as the cards, one button per surface.
-BTN_TASKS = "📋 المهام"
-BTN_WITHDRAWALS = "💸 السحوبات"
-BTN_DEPOSITS = "💵 الإيداعات"
+# Button labels (MT-ADMIN-33) — attention-first: the queues that need
+# admin action lead; the remaining management surfaces follow.
+BTN_REVIEWS = "📋 مراجعات المهام"
+BTN_WITHDRAWALS = "💸 السحوبات المعلقة"
+BTN_DEPOSITS = "💵 إثباتات الدفع"
 BTN_PAYMETHODS = "💳 طرق الدفع"
-BTN_RATE = "💱 سعر USDT"
+BTN_TASKS = "📋 المهام"
+BTN_RATE = "💱 إدارة السعر"
 
 # Closed callback set — ``ctl:<surface>`` with a fixed surface id only.
 CALLBACK_PREFIX = "ctl:"
-_SURFACE_RE = re.compile(r"ctl:(tasks|withdrawals|deposits|paymethods|rate)")
+_SURFACE_RE = re.compile(
+    r"ctl:(tasks|reviews|withdrawals|deposits|paymethods|rate)"
+)
 
 # Navigation: surface → the EXISTING command text (for the shim) and
 # the existing handler that renders the real surface (looked up at
 # call time so tests can spy and imports never cycle).
 _NAV_COMMANDS = {
     "tasks": "/listtasks",
+    "reviews": "/reviews",
     "withdrawals": "/withdrawals",
     "deposits": "/deposits",
     "paymethods": "/paymethods",
@@ -177,7 +192,13 @@ def _count_pending_proofs() -> int:
 
 
 def _payment_method_counts() -> tuple[int, int]:
-    """(active, deposit-enabled among active) — one existing list read."""
+    """(active withdrawal-capable, active deposit-enabled).
+
+    One existing list read: ``is_active`` IS the withdrawal-capable
+    set (the user-facing payout list reads exactly
+    ``list_payment_methods(active_only=True)``) and the
+    ``deposits_enabled`` opt-in gates the user deposit list.
+    """
     methods = payment_method_store.list_payment_methods()
     active = sum(1 for m in methods if m.is_active)
     deposit_enabled = sum(
@@ -186,19 +207,22 @@ def _payment_method_counts() -> tuple[int, int]:
     return active, deposit_enabled
 
 
-def _current_rate_text() -> str | None:
-    """Fresh quote rate text, or None (missing/stale/corrupt row).
+def _current_rate_quote() -> tuple[str, str] | None:
+    """Fresh ``(rate text, provider)``, or None (missing/stale row).
 
     Uses ``rate_store.get_current_quote()`` — the ONE authoritative
-    read.  No RateQuote is ever constructed here and no rate is ever
-    read from ``platform_settings``.
+    read (MT-ADMIN-26).  A returned quote is fresh BY CONTRACT, so the
+    freshness state is ``صالح``; missing/stale/corrupt rows raise and
+    degrade to a safe unavailable state.  No RateQuote is ever
+    constructed here and no rate is ever read from
+    ``platform_settings``.
     """
     try:
         quote = rate_store.get_current_quote()
     except (RateQuoteError, RateStoreError):
         # Missing / stale / invalid persisted row → safe status.
         return None
-    return quote.rate_text
+    return quote.rate_text, quote.provider
 
 
 def collect_snapshot() -> dict:
@@ -220,7 +244,7 @@ def collect_snapshot() -> dict:
         ),
         "pm_active": pm_active,
         "pm_deposit_enabled": pm_deposit,
-        "rate": _metric("rate", _current_rate_text),
+        "rate": _metric("rate", _current_rate_quote),
     }
 
 
@@ -231,9 +255,16 @@ def _num(value: object) -> str:
 def build_dashboard_text(snapshot: dict) -> str:
     """Plain-text dashboard (Arabic, compact, mobile-friendly)."""
     rate = snapshot.get("rate")
-    rate_line = (
-        f"USDT/EGP: {rate} — صالح" if rate else f"USDT/EGP: {NA}"
-    )
+    if isinstance(rate, tuple) and len(rate) == 2:
+        # Fresh quote → value, provider, freshness state (all three
+        # come straight from the authoritative quote — never built).
+        rate_lines = [
+            f"{rate[0]} USDT/EGP",
+            f"المصدر: {rate[1]}",
+            "الحالة: صالح",
+        ]
+    else:
+        rate_lines = [f"USDT/EGP: {NA}"]
     lines = [
         HEADER,
         "",
@@ -252,7 +283,7 @@ def build_dashboard_text(snapshot: dict) -> str:
         f"طرق الإيداع المتاحة: {_num(snapshot.get('pm_deposit_enabled'))}",
         "",
         RATE_HEADER,
-        rate_line,
+        *rate_lines,
         "",
         USERS_HEADER,
         f"الإحصائيات: {NA}",
@@ -261,24 +292,32 @@ def build_dashboard_text(snapshot: dict) -> str:
 
 
 def build_dashboard_keyboard() -> InlineKeyboardMarkup:
-    """Navigation buttons — fixed ``ctl:<surface>`` payloads only."""
+    """Attention-first navigation — fixed ``ctl:<surface>`` payloads.
+
+    The queues requiring an admin decision lead the keyboard; every
+    button routes to the EXISTING operational surface (no review,
+    approval or rejection logic lives here).
+    """
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(BTN_TASKS, callback_data="ctl:tasks"),
                 InlineKeyboardButton(
                     BTN_WITHDRAWALS, callback_data="ctl:withdrawals"
+                ),
+                InlineKeyboardButton(
+                    BTN_DEPOSITS, callback_data="ctl:deposits"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    BTN_DEPOSITS, callback_data="ctl:deposits"
+                    BTN_REVIEWS, callback_data="ctl:reviews"
                 ),
                 InlineKeyboardButton(
                     BTN_PAYMETHODS, callback_data="ctl:paymethods"
                 ),
             ],
             [
+                InlineKeyboardButton(BTN_TASKS, callback_data="ctl:tasks"),
                 InlineKeyboardButton(BTN_RATE, callback_data="ctl:rate"),
             ],
         ]
@@ -330,6 +369,10 @@ async def _open_tasks(shim, context) -> None:
     await bot.list_tasks(shim, context)
 
 
+async def _open_reviews(shim, context) -> None:
+    await admin_review_queue.reviews_command(shim, context)
+
+
 async def _open_withdrawals(shim, context) -> None:
     await withdrawal_admin.withdrawals_command(shim, context)
 
@@ -348,6 +391,7 @@ async def _open_rate(shim, context) -> None:
 
 _NAVIGATORS = {
     "tasks": _open_tasks,
+    "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
     "deposits": _open_deposits,
     "paymethods": _open_paymethods,

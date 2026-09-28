@@ -53,6 +53,20 @@ E. REGISTRATION (32-34)
   33  ctl: callback registered exactly once (group 5)
   34  exactly one "control" / "^ctl:" registration literal in bot.py
 
+G. MT-ADMIN-33 — OPERATIONAL EXTENSION
+  - attention-first keyboard: decision queues lead; ``ctl:reviews``
+    added to the closed payload set (still fixed ids only)
+  - rate card shows value + provider + freshness state, all from the
+    one ``rate_store.get_current_quote()`` quote
+  - no rate read from ``platform_settings`` (structural + runtime)
+  - EVERY ctl op re-checks authorization (non-admin AND group for all
+    six surfaces — the target handler is never invoked)
+  - ``ctl:reviews`` delegates to the EXISTING /reviews queue (real
+    empty + real pending-claim renders; shim identity checked)
+  - mutation sweep extended to every op incl. reviews, plus the
+    task-review decision entry points
+  - registration still exactly once for /control and ^ctl:
+
 Temp databases only; no production destinations or balances are used.
 
 Run:
@@ -78,6 +92,7 @@ import deposit_manual_review
 import deposit_proof_admin
 import deposit_proof_store
 import deposit_store
+import manual_task
 import payment_method_admin
 import payment_method_store
 import platform_settings
@@ -144,6 +159,10 @@ MUTATION_SPY_TARGETS = (
     (deposit_proof_store, "mark_reviewed"),
     (deposit_manual_review, "approve"),
     (deposit_manual_review, "reject"),
+    # Task-review decision entry points (MT-ADMIN-33: the reviews
+    # button must only NAVIGATE — never decide).
+    (admin_review_queue, "handle_review_callback"),
+    (manual_task.ManualReviewService, "decide"),
 )
 
 FINANCIAL_TABLES = (
@@ -426,18 +445,43 @@ class TestMetrics(ControlTestBase):
         self.assertIn("طرق الإيداع المتاحة: 1", text2)
 
     def test_10_rate_display_uses_get_current_quote(self) -> None:
-        """10. Rate card is sourced from rate_store.get_current_quote."""
+        """10. Rate card (value + provider + state) is sourced from
+        rate_store.get_current_quote — never built by hand."""
         with mock.patch.object(rate_store, "get_current_quote") as src:
-            src.return_value = mock.Mock(rate_text="77.77")
+            src.return_value = mock.Mock(
+                rate_text="77.77", provider="manual"
+            )
             text = _reply(self._cmd())
         src.assert_called_once()
-        self.assertIn("USDT/EGP: 77.77 — صالح", text)
+        self.assertIn("77.77 USDT/EGP", text)
+        self.assertIn("المصدر: manual", text)
+        self.assertIn("الحالة: صالح", text)
 
     def test_11_fresh_rate_renders_canonical_quote(self) -> None:
-        """11. A fresh persisted rate renders exactly like the spec."""
+        """11. A fresh persisted rate renders value + provider + state
+        exactly from the authoritative quote."""
         self._seed_rate("48.5")
         text = _reply(self._cmd())
-        self.assertIn("USDT/EGP: 48.5 — صالح", text)
+        self.assertIn("48.5 USDT/EGP", text)
+        self.assertIn("المصدر: manual", text)
+        self.assertIn("الحالة: صالح", text)
+
+    def test_13b_no_rate_read_from_platform_settings(self) -> None:
+        """13. The rate NEVER comes from platform_settings — the module
+        never references it and rendering consults no setting."""
+        source = open(admin_control.__file__, encoding="utf-8").read()
+        self.assertIsNone(re.search(r"platform_settings\s*\.", source))
+
+        self._seed_rate("48.5")
+        with mock.patch.object(
+            platform_settings, "get_setting"
+        ) as get_setting, mock.patch.object(
+            platform_settings, "get_required_setting"
+        ) as get_required:
+            text = _reply(self._cmd())
+        get_setting.assert_not_called()
+        get_required.assert_not_called()
+        self.assertIn("48.5 USDT/EGP", text)
 
     def test_12_missing_rate_is_safe_unavailable(self) -> None:
         """12. No rate ever set -> safe status, dashboard still up."""
@@ -532,6 +576,7 @@ class TestNavigation(ControlTestBase):
                 "ctl:deposits",
                 "ctl:paymethods",
                 "ctl:rate",
+                "ctl:reviews",
                 "ctl:tasks",
                 "ctl:withdrawals",
             ],
@@ -644,6 +689,84 @@ class TestNavigation(ControlTestBase):
         )
         self.assertTrue(update.callback_query.message.reply_text.called)
 
+    # ── MT-ADMIN-33 operational extension ──────────────────────
+
+    def test_17b_attention_first_keyboard(self) -> None:
+        """MT-ADMIN-33: decision queues lead with explicit labels."""
+        markup = build_dashboard_keyboard()
+        data = self._buttons(markup)
+        self.assertEqual(
+            data[:3], ["ctl:withdrawals", "ctl:deposits", "ctl:reviews"]
+        )
+        labels = [
+            button.text
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            labels[:3],
+            [
+                admin_control.BTN_WITHDRAWALS,
+                admin_control.BTN_DEPOSITS,
+                admin_control.BTN_REVIEWS,
+            ],
+        )
+        self.assertIn(admin_control.BTN_TASKS, labels)
+        self.assertIn(admin_control.BTN_PAYMETHODS, labels)
+        self.assertIn(admin_control.BTN_RATE, labels)
+
+    def test_19b_press_reviews_lands_on_existing_queue(self) -> None:
+        """ctl:reviews invokes the EXISTING /reviews surface."""
+        update = self._press("ctl:reviews")
+        reply = update.callback_query.message.reply_text
+        self.assertTrue(reply.called)
+        self.assertEqual(
+            reply.call_args[0][0], admin_review_queue.MSG_NO_REVIEWS
+        )
+        update.callback_query.answer.assert_awaited()
+
+    def test_21b_reviews_shim_carries_identity_and_command(self) -> None:
+        """The reviews delegation re-presents a private /reviews."""
+        with mock.patch.object(
+            admin_review_queue, "reviews_command", new=mock.AsyncMock()
+        ) as target:
+            self._press("ctl:reviews")
+        target.assert_awaited_once()
+        shim, _context = target.await_args[0]
+        self.assertEqual(shim.effective_user.id, ADMIN_ID)
+        self.assertEqual(shim.effective_chat.type, "private")
+        self.assertEqual(shim.message.text, "/reviews")
+
+    def test_22b_every_callback_rechecks_authorization(self) -> None:
+        """5. EVERY ctl op re-checks admin before touching anything —
+        non-admin and group presses never reach the target handler."""
+        import bot as bot_mod
+
+        targets = (
+            ("tasks", bot_mod, "list_tasks"),
+            ("reviews", admin_review_queue, "reviews_command"),
+            ("withdrawals", withdrawal_admin, "withdrawals_command"),
+            ("deposits", deposit_proof_admin, "deposits_command"),
+            ("paymethods", payment_method_admin, "paymethods_command"),
+            ("rate", rate_admin, "setrate_command"),
+        )
+        for op, module, name in targets:
+            with mock.patch.object(
+                module, name, new=mock.AsyncMock()
+            ) as target:
+                update = self._press(f"ctl:{op}", actor_id=STRANGER)
+            target.assert_not_awaited()
+            self.assertEqual(
+                _answered(update.callback_query), MSG_ADMIN_ONLY, op
+            )
+
+            with mock.patch.object(
+                module, name, new=mock.AsyncMock()
+            ) as target:
+                update = self._press(f"ctl:{op}", chat_type="supergroup")
+            target.assert_not_awaited()
+            self.assertIsNone(_answered(update.callback_query), op)
+
 
 # ══════════════════════════════════════════════════════════════════
 # D. SAFETY / SECURITY (25-31)
@@ -689,6 +812,7 @@ class TestSafety(ControlTestBase):
         self._cmd()
         for surface in (
             "tasks",
+            "reviews",
             "withdrawals",
             "deposits",
             "paymethods",
@@ -705,6 +829,7 @@ class TestSafety(ControlTestBase):
         """28. Callback data never carries ids, input or secrets."""
         for surface in (
             "tasks",
+            "reviews",
             "withdrawals",
             "deposits",
             "paymethods",
@@ -852,6 +977,22 @@ class TestRealPendingReviewCount(QueueTestBase):
         self.assertIn(f"بانتظار المراجعة: {len(pending)}", text)
         expected_active = len(db.list_tasks(active_only=True))
         self.assertIn(f"المهام النشطة: {expected_active}", text)
+
+    def test_reviews_navigation_shows_real_pending_claim(self) -> None:
+        """MT-ADMIN-33: ctl:reviews lands on the REAL queue with the
+        claim rendered by the existing surface — never a second
+        review implementation."""
+        self._open_claim()
+        update = _callback(INBOX_ADMIN_A, "ctl:reviews")
+        update.callback_query.message.reply_text = mock.AsyncMock()
+        _run(admin_control.control_callback(update, mock.MagicMock()))
+        reply = update.callback_query.message.reply_text
+        text = reply.call_args[0][0]
+        self.assertTrue(
+            text.startswith(admin_review_queue.MSG_QUEUE_HEADER), text
+        )
+        # The REAL pending claim is rendered by the existing surface.
+        self.assertIn("مهمة مراجعة تجريبية", text)
 
 
 if __name__ == "__main__":

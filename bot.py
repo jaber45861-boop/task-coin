@@ -2089,11 +2089,12 @@ def main() -> None:
         deposit_proof_admin.proof_callback, pattern=r"^dp:",
     ), group=5)
 
-    # MT-ADMIN-32: control-center navigation buttons.  Payloads are
-    #    ctl:<surface> fixed surface identifiers only — the callback
-    #    re-checks config.is_admin server-side and DELEGATES to the
-    #    existing command handlers (listtasks/withdrawals/deposits/
-    #    paymethods/setrate); it renders no data of its own and never
+    # MT-ADMIN-32/33: control-center navigation buttons (attention-
+    #    first queues first).  Payloads are ctl:<surface> fixed surface
+    #    identifiers only — the callback re-checks config.is_admin
+    #    server-side and DELEGATES to the existing command handlers
+    #    (listtasks/reviews/withdrawals/deposits/paymethods/setrate);
+    #    it renders no data of its own and never
     #    touches any financial state (ledger, holds, deposits,
     #    withdrawals, payment methods, rates or tasks), and never
     #    duplicates the wd:/dp: families.
