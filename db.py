@@ -12,7 +12,7 @@ import threading
 from typing import Iterator, Optional
 from contextlib import contextmanager
 
-from config import Channel, CHANNELS
+from config import ADMINS, Channel, CHANNELS
 # USDT scale authority (1 USDT = 100,000,000 atomic units).  Importing
 # the module (not its attributes) keeps the runtime-only cycle safe in
 # both import orders: neither module touches the other at import time.
@@ -184,6 +184,151 @@ def transaction(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
 # Persisted per user in users.language.  The value is constrained to
 # exactly these codes by is_supported_language() / set_user_language().
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("ar", "en", "ru", "fa")
+
+
+# ── Administrative administrators (MT-ADMIN-37) ──────────────────────
+# THE authoritative persistent admin registry: the single source the
+# Admin Control Center's ``admins`` module manages (list / detail /
+# add / remove) and ONE half of the single centralized authorization
+# decision — ``config.is_admin`` consults ``is_admin_user`` after the
+# configured bootstrap list (``config.ADMINS``), never a second one.
+# Identity is ALWAYS the Telegram numeric user_id; usernames, user
+# passwords, tokens, initData and profile dumps are never stored.
+
+
+def _validate_admin_user_id(user_id: object) -> int:
+    """Reject anything that is not a positive, int64-safe id."""
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or user_id > _SQLITE_INT64_MAX
+    ):
+        raise ValueError("admin user_id must be a positive int")
+    return user_id
+
+
+def is_admin_user(user_id: int, db_path: str | None = None) -> bool:
+    """True when *user_id* is an ACTIVE administrator (the store
+    half of the single ``config.is_admin`` decision).
+
+    Defensive by design: authorization fails CLOSED and never raises
+    — a missing database file or a missing table (a fresh path, not
+    yet initialized) answers False WITHOUT creating anything.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not os.path.exists(db_path):
+        return False  # never create a stray file for a lookup
+    try:
+        with get_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM admin_users WHERE user_id = ? AND active = 1",
+                (user_id,),
+            ).fetchone()
+            return row is not None
+    except sqlite3.Error:
+        return False  # uninitialized schema — fail closed
+
+
+def list_admin_users(
+    active_only: bool = False, db_path: str | None = None
+) -> list[dict]:
+    """Administrator rows in deterministic ``user_id ASC`` order.
+
+    The ONE authoritative admin list read (read-only).  The registry
+    is small by nature; the Control Center still pages it.
+    """
+    with get_connection(db_path) as conn:
+        query = (
+            "SELECT user_id, active, created_at, added_by FROM admin_users"
+        )
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY user_id ASC"
+        return [dict(row) for row in conn.execute(query).fetchall()]
+
+
+def get_admin_user(
+    user_id: int, db_path: str | None = None
+) -> dict | None:
+    """One administrator row (active flag included), or None."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT user_id, active, created_at, added_by "
+            "FROM admin_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def add_admin_user(
+    user_id: int, added_by: int | None = None,
+    db_path: str | None = None,
+) -> str:
+    """Ensure *user_id* is an active administrator — ONE idempotent
+    authoritative operation (the add-confirm calls it exactly once).
+
+    Returns:
+        ``created``      a new row was inserted
+        ``reactivated``  an existing inactive row was re-enabled
+        ``exists``       already active — NO write (duplicate-proof)
+
+    Concurrency: the insert path is IntegrityError-safe, so two
+    simultaneous confirmations can never create duplicate records.
+    """
+    _validate_admin_user_id(user_id)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT active FROM admin_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            try:
+                conn.execute(
+                    "INSERT INTO admin_users (user_id, active, added_by) "
+                    "VALUES (?, 1, ?)",
+                    (user_id, added_by),
+                )
+                return "created"
+            except sqlite3.IntegrityError:
+                return "exists"  # lost a benign race — idempotent
+        if row["active"]:
+            return "exists"
+        conn.execute(
+            "UPDATE admin_users SET active = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        return "reactivated"
+
+
+def remove_admin_user(
+    user_id: int, db_path: str | None = None
+) -> str:
+    """Soft-remove: flip active 1 → 0 — ONE authoritative operation.
+
+    Returns:
+        ``removed``         was active, now off
+        ``already_removed`` inactive row (idempotent, no write)
+        ``missing``         no such row
+
+    Policy checks (configured-bootstrap / final-admin) belong to the
+    authorized caller — this primitive only records the state change.
+    """
+    _validate_admin_user_id(user_id)
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE admin_users SET active = 0 "
+            "WHERE user_id = ? AND active = 1",
+            (user_id,),
+        )
+        if cursor.rowcount:
+            return "removed"
+        row = conn.execute(
+            "SELECT 1 FROM admin_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return "already_removed" if row else "missing"
 
 
 def init_db(db_path: str | None = None) -> None:
@@ -655,6 +800,43 @@ def init_db(db_path: str | None = None) -> None:
             ON social_accounts (user_id, provider)
             WHERE status = 'linked'
         """)
+
+        # ── Administrative administrators (MT-ADMIN-37) ─────────────
+        # Additive migration only: brand-new table.  THE persistent
+        # admin registry the Control Center's admins module manages;
+        # config.is_admin() consults it (via db.is_admin_user) after
+        # the configured bootstrap list — the SAME union this module's
+        # list surface renders.
+        #   user_id   Telegram numeric id — the ONLY identity key
+        #   active    1 = current administrator; removal is a soft
+        #             state flip so audit history is never destroyed
+        #   added_by  the administrator id that added this record
+        #             (NULL = configured/bootstrap record)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                user_id INTEGER PRIMARY KEY,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                added_by INTEGER
+            )
+        """)
+        # Deterministic, idempotent bootstrap: every configured
+        # config.ADMINS id gets its authoritative row AND an active
+        # state (INSERT OR IGNORE + UPDATE — repeated init_db() runs
+        # can never duplicate a record, and a configured admin is
+        # always active after initialization).  A configured admin
+        # would stay authorized even if this sync were skipped,
+        # because config.is_admin checks the configured list FIRST.
+        for bootstrap_id in ADMINS:
+            conn.execute(
+                "INSERT OR IGNORE INTO admin_users "
+                "(user_id, active, added_by) VALUES (?, 1, NULL)",
+                (bootstrap_id,),
+            )
+            conn.execute(
+                "UPDATE admin_users SET active = 1 WHERE user_id = ?",
+                (bootstrap_id,),
+            )
 
         # ── Admin notification linkage (MT-ADMIN-03) ───────────────
         # Additive migration only: a brand-new table.  Persists the

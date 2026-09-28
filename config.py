@@ -14,9 +14,12 @@ Usage:
         ...
 """
 
+import logging
 import os
 from typing import Dict
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # ── Admin Configuration ──────────────────────────────────────────────
 # List of Telegram user IDs that have admin privileges.
@@ -27,8 +30,37 @@ ADMINS: list[int] = [
 
 
 def is_admin(user_id: int) -> bool:
-    """Return True if user_id is in the ADMINS list."""
-    return user_id in ADMINS
+    """Return True when *user_id* is an authorized administrator.
+
+    THE single centralized authorization decision (MT-ADMIN-37 keeps
+    this exact API — there is no second ``is_admin`` anywhere):
+
+    1. the configured bootstrap list ``ADMINS`` is honored FIRST, so
+       a configured administrator can never be locked out by a
+       missing/absent database row; then
+    2. the persistent ``admin_users`` store (``db.is_admin_user``) —
+       the authoritative registry the Admin Control Center's
+       ``admins`` module manages (list/add/remove).
+
+    The store lookup is imported LAZILY inside the function because
+    ``db`` imports ``config`` at module scope (this avoids an import
+    cycle), and it fails CLOSED: any store error answers False for
+    non-bootstrap ids and is logged without exposing anything.
+    """
+    if user_id in ADMINS:
+        return True
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+    ):
+        return False
+    try:
+        import db  # lazy: db imports config at module import time
+        return db.is_admin_user(user_id)
+    except Exception:
+        logger.debug("Admin store lookup failed", exc_info=True)
+        return False
 
 
 # ── Channel Data Model ───────────────────────────────────────────────

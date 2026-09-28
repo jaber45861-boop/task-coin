@@ -996,7 +996,9 @@ class TestAdminSystemFoundation(ControlTestBase):
         "rewards",
         "broadcast",
         "settings",
-        "admins",
+        # "admins" is reserved no more (MT-ADMIN-37 renders the
+        # admin-management panel in place) — covered by
+        # test_admin_admins.py instead.
         "logs",
         "health",
     )
