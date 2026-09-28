@@ -40,6 +40,7 @@ from flask import Flask, send_from_directory
 from waitress import create_server
 
 import db
+import admin_control
 import admin_review_queue
 import admin_task_wizard
 import manual_proof_inbox
@@ -1984,6 +1985,17 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "deposits", deposit_proof_admin.deposits_command,
     ), group=0)
+
+    # MT-ADMIN-32: /control — Admin Control Center foundation.  A
+    #    thin, READ-ONLY dashboard over the existing stores (aggregate
+    #    counts + current rate status) with navigation buttons to the
+    #    existing admin surfaces.  Private admin chat ONLY;
+    #    authorization is enforced inside the handler (config.is_admin)
+    #    and no financial state of any kind is mutated.  Not added to
+    #    the BotCommand menu, same as the other admin commands.
+    app.add_handler(CommandHandler(
+        "control", admin_control.control_command,
+    ), group=0)
     # MT-ADMIN-05: wizard free-text answers (title, target,
     #    instructions, reward, repeat hours).  Registered LAST in
     #    group 0 so the add/remove-channel conversations consume their
@@ -2075,6 +2087,18 @@ def main() -> None:
     #    admin's manual verification and never credits by itself.
     app.add_handler(CallbackQueryHandler(
         deposit_proof_admin.proof_callback, pattern=r"^dp:",
+    ), group=5)
+
+    # MT-ADMIN-32: control-center navigation buttons.  Payloads are
+    #    ctl:<surface> fixed surface identifiers only — the callback
+    #    re-checks config.is_admin server-side and DELEGATES to the
+    #    existing command handlers (listtasks/withdrawals/deposits/
+    #    paymethods/setrate); it renders no data of its own and never
+    #    touches any financial state (ledger, holds, deposits,
+    #    withdrawals, payment methods, rates or tasks), and never
+    #    duplicates the wd:/dp: families.
+    app.add_handler(CallbackQueryHandler(
+        admin_control.control_callback, pattern=r"^ctl:",
     ), group=5)
 
     # Register the Mini App menu button (Open button) via post_init.
