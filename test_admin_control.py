@@ -77,8 +77,9 @@ H. MT-ADMIN-34 — ADMIN SYSTEM FOUNDATION (35-42)
   - foreign callback families (wd/dp/pm/mr/atw/mproof) still
     registered exactly once; this module builds no foreign payload
   - successful navigation answers with the /control back hint
-  - sectioned dashboard layout; the users slot honestly shows
-    غير متاح (no fake metric, no user records)
+  - sectioned dashboard layout; the users slot shows the
+    authoritative db.count_users() total (MT-ADMIN-35 — the full
+    user-management surface is covered in test_admin_users.py)
 
 Temp databases only; no production destinations or balances are used.
 
@@ -987,7 +988,6 @@ class TestAdminSystemFoundation(ControlTestBase):
     navigation, sectioned layout and namespace integrity."""
 
     PLACEHOLDERS = (
-        "users",
         "rewards",
         "broadcast",
         "settings",
@@ -1170,7 +1170,8 @@ class TestAdminSystemFoundation(ControlTestBase):
         self.assertIn("/control", admin_control.BACK_HINT)
 
     def test_42_dashboard_layout_sections_and_users_slot(self) -> None:
-        """§9/§11: sectioned dashboard; users honestly unavailable."""
+        """§9/§11/§13: sectioned dashboard; the users slot carries the
+        authoritative db.count_users() total (0 in this empty DB)."""
         text = _reply(self._cmd())
         self.assertIn(HEADER, text)
         self.assertIn(admin_control.SEPARATOR, text)
@@ -1180,7 +1181,7 @@ class TestAdminSystemFoundation(ControlTestBase):
             f"{admin_control.SYSTEM_SECTION}",
             text,
         )
-        self.assertIn(f"{USERS_HEADER}\n{admin_control.NA}", text)
+        self.assertIn(f"{USERS_HEADER}: 0", text)
         self.assertLess(
             text.index(admin_control.OVERVIEW_HEADER),
             text.index(TASKS_HEADER),

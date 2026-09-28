@@ -1017,6 +1017,62 @@ def init_db(db_path: str | None = None) -> None:
         logger.info("Database initialized: %s", db_path or DB_PATH)
 
 
+# ── Authoritative user administration reads (MT-ADMIN-35) ────────────
+# The ONLY user-listing interfaces in the repository.  Read-only,
+# parameterized, deterministically ordered and hard-bounded — the
+# Telegram admin control center builds on these and issues no SQL of
+# its own.  No wallet, ledger, destination or secret column is ever
+# selected here.
+
+# Hard upper bound for any single users read: no caller can ever ask
+# the store for an unbounded page, regardless of what it passes.
+MAX_USER_LIST_LIMIT = 100
+
+
+def count_users(db_path: str | None = None) -> int:
+    """Total registered users — the ONE authoritative user count.
+
+    Read-only COUNT over the ``users`` table.  Both the ``/control``
+    dashboard metric and the admin user-management module read this
+    same function, so no cached or duplicated count can drift.
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+        return row["count"]
+
+
+def list_users(
+    limit: int, offset: int = 0, db_path: str | None = None
+) -> list[dict]:
+    """One bounded page of users in deterministic order (read-only).
+
+    Ordering is ``user_id DESC``: Telegram user ids grow over time, so
+    this is newest-registration-first with a unique, indexed
+    tiebreaker — repeated calls return the identical order.  Only the
+    safe identity columns (user_id / username / first_name) are
+    selected; never language, referrals, or anything financial.
+
+    Bounds: ``limit`` is clamped to ``MAX_USER_LIST_LIMIT`` and a
+    non-positive page (or negative offset) resolves to an empty list,
+    so no caller can trigger an unbounded read.  Type errors are
+    raised instead of being silently coerced — bools included.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("limit must be an int")
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise TypeError("offset must be an int")
+    limit = min(limit, MAX_USER_LIST_LIMIT)
+    if limit <= 0 or offset < 0:
+        return []
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT user_id, username, first_name FROM users "
+            "ORDER BY user_id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
 def get_withdrawal_request(
     request_id: str, db_path: str | None = None
 ) -> dict | None:

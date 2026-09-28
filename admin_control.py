@@ -37,10 +37,14 @@ database.  ``ctl:<key>`` payloads are exactly the registry keys plus
 the fixed ``refresh`` operation — bounded and static, never amounts,
 destinations, rows, JSON or user input — and stay clear of every
 foreign namespace (``wd:`` / ``dp:`` / ``pm:`` / ``mr(view|vp):`` /
-``atw:`` / ``mproof:`` / ``sup:``).  Reserved modules (users, rewards,
+``atw:`` / ``mproof:`` / ``sup:``).  Reserved modules (rewards,
 broadcast, settings, admins, logs, health) answer with a safe
 not-yet-available notice — never fake functionality, never fake
-metrics.
+metrics.  The ``users`` module (MT-ADMIN-35) is rendered IN PLACE by
+this module itself over a small closed ``ctl:users[:…]`` sub-grammar
+(bounded digits only — never JSON, never free text, never amounts or
+destinations) built strictly on the authoritative read-only store
+interfaces: ``db.count_users`` / ``db.list_users`` / ``db.get_user``.
 
 Back navigation
 ---------------
@@ -62,7 +66,10 @@ Data rules (authoritative reads only)
 * rate                → ``rate_store.get_current_quote()`` — value,
   provider and freshness; never constructed, never from
   ``platform_settings`` (fresh BY CONTRACT; stale rows raise)
-* users               → no authoritative safe read exists → ``غير متاح``
+* users               → ``db.count_users()`` (the dashboard metric),
+  ``db.list_users()`` (one bounded, deterministically ordered page)
+  and ``db.get_user()`` (detail) — identity fields only; no wallet,
+  no destinations, no fabricated activity/new-user classifications
 
 No aggregate without an authoritative interface is invented (deposit
 store exposes no list-query for raw pending deposits, so none is
@@ -80,6 +87,7 @@ payment destination can reach the dashboard output.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -106,6 +114,7 @@ MSG_ADMIN_ONLY = "⛔ هذا الأمر للمشرفين فقط."
 MSG_INVALID = "⛔ طلب غير صالح."
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 MSG_MODULE_UNAVAILABLE = "🔒 هذه الوحدة غير متاحة بعد."
+MSG_USER_NOT_FOUND = "⛔ المستخدم غير موجود."
 BACK_HINT = "↩️ للعودة اكتب: /control"
 
 NA = "غير متاح"
@@ -122,12 +131,19 @@ DEPOSITS_HEADER = "💵 الإيداعات"
 PAYMETHODS_HEADER = "💳 طرق الدفع"
 RATE_HEADER = "💱 سعر USDT"
 USERS_HEADER = "👤 المستخدمون"
+USERS_PANEL_HEADER = "👤 إدارة المستخدمين"
+USER_DETAIL_HEADER = "👤 المستخدم"
+# Small fixed page: bounded reads, mobile-friendly rendering.  The
+# page INDEX is clamped server-side, never trusted from the payload.
+USERS_PAGE_SIZE = 5
 
 # ── Module registry (MT-ADMIN-34) ─────────────────────────────────────
 # Static navigation metadata for ONE admin module.  ``command`` is the
 # EXISTING command the Control Center delegates to; ``None`` reserves
-# the slot with a safe unavailable state.  No financial state, no
-# secrets, no ids — deliberately NOT a database and NOT a framework.
+# the slot with a safe unavailable state — except ``users``
+# (MT-ADMIN-35), which this module renders in place itself.  No
+# financial state, no secrets, no ids — deliberately NOT a database
+# and NOT a framework.
 
 
 @dataclass(frozen=True)
@@ -139,7 +155,10 @@ class AdminModule:
 
 
 MODULES: tuple[AdminModule, ...] = (
-    AdminModule("users", "👥 المستخدمون", "قراءة مستخدمين آمنة (قريباً)"),
+    # ``command=None``: users has no separate command — it is
+    # rendered in place by this module (MT-ADMIN-35), unlike the
+    # reserved slots below which answer a safe unavailable notice.
+    AdminModule("users", "👥 المستخدمون", "إدارة مستخدمين (قراءة فقط)"),
     AdminModule("tasks", "📋 المهام", "قائمة المهام الحالية", "/listtasks"),
     AdminModule(
         "reviews", "📋 مراجعات المهام", "طابور المراجعة اليدوية", "/reviews"
@@ -168,6 +187,20 @@ MODULES_BY_KEY: dict[str, AdminModule] = {m.key: m for m in MODULES}
 CALLBACK_PREFIX = "ctl:"
 OP_REFRESH = "refresh"
 _KNOWN_OPS = frozenset(MODULES_BY_KEY) | {OP_REFRESH}
+
+# MT-ADMIN-35: the in-place users module owns a small closed
+# sub-grammar under the SAME ctl: namespace — bounded digits only,
+# never JSON, never user-supplied text, never foreign families:
+#   ctl:users            user dashboard + first page
+#   ctl:users:p:<page>   one page (index clamped server-side)
+#   ctl:users:v:<id>     one bounded Telegram user id (detail view)
+#   ctl:users:back       back to the user list
+# Bounds keep stale/oversized presses out of the handler entirely:
+# pages ≤ 9 digits, ids ≤ 15 digits.
+OP_USERS = "users"
+USERS_BACK_OP = "users:back"
+_USERS_PAGE_RE = re.compile(r"users:p:([0-9]{1,9})")
+_USERS_DETAIL_RE = re.compile(r"users:v:([0-9]{1,15})")
 
 
 # ── Shared MT-ADMIN-02 isolation helpers (inlined, no import cycle) ───
@@ -258,6 +291,12 @@ def _metric(name: str, factory):
         return None
 
 
+def _count_users() -> int:
+    """Authoritative total users — the ONE source behind BOTH the
+    dashboard metric and the users module (no cached count)."""
+    return db.count_users()
+
+
 def _count_active_tasks() -> int:
     return len(db.list_tasks(active_only=True))
 
@@ -315,6 +354,7 @@ def collect_snapshot() -> dict:
         pm_counts if pm_counts is not None else (None, None)
     )
     return {
+        "users_total": _metric("users_total", _count_users),
         "tasks_active": _metric("tasks_active", _count_active_tasks),
         "tasks_pending_review": _metric(
             "tasks_pending_review", _count_pending_reviews
@@ -355,8 +395,9 @@ def build_dashboard_text(snapshot: dict) -> str:
         "",
         OVERVIEW_HEADER,
         "",
-        USERS_HEADER,
-        NA,  # no authoritative safe user read exists (§11) — honestly so.
+        # MT-ADMIN-35: authoritative count from db.count_users() via
+        # collect_snapshot — the same source the users module reads.
+        f"{USERS_HEADER}: {_num(snapshot.get('users_total'))}",
         "",
         TASKS_HEADER,
         f"المهام النشطة: {_num(snapshot.get('tasks_active'))}",
@@ -415,17 +456,30 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
 
 
 def parse_callback(data: object) -> str | None:
-    """Registry key (or ``refresh``) from ``ctl:<op>``, else None.
+    """Registry key, ``refresh`` or a canonical users sub-op, else None.
 
-    The closed op set is the static registry — unknown, malformed and
-    foreign-namespace payloads (``wd:``, ``dp:``, ...) fail safely.
+    The closed op set is the static registry plus the bounded-digits
+    ``users`` grammar (MT-ADMIN-35).  Unknown, malformed, oversized and
+    foreign-namespace payloads (``wd:``, ``dp:``, ...) fail safely with
+    None.  Numeric payloads are canonicalized (``users:p:007`` →
+    ``users:p:7``) so one page/id has exactly one spelling.
     """
     if not isinstance(data, str):
         return None
     if not data.startswith(CALLBACK_PREFIX):
         return None
     op = data[len(CALLBACK_PREFIX):]
-    return op if op in _KNOWN_OPS else None
+    if op in _KNOWN_OPS:
+        return op
+    if op == USERS_BACK_OP:
+        return op
+    match = _USERS_PAGE_RE.fullmatch(op)
+    if match:
+        return f"{OP_USERS}:p:{int(match.group(1))}"
+    match = _USERS_DETAIL_RE.fullmatch(op)
+    if match:
+        return f"{OP_USERS}:v:{int(match.group(1))}"
+    return None
 
 
 # ── Navigation delegation to the EXISTING command handlers ───────────
@@ -495,6 +549,207 @@ _NAVIGATORS = {
 }
 
 
+# ── Users module (MT-ADMIN-35): read-only, rendered in place ───────
+# Authorization is re-checked by the caller BEFORE any read here.
+# Every value comes from the authoritative bounded store reads — no
+# SQL, no cache, no mutation, no invented "active"/"new" semantics
+# (the schema has no last-seen column and no defined recency window).
+
+
+def _user_label(row: dict) -> str:
+    """One safe identity row — username (or first name) + Telegram id.
+
+    Only schema identity fields; never wallet, destination, language
+    or any other column.
+    """
+    username = row.get("username")
+    name = f"@{username}" if username else (row.get("first_name") or NA)
+    return f"👤 {name}\n🆔 {row.get('user_id')}"
+
+
+def _page_count(total: int) -> int:
+    """Pages for *total* users — always at least one so an empty state
+    still renders a stable page label."""
+    return max(1, -(-int(total) // USERS_PAGE_SIZE))
+
+
+def collect_users_page(page: int) -> dict:
+    """Read-only users-page snapshot from the authoritative store.
+
+    The page index is CLAMPED to the real range, so oversized or stale
+    presses land on the last page instead of failing.  Both reads are
+    the bounded db interfaces; this module issues no SQL itself.
+    """
+    if isinstance(page, bool) or not isinstance(page, int):
+        raise TypeError("page must be an int")
+    total = db.count_users()
+    pages = _page_count(total)
+    page = min(max(page, 0), pages - 1)
+    rows = db.list_users(USERS_PAGE_SIZE, page * USERS_PAGE_SIZE)
+    return {"total": total, "page": page, "pages": pages, "rows": rows}
+
+
+def build_users_text(view: dict) -> str:
+    """Arabic user-management panel — identity fields only.
+
+    "النشطون"/"الجدد" have no authoritative definition (no last-seen
+    column, no defined recency window), so both honestly read
+    ``غير متاح`` — never a fabricated number.
+    """
+    lines = [
+        USERS_PANEL_HEADER,
+        "",
+        f"👥 إجمالي المستخدمين: {view['total']}",
+        f"🟢 النشطون: {NA}",
+        f"📅 الجدد: {NA}",
+        "",
+        "اختر مستخدمًا لعرض التفاصيل:",
+    ]
+    if not view["rows"]:
+        lines.append("لا يوجد مستخدمون بعد.")
+    lines += [
+        "",
+        SEPARATOR,
+        f"صفحة {view['page'] + 1}/{view['pages']}",
+    ]
+    return "\n".join(lines)
+
+
+def build_users_keyboard(view: dict) -> InlineKeyboardMarkup:
+    """Tappable identity rows + bounded page nav + canonical back.
+
+    Payloads are the fixed ctl:users grammar only — user ids come
+    from the store rows, never from client input.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                _user_label(row),
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_USERS}:v:{row['user_id']}"
+                ),
+            )
+        ]
+        for row in view["rows"]
+    ]
+    nav = []
+    if view["page"] > 0:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ السابق",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_USERS}:p:{view['page'] - 1}"
+                ),
+            )
+        )
+    if view["page"] + 1 < view["pages"]:
+        nav.append(
+            InlineKeyboardButton(
+                "التالي ➡️",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_USERS}:p:{view['page'] + 1}"
+                ),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ مركز الإدارة",
+                callback_data=f"{CALLBACK_PREFIX}{OP_REFRESH}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_user_detail_text(user: dict | None) -> str:
+    """Safe administrative profile — existing ``db.get_user`` fields.
+
+    Last activity honestly reads ``غير متاح``: the schema has no
+    authoritative last-seen column and none is inferred from
+    unrelated events.  Unknown user → safe fixed notice.
+    """
+    if not user:
+        return MSG_USER_NOT_FOUND
+    username = user.get("username")
+    return "\n".join(
+        [
+            USER_DETAIL_HEADER,
+            "",
+            f"🆔 Telegram ID: {user.get('user_id')}",
+            f"👤 Username: {'@' + username if username else NA}",
+            f"📛 الاسم: {user.get('first_name') or NA}",
+            f"📅 التسجيل: {user.get('created_at') or NA}",
+            f"🕒 آخر نشاط: {NA}",
+        ]
+    )
+
+
+def build_user_detail_keyboard() -> InlineKeyboardMarkup:
+    """Back to the user list — the only navigation a detail needs."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "↩️ المستخدمون",
+                    callback_data=f"{CALLBACK_PREFIX}{USERS_BACK_OP}",
+                )
+            ]
+        ]
+    )
+
+
+async def _edit_view_or_skip(query, text: str, markup, actor: int,
+                             view: str) -> None:
+    """Edit in place; a stale/unchanged message degrades to a safe
+    no-op — a read-only view never fails loudly (refresh convention)."""
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception:
+        logger.info("Control view edit skipped: admin=%d view=%s",
+                    actor, view)
+    await _safe_answer(query, None)
+
+
+async def _render_users_view(query, op: str, actor: int) -> None:
+    """``ctl:users*`` — the read-only user-management surface.
+
+    The caller has ALREADY re-checked authorization before any read.
+    Opens no transaction and mutates nothing; failures degrade to a
+    safe error answer.  Logs carry the admin id + view kind only —
+    never user records, payloads or tracebacks.
+    """
+    view = "users:list"
+    try:
+        if op == OP_USERS or op == USERS_BACK_OP:
+            snapshot = collect_users_page(0)
+            text = build_users_text(snapshot)
+            markup = build_users_keyboard(snapshot)
+        elif op.startswith(f"{OP_USERS}:p:"):
+            snapshot = collect_users_page(int(op.rsplit(":", 1)[1]))
+            text = build_users_text(snapshot)
+            markup = build_users_keyboard(snapshot)
+        elif op.startswith(f"{OP_USERS}:v:"):
+            view = "users:detail"
+            user = db.get_user(int(op.rsplit(":", 1)[1]))
+            text = build_user_detail_text(user)
+            markup = build_user_detail_keyboard()
+        else:
+            # Defense in depth — the parser already rejects this.
+            await _safe_answer(query, MSG_INVALID)
+            return
+    except Exception:
+        logger.exception("Control users view failed: admin=%d view=%s",
+                         actor, view)
+        await _safe_answer(query, MSG_ERROR)
+        return
+    await _edit_view_or_skip(query, text, markup, actor, view)
+    logger.info("Control users view opened: admin=%d view=%s",
+                actor, view)
+
+
 # ── PTB handlers ──────────────────────────────────────────────────────
 
 
@@ -552,14 +807,15 @@ async def _refresh_dashboard(query, actor: int) -> None:
 async def control_callback(update, context) -> None:
     """``ctl:`` callbacks — private admin chat ONLY, server re-reads all.
 
-    Payloads are static registry keys (no ids, no user input, no
-    secrets, no amounts); the CENTRALIZED gate re-runs
-    ``config.is_admin`` before any read; unknown/stale presses fail
-    safely; reserved modules answer a safe unavailable notice; and
-    implemented modules DELEGATE to the existing command handlers
-    (which re-check authorization themselves).  ``ctl:refresh``
-    re-renders read-only.  This handler renders no data of its own
-    and mutates nothing — ever.
+    Payloads are static registry keys plus the bounded ``users``
+    sub-grammar (no amounts, no destinations, no secrets); the
+    CENTRALIZED gate re-runs ``config.is_admin`` before any read;
+    unknown/stale presses fail safely; reserved modules answer a safe
+    unavailable notice; the ``users`` module renders in place from
+    authoritative reads; and the remaining implemented modules
+    DELEGATE to the existing command handlers (which re-check
+    authorization themselves).  ``ctl:refresh`` re-renders read-only.
+    Every path opens no transaction and mutates nothing — ever.
     """
     query = getattr(update, "callback_query", None)
     if query is None:
@@ -577,6 +833,13 @@ async def control_callback(update, context) -> None:
 
     if op == OP_REFRESH:
         await _refresh_dashboard(query, actor)
+        return
+
+    if op == OP_USERS or op.startswith(f"{OP_USERS}:"):
+        # MT-ADMIN-35: rendered in place by this module — the auth
+        # gate above already re-checked config.is_admin BEFORE any
+        # user data was read.
+        await _render_users_view(query, op, actor)
         return
 
     module = MODULES_BY_KEY[op]
