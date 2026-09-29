@@ -145,6 +145,7 @@ import payment_method_admin
 import payment_method_store
 import rate_admin
 import rate_store
+import support_service
 import task_taxonomy
 import withdrawal_admin
 import withdrawal_store
@@ -282,6 +283,9 @@ MODULES: tuple[AdminModule, ...] = (
     AdminModule("rewards", "🎁 المكافآت", "إدارة المكافآت (قريباً)"),
     AdminModule(
         "broadcast", "📢 الإرسال الجماعي", "إرسال رسالة للمستخدمين المسجلين"
+    ),
+    AdminModule(
+        "support", "🎧 الدعم", "إدارة طلبات الدعم", "/support"
     ),
     AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة"),
     AdminModule(
@@ -661,6 +665,7 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
         [_btn("deposits"), _btn("paymethods")],
         [_btn("rate"), _btn("rewards")],
         [_btn("broadcast")],
+        [_btn("support")],
         [_btn("settings"), _btn("admins")],
         [_btn("logs"), _btn("health")],
         [
@@ -810,12 +815,17 @@ async def _open_rate(shim, context) -> None:
     await rate_admin.setrate_command(shim, context)
 
 
+async def _open_support(shim, context) -> None:
+    await support_service.support_command(shim, context)
+
+
 _NAVIGATORS = {
     "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
     "deposits": _open_deposits,
     "paymethods": _open_paymethods,
     "rate": _open_rate,
+    "support": _open_support,
 }
 
 

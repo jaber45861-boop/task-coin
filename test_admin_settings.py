@@ -1212,6 +1212,7 @@ class TestSettingsRegression(SettingsTestBase):
                 "ctl:reviews",
                 "ctl:rewards",
                 "ctl:settings",
+                "ctl:support",
                 "ctl:tasks",
                 "ctl:users",
                 "ctl:withdrawals",
