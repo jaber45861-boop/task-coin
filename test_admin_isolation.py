@@ -546,5 +546,422 @@ class TestDeadSubscriptionGateDisabled(unittest.IsolatedAsyncioTestCase):
         bot.get_chat_member.assert_not_awaited()
 
 
+# ── MT-ADMIN-NEXT: legacy admin private-chat isolation ───────────────
+
+_ISO_ADMIN_ID = 777001
+_ISO_NON_ADMIN_ID = 888002
+_ISO_CHAT_TYPES = ("group", "channel")
+
+_ISO_CHANNEL = Channel(
+    slug="iso_ch", channel_id=-100333,
+    username="iso_ch_user", title="Iso Channel", required=True,
+)
+
+_ISO_TASK_ROW = {
+    "id": 1,
+    "title": "Iso Task",
+    "type": "telegram_channel",
+    "reward": 10000,
+    "active": True,
+}
+
+_ADDTASK_PIPE = "/addtask Iso Task | do it | 0.0001 | iso_ch"
+
+
+class TestLegacyCommandGroupChannelSilent(unittest.IsolatedAsyncioTestCase):
+    """MT-ADMIN-NEXT: group/channel invocations of the five legacy
+    admin COMMANDS answer nothing — no reply, no authorization call,
+    no task read, no task mutation, no channel read and no creation
+    path is ever reached for either actor role."""
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        CHANNELS[_ISO_CHANNEL.slug] = _ISO_CHANNEL
+        unlock_user(_ISO_ADMIN_ID)
+        unlock_user(_ISO_NON_ADMIN_ID)
+
+    async def _assert_silent(
+        self,
+        handler,
+        text: str,
+        *,
+        admin: bool,
+        chat_type: str,
+    ) -> None:
+        uid = _ISO_ADMIN_ID if admin else _ISO_NON_ADMIN_ID
+        with patch(
+            "bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID
+        ) as auth, patch.object(
+            bot_mod.db, "list_tasks"
+        ) as list_tasks, patch.object(
+            bot_mod.db, "get_task"
+        ) as get_task, patch.object(
+            bot_mod.db, "update_task"
+        ) as update_task, patch.object(
+            bot_mod.task_creation, "create_task_from_spec"
+        ) as create_spec:
+            update = _make_update(uid, text=text, chat_type=chat_type)
+            ctx = _make_context()
+
+            await handler(update, ctx)
+
+            # ZERO replies — group/channel stays silent for both roles.
+            update.message.reply_text.assert_not_called()
+            # The private-chat guard runs BEFORE authorization.
+            auth.assert_not_called()
+            # ZERO store reads/writes and no creation path.
+            list_tasks.assert_not_called()
+            get_task.assert_not_called()
+            update_task.assert_not_called()
+            create_spec.assert_not_called()
+
+    async def test_listtasks_silent_in_group_and_channel(self) -> None:
+        for chat_type in _ISO_CHAT_TYPES:
+            for admin in (True, False):
+                with self.subTest(chat=chat_type, admin=admin):
+                    await self._assert_silent(
+                        bot_mod.list_tasks, "/listtasks",
+                        admin=admin, chat_type=chat_type,
+                    )
+
+    async def test_offtask_silent_in_group_and_channel(self) -> None:
+        for chat_type in _ISO_CHAT_TYPES:
+            for admin in (True, False):
+                with self.subTest(chat=chat_type, admin=admin):
+                    await self._assert_silent(
+                        bot_mod.off_task, "/offtask 1",
+                        admin=admin, chat_type=chat_type,
+                    )
+
+    async def test_addtask_pipe_silent_in_group_and_channel(self) -> None:
+        for chat_type in _ISO_CHAT_TYPES:
+            for admin in (True, False):
+                with self.subTest(chat=chat_type, admin=admin):
+                    await self._assert_silent(
+                        bot_mod.add_task, _ADDTASK_PIPE,
+                        admin=admin, chat_type=chat_type,
+                    )
+
+    async def test_listchannels_silent_in_group_and_channel(self) -> None:
+        for chat_type in _ISO_CHAT_TYPES:
+            for admin in (True, False):
+                with self.subTest(chat=chat_type, admin=admin):
+                    await self._assert_silent(
+                        bot_mod.list_channels, "/listchannels",
+                        admin=admin, chat_type=chat_type,
+                    )
+
+    async def test_admin_panel_command_silent_in_group_and_channel(
+        self,
+    ) -> None:
+        for chat_type in _ISO_CHAT_TYPES:
+            for admin in (True, False):
+                with self.subTest(chat=chat_type, admin=admin):
+                    await self._assert_silent(
+                        bot_mod.admin_command, "/admin",
+                        admin=admin, chat_type=chat_type,
+                    )
+
+
+class TestAdminPanelCallbackGroupChannelSilent(
+    unittest.IsolatedAsyncioTestCase
+):
+    """MT-ADMIN-NEXT: every ``admin_panel:`` press from a group or
+    channel answers NOTHING — no callback answer, no message edit,
+    no authorization call — for all three actions and both roles."""
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        CHANNELS[_ISO_CHANNEL.slug] = _ISO_CHANNEL
+
+    async def test_callbacks_silent_in_group_and_channel(self) -> None:
+        for action in ("add", "remove", "list"):
+            for chat_type in _ISO_CHAT_TYPES:
+                for admin in (True, False):
+                    with self.subTest(
+                        action=action, chat=chat_type, admin=admin
+                    ):
+                        uid = (
+                            _ISO_ADMIN_ID if admin else _ISO_NON_ADMIN_ID
+                        )
+                        with patch(
+                            "bot.is_admin",
+                            side_effect=lambda u: u == _ISO_ADMIN_ID,
+                        ) as auth:
+                            update = _make_update(
+                                uid, chat_type=chat_type
+                            )
+                            update.callback_query.data = (
+                                f"admin_panel:{action}"
+                            )
+                            ctx = _make_context()
+
+                            await bot_mod.admin_panel_callback(
+                                update, ctx
+                            )
+
+                            # ZERO answers, ZERO edits, ZERO reads.
+                            update.callback_query.answer.assert_not_called()
+                            update.callback_query.edit_message_text.assert_not_called()
+                            auth.assert_not_called()
+
+
+class TestLegacyCommandPrivateRegression(
+    unittest.IsolatedAsyncioTestCase
+):
+    """MT-ADMIN-NEXT: private-chat behavior of the six surfaces is
+    contract-equivalent — admins act, non-admins are refused."""
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        CHANNELS[_ISO_CHANNEL.slug] = _ISO_CHANNEL
+        unlock_user(_ISO_ADMIN_ID)
+        unlock_user(_ISO_NON_ADMIN_ID)
+
+    # 1. /listtasks ─────────────────────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_listtasks_private_admin_lists_tasks(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text="/listtasks", chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(
+            bot_mod.db, "list_tasks", return_value=[dict(_ISO_TASK_ROW)]
+        ) as list_tasks:
+            await bot_mod.list_tasks(update, ctx)
+
+        list_tasks.assert_called_once()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("قائمة المهام", reply)
+        self.assertIn("Iso Task", reply)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_listtasks_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        CHANNELS.clear()
+        update = _make_update(
+            _ISO_NON_ADMIN_ID, text="/listtasks", chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(bot_mod.db, "list_tasks") as list_tasks:
+            await bot_mod.list_tasks(update, ctx)
+
+        list_tasks.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+
+    # 2. /offtask ───────────────────────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_offtask_private_admin_disables_task(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text="/offtask 1", chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(
+            bot_mod.db, "get_task", return_value=dict(_ISO_TASK_ROW)
+        ), patch.object(
+            bot_mod.db, "update_task", return_value=True
+        ) as update_task:
+            await bot_mod.off_task(update, ctx)
+
+        update_task.assert_called_once_with(1, active=False)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("تم إيقاف المهمة", reply)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_offtask_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        CHANNELS.clear()
+        update = _make_update(
+            _ISO_NON_ADMIN_ID, text="/offtask 1", chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(bot_mod.db, "get_task") as get_task, patch.object(
+            bot_mod.db, "update_task"
+        ) as update_task:
+            await bot_mod.off_task(update, ctx)
+
+        get_task.assert_not_called()
+        update_task.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+
+    # 3. /addtask (legacy pipe form) ────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_addtask_private_admin_creates_task(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text=_ADDTASK_PIPE, chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(
+            bot_mod.task_creation, "create_task_from_spec",
+            return_value=777,
+        ) as create_spec:
+            await bot_mod.add_task(update, ctx)
+
+        create_spec.assert_called_once()
+        spec = create_spec.call_args[0][0]
+        self.assertEqual(spec.title, "Iso Task")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("تم إنشاء المهمة", reply)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_addtask_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_NON_ADMIN_ID, text=_ADDTASK_PIPE, chat_type="private"
+        )
+        ctx = _make_context()
+        with patch.object(
+            bot_mod.task_creation, "create_task_from_spec"
+        ) as create_spec:
+            await bot_mod.add_task(update, ctx)
+
+        create_spec.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+
+    # 4. /listchannels ──────────────────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_listchannels_private_admin_lists_channels(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text="/listchannels", chat_type="private"
+        )
+        ctx = _make_context()
+
+        await bot_mod.list_channels(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("قنوات الاشتراك", reply)
+        self.assertIn("Iso Channel", reply)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_listchannels_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        CHANNELS.clear()
+        update = _make_update(
+            _ISO_NON_ADMIN_ID, text="/listchannels", chat_type="private"
+        )
+        ctx = _make_context()
+
+        await bot_mod.list_channels(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+
+    # 5. /admin ─────────────────────────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_admin_private_admin_sees_panel(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text="/admin", chat_type="private"
+        )
+        ctx = _make_context()
+
+        await bot_mod.admin_command(update, ctx)
+
+        args, kwargs = update.message.reply_text.call_args
+        self.assertEqual(args[0], "⚙️ إدارة القنوات")
+        self.assertIsNotNone(kwargs.get("reply_markup"))
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_admin_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_NON_ADMIN_ID, text="/admin", chat_type="private"
+        )
+        ctx = _make_context()
+
+        await bot_mod.admin_command(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+
+    # 6. admin_panel: callbacks ─────────────────────────────────────
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_admin_panel_private_admin_lists_channels(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(_ISO_ADMIN_ID, chat_type="private")
+        update.callback_query.data = "admin_panel:list"
+        ctx = _make_context()
+
+        await bot_mod.admin_panel_callback(update, ctx)
+
+        update.callback_query.answer.assert_called_once()
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Iso Channel", text)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_admin_panel_private_non_admin_refused(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(_ISO_NON_ADMIN_ID, chat_type="private")
+        update.callback_query.data = "admin_panel:list"
+        ctx = _make_context()
+
+        await bot_mod.admin_panel_callback(update, ctx)
+
+        update.callback_query.answer.assert_called_once()
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", text)
+
+
+class TestChannelTargetedCommandsUntouched(unittest.IsolatedAsyncioTestCase):
+    """Regression: /addchannel and /removechannel are channel-targeted
+    BY DESIGN and were deliberately NOT given the MT-ADMIN-NEXT
+    private-chat guard."""
+
+    def setUp(self) -> None:
+        CHANNELS.clear()
+        unlock_user(_ISO_ADMIN_ID)
+
+    def test_addchannel_start_has_no_isolation_guard(self) -> None:
+        source = inspect.getsource(bot_mod.addchannel_start)
+        self.assertNotIn("MT-ADMIN-NEXT", source)
+
+    def test_removechannel_start_has_no_isolation_guard(self) -> None:
+        source = inspect.getsource(bot_mod.removechannel_start)
+        self.assertNotIn("MT-ADMIN-NEXT", source)
+
+    @patch("bot.is_admin", side_effect=lambda u: u == _ISO_ADMIN_ID)
+    async def test_addchannel_still_runs_in_supergroup(
+        self, _auth: MagicMock
+    ) -> None:
+        update = _make_update(
+            _ISO_ADMIN_ID, text="/addchannel", chat_type="supergroup"
+        )
+        update.callback_query = None
+        ctx = _make_context()
+
+        result = await bot_mod.addchannel_start(update, ctx)
+
+        self.assertEqual(result, bot_mod.ADDCHANNEL_USERNAME)
+        update.message.reply_text.assert_called_once()
+        self.assertIn(
+            "أرسل Username", update.message.reply_text.call_args[0][0]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

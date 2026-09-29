@@ -832,7 +832,13 @@ async def addchannel_cancel(
 # ── Admin: List Channels ─────────────────────────────────────────────
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all mandatory subscription channels. Admin only."""
+    """List all mandatory subscription channels. Admin only.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or read.
+    """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -908,7 +914,14 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Mandatory subscription channels are a separate concern: this
     handler only reads the registry to validate the slug and never
     adds, removes, or gates channels.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before authorization or parsing, so the
+    legacy pipe form never creates a task outside a private admin
+    chat (the bare-form wizard already re-checks it itself).
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
@@ -1002,7 +1015,13 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     Admin only.  Read-only: queries the existing tasks table via
     db.list_tasks() and never creates, modifies, or disables tasks.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or read, so
+    task/reward listings never reach a group.
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -1049,7 +1068,13 @@ async def off_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is never removed: user_tasks history, task_submissions, approvals,
     and ledger rewards stay untouched, and the existing catalog,
     start-gate, and attempt-policy checks then exclude the task.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization, read or
+    write, so the mutation never runs from a group.
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -1460,7 +1485,13 @@ async def clear_command_menus(application: Application) -> None:
 async def admin_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Admin-only /admin command that shows the channel management panel."""
+    """Admin-only /admin command that shows the channel management panel.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or rendering.
+    """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
@@ -1481,7 +1512,15 @@ async def admin_command(
 async def admin_panel_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle admin panel callbacks (add, remove, list)."""
+    """Handle admin panel callbacks (add, remove, list).
+
+    MT-ADMIN-NEXT: private admin chat only — a press from a group or
+    channel answers NOTHING (no callback answer, no read, no write)
+    before any authorization, so the panel family is silent outside
+    private chats.
+    """
+    if _non_private_chat(update):
+        return
     query = update.callback_query
     await query.answer()
 
