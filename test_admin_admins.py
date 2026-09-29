@@ -1417,7 +1417,9 @@ class TestAdminsNavigation(AdminsTestBase):
         reads, no render, no claim of functionality."""
         with mock.patch.object(admin_control, "collect_snapshot") as snap:
             for key in (
-                "rewards", "broadcast", "settings", "logs", "health",
+                # "broadcast" moved to test_admin_broadcast.py
+                # (MT-ADMIN-38 renders it in place).
+                "rewards", "settings", "logs", "health",
             ):
                 update = self._press(f"ctl:{key}")
                 self.assertEqual(

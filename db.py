@@ -331,6 +331,274 @@ def remove_admin_user(
         return "already_removed" if row else "missing"
 
 
+# ── Admin broadcast (MT-ADMIN-38) ─────────────────────────────────
+# Persistence for the Control Center's ``broadcast`` module.  ALL
+# broadcast state lives in SQLite — never in a process-global dict —
+# so drafts survive handler recreation and restarts, and the atomic
+# ``draft → sending`` UPDATE is the ONLY duplicate-send authority:
+# double-clicks, delayed/stale callbacks and cross-client replays
+# all lose the same single transition and can never start a second
+# delivery pass.  This section is a pure record store: no wallet,
+# ledger, task, reward, rate, payment-method or admin-role column is
+# ever read or written here, and no recipient list is ever produced
+# from anywhere but the authoritative ``users`` table
+# (``list_broadcast_recipient_ids``).
+#
+# Status lifecycle (explicit CHECK constraint on the table):
+#   draft      armed/compose state; message may still be '' — the
+#              ONLY confirmable state
+#   sending    claimed by exactly ONE confirm (crash here leaves the
+#              row honestly 'sending': never auto-resumed, never
+#              re-sent, stale confirms answer already-processed)
+#   completed  the delivery pass finished (counts stamped)
+#   cancelled  cancelled before any send (no send ever happened)
+
+BROADCAST_STATUS_DRAFT = "draft"
+BROADCAST_STATUS_SENDING = "sending"
+BROADCAST_STATUS_COMPLETED = "completed"
+BROADCAST_STATUS_CANCELLED = "cancelled"
+
+# Telegram's hard limit for a plain text message (characters).  The
+# store enforces it again on every write — the UI validation is not
+# the only gate.
+MAX_BROADCAST_MESSAGE_LEN = 4096
+
+# Hard bound on recipient enumeration: the id-only read below can
+# never pull an unbounded table into memory, and a population above
+# the bound FAILS CLOSED instead of starting a silently partial
+# broadcast.
+MAX_BROADCAST_RECIPIENTS = 50_000
+
+
+def _validate_broadcast_actor(user_id: object) -> int:
+    """Reject anything that is not a positive, int64-safe id."""
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or user_id > _SQLITE_INT64_MAX
+    ):
+        raise ValueError("broadcast admin_user_id must be a positive int")
+    return user_id
+
+
+def arm_broadcast_draft(
+    admin_user_id: int, db_path: str | None = None
+) -> int:
+    """Create — or reset — the ONE open draft for this administrator.
+
+    This is the persisted compose state behind ``ctl:broadcast:new``:
+    a fresh row starts with an empty message ("awaiting text"), and
+    pressing ``new`` again resets any existing draft back to that
+    composing state.  At most ONE draft per admin can be open
+    (partial unique index), so the confirm/cancel payloads never
+    need an identifier — and never the message body.
+
+    Returns the draft id.  Race-safe: a lost INSERT race reuses the
+    winner's row instead of failing.
+    """
+    _validate_broadcast_actor(admin_user_id)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT id FROM broadcasts "
+            "WHERE admin_user_id = ? AND status = 'draft'",
+            (admin_user_id,),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE broadcasts SET message = '' WHERE id = ?",
+                (row["id"],),
+            )
+            return row["id"]
+        try:
+            cursor = conn.execute(
+                "INSERT INTO broadcasts (admin_user_id, message) "
+                "VALUES (?, '')",
+                (admin_user_id,),
+            )
+        except sqlite3.IntegrityError:
+            # Lost a benign race against another arm — reuse it.
+            row = conn.execute(
+                "SELECT id FROM broadcasts "
+                "WHERE admin_user_id = ? AND status = 'draft'",
+                (admin_user_id,),
+            ).fetchone()
+            if row is None:
+                raise
+            conn.execute(
+                "UPDATE broadcasts SET message = '' WHERE id = ?",
+                (row["id"],),
+            )
+            return row["id"]
+        return int(cursor.lastrowid)
+
+
+def get_open_broadcast(
+    admin_user_id: int, db_path: str | None = None
+) -> dict | None:
+    """The admin's open (``draft``) broadcast row, or None.
+
+    Read-only.  The message field is '' while composing — callers
+    distinguish compose state (empty) from a confirmable draft
+    (non-empty).  At most one row can match (partial unique index).
+    """
+    _validate_broadcast_actor(admin_user_id)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, admin_user_id, message, status, recipient_count, "
+            "success_count, failure_count, created_at "
+            "FROM broadcasts "
+            "WHERE admin_user_id = ? AND status = 'draft' "
+            "ORDER BY id DESC LIMIT 1",
+            (admin_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_broadcast(
+    admin_user_id: int, db_path: str | None = None
+) -> dict | None:
+    """The admin's most recent broadcast row (any status), or None.
+
+    Read-only — used to answer a STALE confirm deterministically:
+    a sending/completed row means ``already processed``, anything
+    else means ``no pending operation``.  Never resends.
+    """
+    _validate_broadcast_actor(admin_user_id)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, admin_user_id, message, status, recipient_count, "
+            "success_count, failure_count, created_at "
+            "FROM broadcasts "
+            "WHERE admin_user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (admin_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def save_broadcast_draft_message(
+    broadcast_id: int, message: str, db_path: str | None = None
+) -> bool:
+    """Store the composed text on the open draft — single-use state.
+
+    Returns True only while the row is still ``draft`` (a cancelled,
+    claimed or vanished draft writes NOTHING and answers False, so a
+    raced text can never resurrect a processed broadcast).
+
+    Validation is re-enforced here: non-empty after strip, bounded by
+    Telegram's real text limit — the UI check is not the only gate.
+    """
+    if (
+        isinstance(broadcast_id, bool)
+        or not isinstance(broadcast_id, int)
+        or broadcast_id <= 0
+    ):
+        raise ValueError("broadcast_id must be a positive int")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("broadcast message must be non-empty text")
+    if len(message) > MAX_BROADCAST_MESSAGE_LEN:
+        raise ValueError("broadcast message exceeds Telegram's text limit")
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE broadcasts SET message = ? "
+            "WHERE id = ? AND status = 'draft'",
+            (message, broadcast_id),
+        )
+        return cursor.rowcount == 1
+
+
+def claim_broadcast_sending(
+    broadcast_id: int, recipient_count: int, db_path: str | None = None
+) -> bool:
+    """THE atomic duplicate-send gate: ``draft → sending``, once.
+
+    Exactly ONE caller can observe rowcount == 1 (a single guarded
+    UPDATE — no application-level lock involved); every other answer
+    (already sending/completed/cancelled/missing) means NO Telegram
+    send may begin.  ``recipient_count`` is stamped with the claim so
+    the final invariant (success + failure == recipients) is recorded
+    against the population the winning pass actually enumerated.
+    """
+    if (
+        isinstance(broadcast_id, bool)
+        or not isinstance(broadcast_id, int)
+        or broadcast_id <= 0
+    ):
+        raise ValueError("broadcast_id must be a positive int")
+    if (
+        isinstance(recipient_count, bool)
+        or not isinstance(recipient_count, int)
+        or recipient_count < 0
+    ):
+        raise ValueError("recipient_count must be a non-negative int")
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE broadcasts "
+            "SET status = 'sending', recipient_count = ?, "
+            "confirmed_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND status = 'draft'",
+            (recipient_count, broadcast_id),
+        )
+        return cursor.rowcount == 1
+
+
+def finalize_broadcast(
+    broadcast_id: int,
+    success_count: int,
+    failure_count: int,
+    db_path: str | None = None,
+) -> bool:
+    """Stamp the finished pass: ``sending → completed`` with counts.
+
+    Guarded on ``status = 'sending'`` — it never resurrects a
+    cancelled draft and never re-opens a completed row.  Returns True
+    only for the row this caller actually owned.
+    """
+    if (
+        isinstance(broadcast_id, bool)
+        or not isinstance(broadcast_id, int)
+        or broadcast_id <= 0
+    ):
+        raise ValueError("broadcast_id must be a positive int")
+    for value in (success_count, failure_count):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise ValueError("counts must be non-negative ints")
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE broadcasts "
+            "SET status = 'completed', success_count = ?, "
+            "failure_count = ?, completed_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND status = 'sending'",
+            (success_count, failure_count, broadcast_id),
+        )
+        return cursor.rowcount == 1
+
+
+def cancel_open_broadcast(
+    admin_user_id: int, db_path: str | None = None
+) -> bool:
+    """Cancel the admin's open draft — ``draft → cancelled``.
+
+    Only drafts are affected: a sending or completed broadcast is
+    never mutated by a cancel, and cancelling performs no send and
+    no user mutation.  Returns False when there was nothing to
+    cancel (idempotent — a repeated cancel is a safe no-op).
+    """
+    _validate_broadcast_actor(admin_user_id)
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE broadcasts SET status = 'cancelled' "
+            "WHERE admin_user_id = ? AND status = 'draft'",
+            (admin_user_id,),
+        )
+        return cursor.rowcount >= 1
+
+
 def init_db(db_path: str | None = None) -> None:
     """Initialize all database tables (channels + users)."""
     with get_connection(db_path) as conn:
@@ -838,6 +1106,55 @@ def init_db(db_path: str | None = None) -> None:
                 (bootstrap_id,),
             )
 
+        # ── Admin broadcast (MT-ADMIN-38) ─────────────────────────
+        # Additive migration only: brand-new table (idempotent
+        # CREATE TABLE IF NOT EXISTS — pre-existing databases upgrade
+        # in place, nothing is dropped or rewritten, no financial
+        # schema is touched).  The Control Center's broadcast module
+        # persists its ENTIRE state here: draft ownership, bounded
+        # message, explicit status, timestamps and the completion
+        # counts.  The atomic draft→sending UPDATE is the
+        # duplicate-send authority (see the store operations above).
+        #   admin_user_id  the authorized actor (NOT FK'd to
+        #                  admin_users: authorization is decided by
+        #                  config.is_admin at write time and this is
+        #                  not a user registry)
+        #   message        '' while composing; bounded by Telegram's
+        #                  4096-char text limit (CHECK below)
+        #   status         'draft' | 'sending' | 'completed' |
+        #                  'cancelled' (explicit CHECK constraint)
+        #   recipient/success/failure_count  stamped by the winning
+        #                  pass (S + F = N by construction)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft'
+                    CHECK (status IN (
+                        'draft', 'sending', 'completed', 'cancelled'
+                    )),
+                recipient_count INTEGER,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                confirmed_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                CHECK (length(message) <= 4096)
+            )
+        """)
+        # At most ONE open draft per administrator — the same partial
+        # -index pattern as admin_task_drafts, so confirm/cancel
+        # payloads need no identifier (and never the message body).
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_broadcasts_open
+            ON broadcasts (admin_user_id) WHERE status = 'draft'
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS ix_broadcasts_admin
+            ON broadcasts (admin_user_id, id)
+        """)
+
         # ── Admin notification linkage (MT-ADMIN-03) ───────────────
         # Additive migration only: a brand-new table.  Persists the
         # association between a server-side operation (e.g. a manual
@@ -1253,6 +1570,30 @@ def list_users(
             (limit, offset),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def list_broadcast_recipient_ids(db_path: str | None = None) -> list[int]:
+    """Every registered user id — the ONLY recipient source of a
+    broadcast (MT-ADMIN-38).
+
+    Straight from the authoritative ``users`` table: never
+    ``config.ADMINS``, never task participants, wallet holders,
+    withdrawal/deposit users, username search or any cached list.
+    id-only (no username/identity/financial column is selected),
+    deterministically ordered, and FAILS CLOSED with ValueError when
+    the population exceeds ``MAX_BROADCAST_RECIPIENTS`` so a runaway
+    table is never pulled into memory and a broadcast above the
+    bound can never start silently partial.  Read-only: never
+    mutates the users table.
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+        if row["count"] > MAX_BROADCAST_RECIPIENTS:
+            raise ValueError("broadcast recipient population too large")
+        cursor = conn.execute(
+            "SELECT user_id FROM users ORDER BY user_id ASC"
+        )
+        return [int(r["user_id"]) for r in cursor.fetchall()]
 
 
 def get_withdrawal_request(

@@ -38,9 +38,8 @@ the fixed ``refresh`` operation — bounded and static, never amounts,
 destinations, rows, JSON or user input — and stay clear of every
 foreign namespace (``wd:`` / ``dp:`` / ``pm:`` / ``mr(view|vp):`` /
 ``atw:`` / ``mproof:`` / ``sup:``).  Reserved modules (rewards,
-broadcast, settings, admins, logs, health) answer with a safe
-not-yet-available notice — never fake functionality, never fake
-metrics.  The ``users`` module (MT-ADMIN-35) is rendered IN PLACE by
+settings, logs, health) answer with a safe not-yet-available notice
+— never fake functionality, never fake metrics.  The ``users`` module (MT-ADMIN-35) is rendered IN PLACE by
 this module itself over a small closed ``ctl:users[:…]`` sub-grammar
 (bounded digits only — never JSON, never free text, never amounts or
 destinations) built strictly on the authoritative read-only store
@@ -53,7 +52,7 @@ tokens + bounded digits): reads from ``db.list_tasks`` /
 confirmation card plus a fresh re-read (stale presses never write,
 confirmations are single-use); creation delegates to the canonical
 ``/addtask`` wizard → ``task_creation`` service.  The ``admins``
-module (MT-ADMIN-37) completes the in-place trio over its own
+module (MT-ADMIN-37) is the third in-place module over its own
 bounded ``ctl:admins[:…]`` grammar: reads from
 ``db.list_admin_users`` / ``db.get_admin_user`` UNIONED with the
 configured ``config.ADMINS`` (the exact union ``config.is_admin``
@@ -61,7 +60,17 @@ authorizes), and the ONLY mutations are the single idempotent
 ``db.add_admin_user`` / ``db.remove_admin_user`` store operations,
 reached solely through confirmation cards + fresh re-reads (a
 configured administrator can never be removed; the final
-administrator can never be removed — lockout is impossible).
+administrator can never be removed — lockout is impossible).  The
+``broadcast`` module (MT-ADMIN-38) is the fourth in-place module,
+over four FIXED operation tokens — ``ctl:broadcast`` plus ``:new``,
+``:confirm`` and ``:cancel`` — carrying NO identifier and NEVER the
+message body: ALL state persists in the additive ``broadcasts``
+store (never a process-global dict), recipients come from the
+authoritative ``users`` table only (id-only, bounded enumeration),
+the atomic ``draft → sending`` claim is the sole duplicate-send
+authority, and delivery is individual ``context.bot.send_message``
+calls by the EXISTING bot instance — aggregate counts only in the
+UI, and no financial/task/admin-role mutation exists on this path.
 Authorization runs BEFORE payload parsing, so a non-admin never
 reaches a read.
 
@@ -99,6 +108,11 @@ Data rules (authoritative reads only)
   ``db.get_admin_user()`` (detail); mutations only via the existing
   ``db.add_admin_user()`` / ``db.remove_admin_user()`` store
   operations after confirmation + fresh re-reads
+* broadcast            → ``db.count_users()`` (aggregate count) and
+  ``db.list_broadcast_recipient_ids()`` (id-only, bounded recipient
+  enumeration from the ``users`` table ONLY); all state persists in
+  the additive ``broadcasts`` store; delivery = individual
+  ``context.bot.send_message`` calls by the existing bot instance
 
 No aggregate without an authoritative interface is invented (deposit
 store exposes no list-query for raw pending deposits, so none is
@@ -169,6 +183,18 @@ MSG_LAST_ADMIN = "❌ لا يمكن إزالة المشرف الأخير."
 MSG_BOOTSTRAP_ADMIN = "❌ لا يمكن إزالة المشرف المُهيّأ في الإعدادات."
 TOAST_ADMIN_ADDED = "✅ تمت إضافة المشرف"
 TOAST_ADMIN_REMOVED = "✅ تم إزالة المشرف"
+# MT-ADMIN-38 broadcast surface — stable Arabic copy.  The message
+# BODY never travels in callback data and never appears in logs;
+# the UI shows aggregate counts only (never a recipient list).
+BROADCAST_HEADER = "📢 الإرسال الجماعي"
+BROADCAST_COMPOSE_HEADER = "📢 إرسال جماعي"
+BROADCAST_CONFIRM_HEADER = "📢 تأكيد الإرسال الجماعي"
+BROADCAST_SENDING_TEXT = "📢 جاري الإرسال..."
+BROADCAST_RESULT_HEADER = "✅ اكتمل الإرسال الجماعي"
+MSG_BROADCAST_EMPTY = "❌ الرسالة فارغة."
+MSG_BROADCAST_TOO_LONG = "❌ الرسالة طويلة جدًا."
+MSG_BROADCAST_ALREADY = "⚠️ تم تنفيذ هذه العملية بالفعل."
+TOAST_BROADCAST_CANCELLED = "↩️ تم إلغاء الإرسال."
 BACK_HINT = "↩️ للعودة اكتب: /control"
 
 NA = "غير متاح"
@@ -224,10 +250,10 @@ class AdminModule:
 
 
 MODULES: tuple[AdminModule, ...] = (
-    # ``command=None``: users, tasks and admins have no delegation
-    # command — this module renders ALL THREE in place
-    # (MT-ADMIN-35 / MT-ADMIN-36 / MT-ADMIN-37),
-    # unlike the reserved slots below which answer a safe notice.
+# ``command=None``: users, tasks, admins and broadcast have no
+# delegation command — this module renders ALL FOUR in place
+# (MT-ADMIN-35 / MT-ADMIN-36 / MT-ADMIN-37 / MT-ADMIN-38),
+# unlike the reserved slots below which answer a safe notice.
     AdminModule("users", "👥 المستخدمون", "إدارة مستخدمين (قراءة فقط)"),
     AdminModule("tasks", "📋 المهام", "إدارة المهام (عرض/تفعيل/تعطيل)"),
     AdminModule(
@@ -244,7 +270,9 @@ MODULES: tuple[AdminModule, ...] = (
     ),
     AdminModule("rate", "💱 سعر USDT", "ضبط سعر الصرف اليدوي", "/setrate"),
     AdminModule("rewards", "🎁 المكافآت", "إدارة المكافآت (قريباً)"),
-    AdminModule("broadcast", "📢 الإعلانات", "الإعلانات العامة (قريباً)"),
+    AdminModule(
+        "broadcast", "📢 الإرسال الجماعي", "إرسال رسالة للمستخدمين المسجلين"
+    ),
     AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة (قريباً)"),
     AdminModule(
         "admins", "👮 المشرفون", "إدارة المشرفين (عرض/إضافة/إزالة)"
@@ -330,6 +358,25 @@ _ADMINS_CANCEL_RE = re.compile(r"admins:cancel:([0-9]{1,15})")
 _ADMINS_CONFIRM_RE = re.compile(
     r"admins:confirm:(add|remove):([0-9]{1,15})"
 )
+
+# MT-ADMIN-38: the in-place broadcast module owns its own closed
+# sub-grammar under the SAME ctl: namespace — four FIXED operation
+# tokens only, never JSON, never free text, never the message body,
+# never usernames, recipients, destinations or identifiers:
+#   ctl:broadcast           broadcast panel + aggregate user count
+#   ctl:broadcast:new       arm ONE persisted draft (compose prompt)
+#   ctl:broadcast:confirm   confirm the open draft → atomic
+#                           draft→sending claim → individual sends
+#                           → aggregate result
+#   ctl:broadcast:cancel    cancel the open draft (no send) → panel
+# The draft is resolved SERVER-SIDE from the pressing administrator
+# (at most ONE open draft per admin, enforced by a partial unique
+# index in SQLite), so no id — and never the message body — has to
+# travel in the payload.
+OP_BROADCAST = "broadcast"
+BROADCAST_NEW_OP = "broadcast:new"
+BROADCAST_CONFIRM_OP = "broadcast:confirm"
+BROADCAST_CANCEL_OP = "broadcast:cancel"
 
 
 # ── Shared MT-ADMIN-02 isolation helpers (inlined, no import cycle) ───
@@ -589,8 +636,9 @@ def parse_callback(data: object) -> str | None:
     sub-op, else None.
 
     The closed op set is the static registry plus the bounded-digits
-    ``users`` (MT-ADMIN-35), ``tasks`` (MT-ADMIN-36) and ``admins``
-    (MT-ADMIN-37) grammars.  Unknown, malformed, oversized and
+    ``users`` (MT-ADMIN-35), ``tasks`` (MT-ADMIN-36), ``admins``
+    (MT-ADMIN-37) grammars and the fixed-token ``broadcast``
+    (MT-ADMIN-38) grammar.  Unknown, malformed, oversized and
     foreign-namespace payloads (``wd:``, ``dp:``, ...) fail safely
     with None.  Numeric payloads are canonicalized
     (``tasks:p:007`` → ``tasks:p:7``) so one page/id/op has exactly
@@ -651,6 +699,11 @@ def parse_callback(data: object) -> str | None:
         return (
             f"{OP_ADMINS}:confirm:{match.group(1)}:{int(match.group(2))}"
         )
+    # ── broadcast grammar (MT-ADMIN-38) ──
+    # Four fixed tokens — no digits, no free text, no ids, and
+    # NEVER the message body in the payload.
+    if op in (BROADCAST_NEW_OP, BROADCAST_CONFIRM_OP, BROADCAST_CANCEL_OP):
+        return op
     return None
 
 
@@ -975,15 +1028,19 @@ async def control_callback(update, context) -> None:
     CENTRALIZED ``config.is_admin`` gate, THEN payload grammar — so a
     non-admin can never even reach payload parsing, let alone a read.
     Payloads are static registry keys plus the bounded ``users``
-    (MT-ADMIN-35), ``tasks`` (MT-ADMIN-36) and ``admins``
-    (MT-ADMIN-37) sub-grammars (no amounts, no destinations, no
-    secrets); unknown/stale presses fail safely; reserved modules
-    answer a safe unavailable notice; the ``users``, ``tasks`` and
-    ``admins`` modules render in place from authoritative reads
-    (``tasks`` mutates only via confirmation + the existing
-    ``db.update_task`` contract; ``admins`` mutates only via
-    confirmation + the existing ``db.add_admin_user`` /
-    ``db.remove_admin_user`` store operations); and the remaining
+    (MT-ADMIN-35), ``tasks`` (MT-ADMIN-36), ``admins``
+    (MT-ADMIN-37) sub-grammars and the fixed-token ``broadcast``
+    (MT-ADMIN-38) grammar (no amounts, no destinations, no secrets,
+    never the message body); unknown/stale presses fail safely;
+    reserved modules answer a safe unavailable notice; the
+    ``users``, ``tasks``, ``admins`` and ``broadcast`` modules
+    render in place from authoritative reads (``tasks`` mutates
+    only via confirmation + the existing ``db.update_task``
+    contract; ``admins`` mutates only via confirmation + the
+    existing ``db.add_admin_user`` / ``db.remove_admin_user`` store
+    operations; ``broadcast`` persists ALL of its state in SQLite
+    and delivers individually only after the atomic draft→sending
+    claim); and the remaining
     implemented modules DELEGATE to the existing command handlers
     (which re-check authorization themselves).  ``ctl:refresh``
     re-renders read-only.  No path owns a financial transaction.
@@ -1033,6 +1090,19 @@ async def control_callback(update, context) -> None:
         # rule can never starve the MT-ADMIN-36 task catch-all).
         _ensure_admins_text_input_handler(context)
         await _handle_admins_op(update, context, query, op, actor)
+        return
+
+    if op == OP_BROADCAST or op.startswith(f"{OP_BROADCAST}:"):
+        # MT-ADMIN-38: rendered in place by this module — the auth
+        # gate above already re-checked config.is_admin BEFORE any
+        # broadcast state or user count was read.  The first
+        # broadcast press also attaches the compose-text catch-all
+        # ONCE (lazy, idempotent; its own group 7, so PTB's
+        # one-handler-per-group rule can never starve the
+        # MT-ADMIN-36 (group 3) or MT-ADMIN-37 (group 6)
+        # catch-alls).
+        _ensure_broadcast_text_input_handler(context)
+        await _handle_broadcast_op(update, context, query, op, actor)
         return
 
     module = MODULES_BY_KEY[op]
@@ -2335,4 +2405,445 @@ async def task_edit_text_input(update, context) -> None:
     logger.info(
         "Task edit staged: admin=%d task=%d field=%s",
         actor, task_id, field,
+    )
+
+
+# ── Broadcast module (MT-ADMIN-38): individual sends, in place ───────
+# Authorization is re-checked by the caller BEFORE any read here.
+# Recipients come from the authoritative ``users`` table ONLY
+# (``db.list_broadcast_recipient_ids`` — never ``config.ADMINS``,
+# never task/wallet/withdrawal/deposit populations, never a username
+# search, never a client-supplied list); the aggregate count comes
+# from ``db.count_users``; and ALL broadcast state lives in the
+# persistent ``broadcasts`` store — there is NO process-global
+# broadcast dict anywhere in this module.  Delivery is individual
+# ``context.bot.send_message`` calls issued by the EXISTING bot
+# instance through the handler's own context (never a Telegram
+# group/chat broadcast, never a second Bot object): one failed
+# recipient (blocked bot, invalid/unavailable chat, network error,
+# anything unexpected) is COUNTED and the pass continues, the
+# invariant success + failure == recipients holds by construction,
+# and the atomic ``draft → sending`` claim
+# (``db.claim_broadcast_sending``) is the sole duplicate-send
+# authority — a duplicate, delayed or stale confirm performs ZERO
+# sends.  Privacy: the UI shows aggregate counts only (never a
+# recipient list, usernames or destinations) and logs carry
+# admin_id / broadcast_id / action / counts — never the message
+# body.  No wallet, ledger, task, reward, rate, payment-method or
+# admin-role primitive is ever called on this path, and this module
+# issues no SQL itself (all statements live in ``db.py``).
+
+
+def _broadcast_recipient_count() -> int | None:
+    """Authoritative registered-user total for the panel/card —
+    ``db.count_users`` through the shared metric guard, degrading to
+    ``None`` (rendered ``غير متاح``) on any read failure."""
+    return _metric("broadcast_recipients", _count_users)
+
+
+def build_broadcast_panel_text(count: int | None) -> str:
+    """Compact broadcast panel — aggregate count only, never a
+    recipient list or usernames."""
+    shown = NA if count is None else str(count)
+    return "\n".join(
+        [
+            BROADCAST_HEADER,
+            "",
+            f"👥 المستخدمون المسجلون: {shown}",
+            "",
+            "اختر إجراءً:",
+        ]
+    )
+
+
+def build_broadcast_panel_keyboard() -> InlineKeyboardMarkup:
+    """Fixed payloads only — new broadcast / back to Control Center."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 رسالة جديدة",
+                    callback_data=f"{CALLBACK_PREFIX}{BROADCAST_NEW_OP}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ مركز الإدارة",
+                    callback_data=f"{CALLBACK_PREFIX}{OP_REFRESH}",
+                )
+            ],
+        ]
+    )
+
+
+def build_broadcast_prompt_text() -> str:
+    """Compose prompt after 📢 رسالة جديدة."""
+    return "\n".join(
+        [
+            BROADCAST_COMPOSE_HEADER,
+            "",
+            "أرسل الآن الرسالة التي تريد إرسالها إلى المستخدمين.",
+            "",
+            "يمكنك إلغاء العملية من الزر أدناه.",
+        ]
+    )
+
+
+def build_broadcast_prompt_keyboard() -> InlineKeyboardMarkup:
+    # The prompt's cancel doubles as the compose-state cancel — the
+    # draft is resolved server-side, so no id travels in the payload.
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "↩️ إلغاء",
+                    callback_data=f"{CALLBACK_PREFIX}{BROADCAST_CANCEL_OP}",
+                )
+            ]
+        ]
+    )
+
+
+def build_broadcast_confirm_text(count: int | None, message: str) -> str:
+    """Confirmation card: aggregate recipient count + the reviewed
+    message — nothing else (no recipient list, no usernames, no
+    destinations, no wallet/financial data).
+
+    An unobtainable count honestly reads ``غير متاح`` (the keyboard
+    then offers NO confirm button, so an unknown population can
+    never send).  The preview is bounded by Telegram's real text
+    limit; an overlong PREVIEW is explicitly marked — the stored and
+    SENT message itself is never truncated.
+    """
+    shown = NA if count is None else str(count)
+    head = "\n".join(
+        [
+            BROADCAST_CONFIRM_HEADER,
+            "",
+            f"👥 المستلمون: {shown}",
+            "",
+            "📝 الرسالة:",
+            "",
+        ]
+    )
+    suffix = "\n… (معاينة مختصرة — الرسالة كاملة ستُرسل كما هي)"
+    budget = db.MAX_BROADCAST_MESSAGE_LEN - len(head) - len(suffix)
+    if len(message) > budget:
+        body = message[: max(budget, 0)] + suffix
+    else:
+        body = message
+    return head + body
+
+
+def build_broadcast_confirm_keyboard(confirmable: bool) -> InlineKeyboardMarkup:
+    """[✅ تأكيد الإرسال] only when the population is known; the
+    cancel button is always offered."""
+    rows = []
+    if confirmable:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ تأكيد الإرسال",
+                    callback_data=f"{CALLBACK_PREFIX}{BROADCAST_CONFIRM_OP}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ إلغاء",
+                callback_data=f"{CALLBACK_PREFIX}{BROADCAST_CANCEL_OP}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_broadcast_result_text(
+    recipients: int, success: int, failure: int
+) -> str:
+    """Aggregate delivery result — S + F = N by construction."""
+    return "\n".join(
+        [
+            BROADCAST_RESULT_HEADER,
+            "",
+            f"👥 المستلمون: {recipients}",
+            f"✅ تم الإرسال: {success}",
+            f"❌ فشل الإرسال: {failure}",
+        ]
+    )
+
+
+async def _deliver_broadcast(context, query, actor: int):
+    """Confirm → atomic claim → individual sends → aggregate result.
+
+    Order matters.  The draft and the recipient population are read
+    FIRST — a failed read degrades to a NON-sendable card (no claim,
+    no send, retryable), so an unknown population can never
+    broadcast.  The atomic ``draft → sending`` claim comes next and
+    is the SOLE duplicate-send authority: only the single rowcount-1
+    winner may begin Telegram sends; every loser answers the
+    deterministic already-processed notice with ZERO sends.  Each
+    recipient failure (blocked bot, invalid/unavailable chat,
+    network or unexpected error) is counted and the pass CONTINUES —
+    one failure never aborts the rest, no retry loop is invented and
+    no traceback reaches the administrator.  Returns
+    ``(text, markup, toast)`` for the caller to render.
+    """
+    panel = build_broadcast_panel_keyboard()
+    try:
+        draft = db.get_open_broadcast(actor)
+    except Exception:
+        logger.exception("Broadcast draft read failed: admin=%d", actor)
+        return MSG_ERROR, panel, None
+    if draft is None or not (draft.get("message") or "").strip():
+        # Stale/duplicate confirm: nothing is confirmable.  A
+        # sending/completed predecessor answers the deterministic
+        # already-processed notice; NEVER a resend, NEVER a rebuild.
+        try:
+            latest = db.get_latest_broadcast(actor)
+        except Exception:
+            logger.exception("Broadcast state read failed: admin=%d", actor)
+            return MSG_ERROR, panel, None
+        if latest and latest.get("status") in (
+            db.BROADCAST_STATUS_SENDING,
+            db.BROADCAST_STATUS_COMPLETED,
+        ):
+            logger.info(
+                "Broadcast confirm ignored: admin=%d broadcast=%s "
+                "result=already-processed",
+                actor, latest.get("id"),
+            )
+            return MSG_BROADCAST_ALREADY, panel, None
+        return MSG_NO_PENDING, panel, None
+    try:
+        recipients = db.list_broadcast_recipient_ids()
+    except Exception:
+        # Population unavailable → the confirmation must NOT send;
+        # the card degrades to ``غير متاح`` without a confirm button.
+        logger.exception(
+            "Broadcast recipients unavailable: admin=%d broadcast=%d",
+            actor, draft["id"],
+        )
+        return (
+            build_broadcast_confirm_text(None, draft["message"]),
+            build_broadcast_confirm_keyboard(False),
+            None,
+        )
+    if not db.claim_broadcast_sending(draft["id"], len(recipients)):
+        # Lost the atomic draft→sending transition: another confirm
+        # (or a delayed/raced press) already owns this broadcast.
+        logger.info(
+            "Broadcast confirm raced: admin=%d broadcast=%d "
+            "result=already-processed",
+            actor, draft["id"],
+        )
+        return MSG_BROADCAST_ALREADY, panel, None
+    # ONE intermediate state edit — never one edit per recipient.
+    try:
+        await query.edit_message_text(BROADCAST_SENDING_TEXT)
+    except Exception:
+        logger.info("Broadcast sending edit skipped: admin=%d", actor)
+    await _safe_answer(query, None)
+    logger.info(
+        "Broadcast started: admin=%d broadcast=%d recipients=%d",
+        actor, draft["id"], len(recipients),
+    )
+    message = draft["message"]
+    success = 0
+    failure = 0
+    for recipient in recipients:
+        try:
+            await context.bot.send_message(chat_id=recipient, text=message)
+            success += 1
+        except Exception:
+            # Blocked bot / invalid chat / network / unexpected: the
+            # recipient counts as failed and the pass CONTINUES.
+            # Only safe operational ids are logged — never the body.
+            failure += 1
+            logger.warning(
+                "Broadcast delivery failure: broadcast=%d failure_count=%d",
+                draft["id"], failure,
+            )
+    try:
+        db.finalize_broadcast(draft["id"], success, failure)
+    except Exception:
+        # The pass already ran; the row honestly stays 'sending'
+        # (never claimed complete) and the result below still reports
+        # the REAL counts.
+        logger.exception(
+            "Broadcast finalize failed: broadcast=%d", draft["id"]
+        )
+    logger.info(
+        "Broadcast completed: admin=%d broadcast=%d recipients=%d "
+        "success=%d failure=%d",
+        actor, draft["id"], len(recipients), success, failure,
+    )
+    return (
+        build_broadcast_result_text(len(recipients), success, failure),
+        panel,
+        None,
+    )
+
+
+async def _handle_broadcast_op(update, context, query, op: str,
+                               actor: int) -> None:
+    """``ctl:broadcast*`` — the broadcast surface (MT-ADMIN-38).
+
+    The caller has ALREADY re-checked authorization (private chat +
+    ``config.is_admin``) before any read here.  Reads use the
+    authoritative ``db.count_users`` / store operations; ALL state
+    lives in the persistent ``broadcasts`` store; the only side
+    effect beyond it is the individual delivery pass of the EXISTING
+    bot instance (no financial, task or admin-role mutation exists
+    on this path).  Failures degrade to a safe error answer.  Logs
+    carry admin id + broadcast id + action + counts only — never the
+    message body, recipient identities or tracebacks shown to the
+    administrator.
+    """
+    view = "broadcast:panel"
+    toast: str | None = None
+    try:
+        if op == OP_BROADCAST:
+            count = _broadcast_recipient_count()
+            text = build_broadcast_panel_text(count)
+            markup = build_broadcast_panel_keyboard()
+        elif op == BROADCAST_NEW_OP:
+            # Arm ONE persisted draft (compose state lives in SQLite
+            # — never a process-global dict).  No send, no user read.
+            view = "broadcast:compose"
+            broadcast_id = db.arm_broadcast_draft(actor)
+            text = build_broadcast_prompt_text()
+            markup = build_broadcast_prompt_keyboard()
+            logger.info(
+                "Broadcast armed: admin=%d broadcast=%d",
+                actor, broadcast_id,
+            )
+        elif op == BROADCAST_CONFIRM_OP:
+            view = "broadcast:result"
+            text, markup, toast = await _deliver_broadcast(
+                context, query, actor
+            )
+        elif op == BROADCAST_CANCEL_OP:
+            # Clear the pending draft: NO send, NO user mutation.
+            view = "broadcast:cancel"
+            cancelled = db.cancel_open_broadcast(actor)
+            count = _broadcast_recipient_count()
+            text = build_broadcast_panel_text(count)
+            markup = build_broadcast_panel_keyboard()
+            toast = (
+                TOAST_BROADCAST_CANCELLED if cancelled else MSG_NO_PENDING
+            )
+            logger.info(
+                "Broadcast cancelled: admin=%d result=%s",
+                actor, "cancelled" if cancelled else "no-pending",
+            )
+        else:
+            # Defense in depth — the parser already rejects this.
+            await _safe_answer(query, MSG_INVALID)
+            return
+    except Exception:
+        logger.exception(
+            "Control broadcast view failed: admin=%d view=%s",
+            actor, view,
+        )
+        await _safe_answer(query, MSG_ERROR)
+        return
+    await _edit_view_or_skip(query, text, markup, actor, view, toast)
+    logger.info("Control broadcast view: admin=%d view=%s", actor, view)
+
+
+async def broadcast_text_input(update, context) -> None:
+    """Pending broadcast text (MT-ADMIN-38).
+
+    Attached LAZILY + idempotently (group 7) — same catch-all
+    pattern as the MT-ADMIN-36 task input (group 3) and MT-ADMIN-37
+    admin input (group 6); PTB runs ONE handler per group, so every
+    self-gated catch-all owns its own group and none can starve the
+    others.  Completely SILENT unless THIS admin holds an open
+    COMPOSING draft, so ordinary chat, the anti-bot flow, the
+    wizard, support, the task editor and the add-admin input are
+    untouched.  Authorization is re-checked BEFORE any broadcast
+    state is read from SQLite; NOTHING is sent and NO recipient is
+    touched here — the text only arms the confirmation card, and
+    delivery happens solely through ``ctl:broadcast:confirm`` + the
+    atomic draft→sending claim.  Invalid input (empty,
+    whitespace-only, oversized) keeps the draft so the admin can
+    retry; no broadcast job is created and nothing is sent.
+    """
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    if _non_private_chat(update):
+        return
+    actor = _actor_id(
+        getattr(getattr(update, "effective_user", None), "id", None)
+    )
+    if actor is None:
+        return
+    if not is_admin(actor):
+        return  # auth BEFORE any broadcast state read
+    try:
+        draft = db.get_open_broadcast(actor)
+    except Exception:
+        logger.exception("Broadcast state read failed: admin=%d", actor)
+        return
+    if not draft or (draft.get("message") or "") != "":
+        return  # not composing — stay silent like the other catch-alls
+    raw = message.text or ""
+    text = raw.strip()
+    if not text:
+        await message.reply_text(MSG_BROADCAST_EMPTY)
+        return  # no broadcast job created, nothing sent
+    if len(text) > db.MAX_BROADCAST_MESSAGE_LEN:
+        # Telegram's real text limit — never silently truncated; the
+        # draft is KEPT so the admin can simply retry shorter.
+        await message.reply_text(MSG_BROADCAST_TOO_LONG)
+        return
+    if not db.save_broadcast_draft_message(draft["id"], text):
+        # Raced to cancelled/claimed — single-use compose state.
+        await message.reply_text(MSG_NO_PENDING)
+        return
+    count = _broadcast_recipient_count()
+    logger.info(
+        "Broadcast composed: admin=%d broadcast=%d recipients=%s",
+        actor, draft["id"], count,
+    )
+    await message.reply_text(
+        build_broadcast_confirm_text(count, text),
+        reply_markup=build_broadcast_confirm_keyboard(count is not None),
+    )
+
+
+# Marker on Application.bot_data: the broadcast compose-text
+# catch-all has been attached to the LIVE application (single-shot,
+# idempotent).
+_BROADCAST_TEXT_HANDLER_MARK = "admin_broadcast_text_input_handler"
+
+
+def _ensure_broadcast_text_input_handler(context) -> None:
+    """Attach ``broadcast_text_input`` to the live Application ONCE.
+
+    Same lazy, idempotent pattern the MT-ADMIN-36 (group 3) and
+    MT-ADMIN-37 (group 6) catch-alls established — no static
+    registration in bot.py is needed and ``^ctl:`` stays the single
+    callback entry.  Group 7 is used because groups 0-6 are occupied
+    and PTB runs at most ONE handler per group: a separate group
+    guarantees all three self-gated catch-alls always get their
+    chance.  A context without a live Application (unit-test shims)
+    degrades to a no-op.
+    """
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None)
+    if app is None or not isinstance(bot_data, dict):
+        return  # no live application (or a test shim) — no-op
+    if bot_data.get(_BROADCAST_TEXT_HANDLER_MARK):
+        return  # single-shot: never double-register
+    bot_data[_BROADCAST_TEXT_HANDLER_MARK] = True
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            broadcast_text_input,
+        ),
+        group=7,
     )
