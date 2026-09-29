@@ -997,10 +997,9 @@ class TestAdminSystemFoundation(ControlTestBase):
         # "broadcast" is reserved no more (MT-ADMIN-38 renders the
         # broadcast panel in place) — covered by
         # test_admin_broadcast.py instead.
-        "settings",
-        # "admins" is reserved no more (MT-ADMIN-37 renders the
-        # admin-management panel in place) — covered by
-        # test_admin_admins.py instead.
+        # "settings" is reserved no more (MT-ADMIN-39 renders the
+        # settings panel in place) — covered by
+        # test_admin_settings.py instead.
         "logs",
         "health",
     )

@@ -1419,7 +1419,9 @@ class TestAdminsNavigation(AdminsTestBase):
             for key in (
                 # "broadcast" moved to test_admin_broadcast.py
                 # (MT-ADMIN-38 renders it in place).
-                "rewards", "settings", "logs", "health",
+                # "settings" moved to test_admin_settings.py
+                # (MT-ADMIN-39 renders it in place).
+                "rewards", "logs", "health",
             ):
                 update = self._press(f"ctl:{key}")
                 self.assertEqual(

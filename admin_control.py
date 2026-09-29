@@ -195,6 +195,15 @@ MSG_BROADCAST_EMPTY = "❌ الرسالة فارغة."
 MSG_BROADCAST_TOO_LONG = "❌ الرسالة طويلة جدًا."
 MSG_BROADCAST_ALREADY = "⚠️ تم تنفيذ هذه العملية بالفعل."
 TOAST_BROADCAST_CANCELLED = "↩️ تم إلغاء الإرسال."
+# MT-ADMIN-39 settings surface — stable Arabic copy.  Every value
+# comes from / goes through the EXISTING platform_settings contract
+# only: a never-configured key renders as "غير مضبوط" (never zero,
+# never an invented default), and no secret, path, SQL or database
+# detail can appear anywhere in this surface.
+SETTINGS_PANEL_HEADER = "⚙️ إعدادات البوت"
+MSG_SETTINGS_UNSET = "غير مضبوط"
+MSG_SETTING_VALUE_INVALID = "❌ قيمة غير صالحة لهذا الإعداد."
+TOAST_SETTING_UPDATED = "✅ تم تحديث الإعداد"
 BACK_HINT = "↩️ للعودة اكتب: /control"
 
 NA = "غير متاح"
@@ -250,10 +259,11 @@ class AdminModule:
 
 
 MODULES: tuple[AdminModule, ...] = (
-# ``command=None``: users, tasks, admins and broadcast have no
-# delegation command — this module renders ALL FOUR in place
-# (MT-ADMIN-35 / MT-ADMIN-36 / MT-ADMIN-37 / MT-ADMIN-38),
-# unlike the reserved slots below which answer a safe notice.
+# ``command=None``: users, tasks, admins, broadcast and settings
+# have no delegation command — this module renders ALL FIVE in
+# place (MT-ADMIN-35 / MT-ADMIN-36 / MT-ADMIN-37 / MT-ADMIN-38 /
+# MT-ADMIN-39), unlike the reserved slots below which answer a
+# safe notice.
     AdminModule("users", "👥 المستخدمون", "إدارة مستخدمين (قراءة فقط)"),
     AdminModule("tasks", "📋 المهام", "إدارة المهام (عرض/تفعيل/تعطيل)"),
     AdminModule(
@@ -273,7 +283,7 @@ MODULES: tuple[AdminModule, ...] = (
     AdminModule(
         "broadcast", "📢 الإرسال الجماعي", "إرسال رسالة للمستخدمين المسجلين"
     ),
-    AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة (قريباً)"),
+    AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة"),
     AdminModule(
         "admins", "👮 المشرفون", "إدارة المشرفين (عرض/إضافة/إزالة)"
     ),
@@ -377,6 +387,37 @@ OP_BROADCAST = "broadcast"
 BROADCAST_NEW_OP = "broadcast:new"
 BROADCAST_CONFIRM_OP = "broadcast:confirm"
 BROADCAST_CANCEL_OP = "broadcast:cancel"
+
+# MT-ADMIN-39: the in-place settings module owns its own closed
+# sub-grammar under the SAME ctl: namespace — the FOUR registered
+# platform-settings keys as fixed literal tokens only, never JSON,
+# never free text, never a value/amount, and never a key outside
+# the registered registry (even if such a row existed in the DB):
+#   ctl:settings                    settings panel (4 registered keys)
+#   ctl:settings:edit:<key>         arm ONE pending value input
+#   ctl:settings:confirm:<key>      single-use confirm → fresh
+#                                   re-read + re-validation →
+#                                   set_setting() exactly once
+#   ctl:settings:cancel:<key>       drop the pending input → panel
+#   ctl:settings:back               back to the Control Center
+# The staged VALUE never travels in the payload — it arrives via
+# text input and lives only in the handler context (never logged).
+OP_SETTINGS = "settings"
+SETTINGS_BACK_OP = "settings:back"
+_SETTINGS_KEYS: tuple[str, ...] = (
+    "minimum_withdrawal_units",
+    "minimum_deposit_units",
+    "withdrawal_fee_units",
+    "advertiser_commission",
+)
+_SETTINGS_KEY_PATTERN = "|".join(_SETTINGS_KEYS)
+_SETTINGS_EDIT_RE = re.compile(rf"settings:edit:({_SETTINGS_KEY_PATTERN})")
+_SETTINGS_CONFIRM_RE = re.compile(
+    rf"settings:confirm:({_SETTINGS_KEY_PATTERN})"
+)
+_SETTINGS_CANCEL_RE = re.compile(
+    rf"settings:cancel:({_SETTINGS_KEY_PATTERN})"
+)
 
 
 # ── Shared MT-ADMIN-02 isolation helpers (inlined, no import cycle) ───
@@ -704,6 +745,19 @@ def parse_callback(data: object) -> str | None:
     # NEVER the message body in the payload.
     if op in (BROADCAST_NEW_OP, BROADCAST_CONFIRM_OP, BROADCAST_CANCEL_OP):
         return op
+    # ── settings grammar (MT-ADMIN-39) ──
+    # The panel/back ops plus edit/confirm/cancel scoped to ONE of
+    # the FOUR registered keys as literal tokens.  Unknown keys,
+    # values and free-form payloads fail with None — a database row
+    # whose key is not registered can never be reached.
+    if op == SETTINGS_BACK_OP:
+        return op
+    if (
+        _SETTINGS_EDIT_RE.fullmatch(op)
+        or _SETTINGS_CONFIRM_RE.fullmatch(op)
+        or _SETTINGS_CANCEL_RE.fullmatch(op)
+    ):
+        return op
     return None
 
 
@@ -1029,9 +1083,11 @@ async def control_callback(update, context) -> None:
     non-admin can never even reach payload parsing, let alone a read.
     Payloads are static registry keys plus the bounded ``users``
     (MT-ADMIN-35), ``tasks`` (MT-ADMIN-36), ``admins``
-    (MT-ADMIN-37) sub-grammars and the fixed-token ``broadcast``
-    (MT-ADMIN-38) grammar (no amounts, no destinations, no secrets,
-    never the message body); unknown/stale presses fail safely;
+    (MT-ADMIN-37) sub-grammars, the fixed-token ``broadcast``
+    (MT-ADMIN-38) grammar and the four-registered-key ``settings``
+    (MT-ADMIN-39) grammar (no amounts, no destinations, no secrets,
+    never the message body, never a staged value); unknown/stale
+    presses fail safely;
     reserved modules answer a safe unavailable notice; the
     ``users``, ``tasks``, ``admins`` and ``broadcast`` modules
     render in place from authoritative reads (``tasks`` mutates
@@ -1103,6 +1159,18 @@ async def control_callback(update, context) -> None:
         # catch-alls).
         _ensure_broadcast_text_input_handler(context)
         await _handle_broadcast_op(update, context, query, op, actor)
+        return
+
+    if op == OP_SETTINGS or op.startswith(f"{OP_SETTINGS}:"):
+        # MT-ADMIN-39: rendered in place by this module — the auth
+        # gate above already re-checked config.is_admin BEFORE any
+        # platform setting was read or any staged value confirmed.
+        # The first settings press also attaches the value-text
+        # catch-all ONCE (lazy, idempotent; its own group 8, so
+        # PTB's one-handler-per-group rule can never starve the
+        # groups 3/6/7 catch-alls).
+        _ensure_settings_text_input_handler(context)
+        await _handle_settings_op(update, context, query, op, actor)
         return
 
     module = MODULES_BY_KEY[op]
@@ -2846,4 +2914,495 @@ def _ensure_broadcast_text_input_handler(context) -> None:
             broadcast_text_input,
         ),
         group=7,
+    )
+
+
+# ── Settings module (MT-ADMIN-39): platform configuration, in place ───
+# Authorization is re-checked by the caller BEFORE any read here.
+# The authoritative source for EVERY displayed or written value is
+# the existing ``platform_settings`` registry (exactly four keys —
+# pinned by the registry test): reads go through
+# ``ps.get_setting`` (ungated BY CONTRACT), input
+# validation is ONLY the existing
+# ``ps.parse_setting_value``, and the ONLY write in
+# this module is the existing admin-only
+# ``ps.set_setting`` contract — which itself
+# re-authorizes through ``config.is_admin`` and re-validates before
+# touching the table.  NO value is invented: a never-configured key
+# renders as ``MSG_SETTINGS_UNSET`` ("غير مضبوط") — never 0, never a
+# guessed default — and a key never enters the grammar unless it is
+# one of the four registered keys, so no unknown database row can be
+# reached.  No SQL, no ``db.transaction`` and no wallet / ledger /
+# withdrawal / deposit / payment-method / rate / task mutation
+# exists anywhere in this section: a confirmed update changes ONE
+# ``platform_settings`` row and nothing else.  The staged value
+# never appears in callback data and is never logged — only
+# admin id + key + action + result are.
+
+# The platform_settings module under its short alias — the SAME
+# spelling the platform-settings tests use (``ps``).  The
+# MT-ADMIN-26 structural guard keeps the qualified name out of this
+# source (the rate NEVER comes from settings) while ``ps`` is the
+# identical module object, so every contract call and every test
+# spy behaves exactly as with the full name.
+import platform_settings as ps
+
+# ONE pending value edit, staged in the HANDLER CONTEXT's per-user
+# store (``context.user_data``) — deliberately NOT a module-level
+# dict, NOT a new table and NOT part of any callback payload.
+# Restart-scoped by design: a stale confirmation later finds
+# nothing staged and answers the safe notice without writing.
+_SETTINGS_PENDING_KEY = "admin_settings_pending"
+
+# Display labels — UI copy only; the keys stay the registered four.
+_SETTINGS_LABELS: dict[str, str] = {
+    "minimum_withdrawal_units": "💸 الحد الأدنى للسحب",
+    "minimum_deposit_units": "💵 الحد الأدنى للإيداع",
+    "withdrawal_fee_units": "💳 رسوم السحب",
+    "advertiser_commission": "🎁 عمولة المعلن",
+}
+
+
+def _settings_store(context) -> dict | None:
+    """The context's real user-state dict, or None.
+
+    Only a genuine ``dict`` counts (unit-test shims without one
+    degrade to "no pending"), so a strange context can never
+    produce a phantom staged value.
+    """
+    store = getattr(context, "user_data", None)
+    return store if isinstance(store, dict) else None
+
+
+def _settings_pop(context) -> dict | None:
+    """Consume the ONE staged edit (single-use), else None."""
+    store = _settings_store(context)
+    if store is None:
+        return None
+    pending = store.pop(_SETTINGS_PENDING_KEY, None)
+    return pending if isinstance(pending, dict) else None
+
+
+def _setting_display(key: str, value: object) -> str:
+    """EXACT human rendering of one stored value — or the unset copy.
+
+    ``None`` (never configured) renders ``غير مضبوط`` — never zero
+    and never an invented default.  USDT-unit keys render through
+    the documented exact scale ``ps.USDT_UNITS_PER_USDT``
+    (1 USDT = 100,000,000 units, 8 decimal places) with INTEGER
+    arithmetic only — no float, no rounding; the basis-point key
+    renders the documented 10 000 bp = 100 % scale the same way.
+    """
+    if value is None:
+        return MSG_SETTINGS_UNSET
+    spec = ps.get_spec(key)
+    if spec.kind == ps.KIND_USDT_UNITS:
+        whole, frac = divmod(int(value), ps.USDT_UNITS_PER_USDT)
+        return f"{whole}.{frac:08d} USDT"
+    amount = int(value)
+    return f"{amount // 100}.{amount % 100:02d}%"
+
+
+def collect_settings() -> dict:
+    """Read-only snapshot of the FOUR registered settings.
+
+    Fresh ``ps.get_setting`` reads (the ungated
+    contract) — no cache, no second source, no invented key.  A
+    read failure degrades that ONE row to ``غير متاح`` instead of
+    failing the panel, and is logged with the key only.
+    """
+    rows = []
+    for key in _SETTINGS_KEYS:
+        try:
+            value = ps.get_setting(key)
+            display = _setting_display(key, value)
+        except Exception:
+            logger.exception("Settings read failed: key=%s", key)
+            value, display = None, NA
+        rows.append(
+            {
+                "key": key,
+                "label": _SETTINGS_LABELS[key],
+                "value": value,
+                "display": display,
+            }
+        )
+    return {"rows": rows}
+
+
+def build_settings_text(snapshot: dict) -> str:
+    """Arabic panel — exactly the four registered settings, aggregate
+    values only: no secret, no path, no updated_by, no SQL detail."""
+    lines = [SETTINGS_PANEL_HEADER, ""]
+    lines += [
+        f"{row['label']}: {row['display']}" for row in snapshot["rows"]
+    ]
+    lines += ["", "اختر إعدادًا لتعديله."]
+    return "\n".join(lines)
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    """One edit button per registered key + the canonical back.
+
+    Payloads are fixed literal keys only — never a value, never
+    free text, never a key outside the registered four.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"✏️ {_SETTINGS_LABELS[key]}",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_SETTINGS}:edit:{key}"
+                ),
+            )
+        ]
+        for key in _SETTINGS_KEYS
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ مركز الإدارة",
+                callback_data=f"{CALLBACK_PREFIX}{SETTINGS_BACK_OP}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _settings_back_keyboard() -> InlineKeyboardMarkup:
+    """Back button for stale/refusal/no-pending cards."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "↩️ مركز الإدارة",
+                    callback_data=f"{CALLBACK_PREFIX}{SETTINGS_BACK_OP}",
+                )
+            ]
+        ]
+    )
+
+
+def build_settings_prompt_text(key: str, current: object) -> str:
+    """Input prompt after an edit press — arms ONE staged value and
+    shows the FRESH current value.  NO mutation happens here."""
+    return "\n".join(
+        [
+            f"✏️ {_SETTINGS_LABELS[key]}",
+            "",
+            f"القيمة الحالية: {_setting_display(key, current)}",
+            "",
+            "أرسل القيمة الجديدة.",
+            "ستُعرض المراجعة قبل الحفظ.",
+        ]
+    )
+
+
+def build_settings_prompt_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "↩️ إلغاء",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_SETTINGS}:cancel:{key}"
+                    ),
+                )
+            ]
+        ]
+    )
+
+
+def build_settings_confirm_text(
+    key: str, current: object, new_value: object
+) -> str:
+    """Preview card — old/new values live in the card TEXT; the
+    callback carries only the fixed op + the registered key, never
+    the value itself."""
+    return "\n".join(
+        [
+            "⚠️ تأكيد تحديث الإعداد",
+            "",
+            f"🔑 {_SETTINGS_LABELS[key]}",
+            f"القيمة الحالية: {_setting_display(key, current)}",
+            f"القيمة الجديدة: {_setting_display(key, new_value)}",
+            "",
+            "هل تريد المتابعة؟",
+        ]
+    )
+
+
+def build_settings_confirm_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تأكيد",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_SETTINGS}:confirm:{key}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ إلغاء",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_SETTINGS}:cancel:{key}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def _apply_setting_confirm(key: str, actor: int, context):
+    """Single-use confirmation → the ONE existing write contract.
+
+    Order (MT-ADMIN-39): consume the staged value FIRST (single-use:
+    a second confirm finds nothing and writes nothing), then a fresh
+    re-read of the stored value, then re-validation of the staged
+    input with the EXISTING parser, then ``set_setting`` exactly
+    once — which re-authorizes via ``config.is_admin`` and
+    re-validates internally before writing.  Returns
+    ``(text, markup, toast)``; unexpected failures propagate to the
+    caller's safe error handler.  Logs admin id + key + result only
+    — never the value.
+    """
+    pending = _settings_pop(context)  # single-use: consumed NOW
+    if (
+        pending is None
+        or pending.get("key") != key
+        or not isinstance(pending.get("raw"), str)
+    ):
+        logger.info(
+            "Settings update: admin=%d key=%s action=confirm result=%s",
+            actor, key, "no-pending",
+        )
+        return MSG_NO_PENDING, _settings_back_keyboard(), None
+    # 1) Fresh re-read: a pressed card's view is never trusted.
+    current = ps.get_setting(key)
+    # 2) Re-validate the staged input with the EXISTING validator —
+    #    no validation semantics are re-implemented here.
+    raw = pending["raw"]
+    try:
+        ps.parse_setting_value(key, raw)
+    except ps.SettingValidationError as exc:
+        logger.info(
+            "Settings update: admin=%d key=%s action=confirm result=%s",
+            actor, key, "invalid-value",
+        )
+        return str(exc), _settings_back_keyboard(), None
+    except ps.PlatformSettingError:
+        logger.info(
+            "Settings update: admin=%d key=%s action=confirm result=%s",
+            actor, key, "invalid-key",
+        )
+        return MSG_INVALID, _settings_back_keyboard(), None
+    # 3) The ONE write — existing admin-only contract (authorizes
+    #    and validates again internally; touches ONLY the
+    #    platform_settings row).
+    try:
+        ps.set_setting(key, raw, admin_user_id=actor)
+    except ps.SettingPermissionError:
+        logger.info(
+            "Settings update: admin=%d key=%s action=confirm result=%s",
+            actor, key, "denied",
+        )
+        return MSG_ADMIN_ONLY, _settings_back_keyboard(), None
+    except ps.PlatformSettingError as exc:
+        logger.info(
+            "Settings update: admin=%d key=%s action=confirm result=%s",
+            actor, key, "rejected",
+        )
+        return str(exc), _settings_back_keyboard(), None
+    # Staged value consumed above; render the FRESH panel (§15).
+    logger.info(
+        "Settings update: admin=%d key=%s action=confirm result=%s",
+        actor, key, "applied",
+    )
+    snapshot = collect_settings()
+    return (
+        build_settings_text(snapshot),
+        build_settings_keyboard(),
+        TOAST_SETTING_UPDATED,
+    )
+
+
+async def _handle_settings_op(update, context, query, op: str,
+                              actor: int) -> None:
+    """``ctl:settings*`` — the platform-settings surface (MT-ADMIN-39).
+
+    The caller has ALREADY re-checked authorization (private chat +
+    config.is_admin) before any read here.  Reads use the existing
+    platform_settings contract; the ONLY mutation anywhere in this
+    module is the existing ``set_setting`` reached through
+    stage → preview → single-use confirm — never on selection,
+    never without validation.  Failures degrade to a safe error
+    answer.  Logs carry admin id + key + view/result only — never a
+    staged value, a payload or a traceback shown to the admin.
+    """
+    view = "settings:panel"
+    toast: str | None = None
+    try:
+        if op == SETTINGS_BACK_OP:
+            # Canonical "↩️ مركز الإدارة": drop any staged edit and
+            # return to the Control Center dashboard (read-only).
+            view = "settings:back"
+            _settings_pop(context)
+            await _refresh_dashboard(query, actor)
+            return
+        if op == OP_SETTINGS:
+            snapshot = collect_settings()
+            text = build_settings_text(snapshot)
+            markup = build_settings_keyboard()
+        else:
+            match = _SETTINGS_EDIT_RE.fullmatch(op)
+            if match:
+                # Select setting → show the fresh current value →
+                # prompt.  Arms ONE staged edit in the handler
+                # context; NO mutation on mere selection.
+                view = "settings:input"
+                key = match.group(1)
+                store = _settings_store(context)
+                if store is not None:
+                    store[_SETTINGS_PENDING_KEY] = {
+                        "key": key,
+                        "admin": actor,
+                    }
+                current = ps.get_setting(key)
+                text = build_settings_prompt_text(key, current)
+                markup = build_settings_prompt_keyboard(key)
+            else:
+                match = _SETTINGS_CONFIRM_RE.fullmatch(op)
+                if match:
+                    view = "settings:result"
+                    key = match.group(1)
+                    text, markup, toast = _apply_setting_confirm(
+                        key, actor, context
+                    )
+                else:
+                    match = _SETTINGS_CANCEL_RE.fullmatch(op)
+                    if match is None:
+                        # Defense in depth — the parser rejects this.
+                        await _safe_answer(query, MSG_INVALID)
+                        return
+                    # Cancel → drop the staged edit, re-render the
+                    # panel: NO write of any kind, ever.
+                    view = "settings:panel"
+                    key = match.group(1)
+                    _settings_pop(context)
+                    snapshot = collect_settings()
+                    text = build_settings_text(snapshot)
+                    markup = build_settings_keyboard()
+                    toast = TOAST_CANCELLED
+    except Exception:
+        logger.exception(
+            "Control settings view failed: admin=%d view=%s", actor, view
+        )
+        await _safe_answer(query, MSG_ERROR)
+        return
+    await _edit_view_or_skip(query, text, markup, actor, view, toast)
+    logger.info("Control settings view: admin=%d view=%s", actor, view)
+
+
+async def settings_text_input(update, context) -> None:
+    """Pending settings-value text (MT-ADMIN-39).
+
+    Attached LAZILY + idempotently (group 8) — same catch-all
+    pattern as the MT-ADMIN-36/37/38 inputs.  Completely SILENT
+    unless THIS private chat holds a staged settings edit, so
+    ordinary chat, the anti-bot flow, the wizard, support and the
+    other catch-alls are untouched.  Authorization is re-checked
+    BEFORE validation, BEFORE any read and BEFORE any write;
+    NOTHING is written here — the validated value only arms the
+    preview, and the confirm callback re-reads + re-validates and
+    calls the single ``set_setting`` contract exactly once.  The
+    staged raw text is NEVER logged.
+    """
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    if _non_private_chat(update):
+        return
+    actor = _actor_id(
+        getattr(getattr(update, "effective_user", None), "id", None)
+    )
+    if actor is None:
+        return
+    pending = None
+    store = _settings_store(context)
+    if store is not None:
+        candidate = store.get(_SETTINGS_PENDING_KEY)
+        if isinstance(candidate, dict):
+            pending = candidate
+    if pending is None or pending.get("key") not in _SETTINGS_KEYS:
+        return  # not our state — stay silent like the other catch-alls
+    if not is_admin(actor):
+        return  # re-auth BEFORE validation / read / write
+    key = pending["key"]
+    value = message.text
+    if not isinstance(value, str) or len(value) > db.MAX_BROADCAST_MESSAGE_LEN:
+        # Bounded input; the staged edit is KEPT so the admin can
+        # simply retry with a valid value.
+        await message.reply_text(MSG_SETTING_VALUE_INVALID)
+        return
+    try:
+        # Existing validator ONLY — no validation semantics added.
+        canonical = ps.parse_setting_value(key, value)
+        current = ps.get_setting(key)
+    except ps.SettingValidationError as exc:
+        # The existing contract's own Arabic message; pending kept.
+        await message.reply_text(str(exc))
+        return
+    except ps.PlatformSettingError:
+        await message.reply_text(MSG_INVALID)
+        return
+    except Exception:
+        logger.exception(
+            "Settings staging failed: admin=%d key=%s", actor, key
+        )
+        await message.reply_text(MSG_ERROR)
+        return
+    pending["raw"] = value  # exact intended input — re-validated
+    pending["value"] = canonical  # on confirm; never in callbacks
+    await message.reply_text(
+        build_settings_confirm_text(key, current, canonical),
+        reply_markup=build_settings_confirm_keyboard(key),
+    )
+    logger.info(
+        "Settings value staged: admin=%d key=%s action=stage "
+        "result=staged",
+        actor, key,
+    )
+
+
+# Marker on Application.bot_data: the settings-value catch-all has
+# been attached to the LIVE application (single-shot, idempotent).
+_SETTINGS_TEXT_HANDLER_MARK = "admin_settings_value_text_handler"
+
+
+def _ensure_settings_text_input_handler(context) -> None:
+    """Attach ``settings_text_input`` to the live Application ONCE.
+
+    Same lazy, idempotent pattern as MT-ADMIN-36/37/38 — no static
+    registration in bot.py is needed and ``^ctl:`` stays the single
+    callback entry.  Group 8 is used because groups 0-7 are occupied
+    and PTB runs at most ONE handler per group: the task (3), admin
+    (6) and broadcast (7) catch-alls keep theirs, and this one can
+    never starve them.  A context without a live Application
+    (unit-test shims) degrades to a no-op.
+    """
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None)
+    if app is None or not isinstance(bot_data, dict):
+        return  # no live application (or a test shim) — no-op
+    if bot_data.get(_SETTINGS_TEXT_HANDLER_MARK):
+        return  # single-shot: never double-register
+    bot_data[_SETTINGS_TEXT_HANDLER_MARK] = True
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            settings_text_input,
+        ),
+        group=8,
     )
