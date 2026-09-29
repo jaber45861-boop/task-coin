@@ -287,6 +287,9 @@ MODULES: tuple[AdminModule, ...] = (
     AdminModule(
         "support", "🎧 الدعم", "إدارة طلبات الدعم", "/support"
     ),
+    AdminModule(
+        "channels", "📡 القنوات", "إدارة القنوات المطلوبة", "/listchannels"
+    ),
     AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة"),
     AdminModule(
         "admins", "👮 المشرفون", "إدارة المشرفين (عرض/إضافة/إزالة)"
@@ -666,6 +669,7 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
         [_btn("rate"), _btn("rewards")],
         [_btn("broadcast")],
         [_btn("support")],
+        [_btn("channels")],
         [_btn("settings"), _btn("admins")],
         [_btn("logs"), _btn("health")],
         [
@@ -819,6 +823,17 @@ async def _open_support(shim, context) -> None:
     await support_service.support_command(shim, context)
 
 
+async def _open_channels(shim, context) -> None:
+    # Local import: bot.py imports this module (cycle), same pattern
+    # the tasks-new delegation uses.  Delegation ONLY — the existing
+    # /listchannels handler keeps its own auth + private-chat guard
+    # and renders its own list; nothing channel-related is
+    # re-implemented or written here.
+    import bot  # local: bot.py imports this module (cycle)
+
+    await bot.list_channels(shim, context)
+
+
 _NAVIGATORS = {
     "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
@@ -826,6 +841,7 @@ _NAVIGATORS = {
     "paymethods": _open_paymethods,
     "rate": _open_rate,
     "support": _open_support,
+    "channels": _open_channels,
 }
 
 

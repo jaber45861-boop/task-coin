@@ -1308,7 +1308,7 @@ class TestTasksNavigation(TasksTestBase):
         expected_keys = {
             "users", "tasks", "reviews", "withdrawals", "deposits",
             "paymethods", "rate", "rewards", "broadcast", "support",
-            "settings", "admins", "logs", "health",
+            "channels", "settings", "admins", "logs", "health",
         }
         self.assertEqual(set(admin_control.MODULES_BY_KEY), expected_keys)
         self.assertIsNone(admin_control.MODULES_BY_KEY["tasks"].command)

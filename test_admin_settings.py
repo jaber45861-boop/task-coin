@@ -1203,6 +1203,7 @@ class TestSettingsRegression(SettingsTestBase):
             [
                 "ctl:admins",
                 "ctl:broadcast",
+                "ctl:channels",
                 "ctl:deposits",
                 "ctl:health",
                 "ctl:logs",

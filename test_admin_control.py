@@ -592,6 +592,7 @@ class TestNavigation(ControlTestBase):
             [
                 "ctl:admins",
                 "ctl:broadcast",
+                "ctl:channels",
                 "ctl:deposits",
                 "ctl:health",
                 "ctl:logs",
@@ -739,6 +740,7 @@ class TestNavigation(ControlTestBase):
                 "ctl:rewards",
                 "ctl:broadcast",
                 "ctl:support",
+                "ctl:channels",
                 "ctl:settings",
                 "ctl:admins",
                 "ctl:logs",
@@ -1025,6 +1027,7 @@ class TestAdminSystemFoundation(ControlTestBase):
                 "rewards",
                 "broadcast",
                 "support",
+                "channels",
                 "settings",
                 "admins",
                 "logs",
@@ -1047,6 +1050,7 @@ class TestAdminSystemFoundation(ControlTestBase):
             "paymethods": "/paymethods",
             "rate": "/setrate",
             "support": "/support",
+            "channels": "/listchannels",
         }
         for module in admin_control.MODULES:
             self.assertEqual(
@@ -1069,6 +1073,7 @@ class TestAdminSystemFoundation(ControlTestBase):
             "paymethods": (payment_method_admin, "paymethods_command"),
             "rate": (rate_admin, "setrate_command"),
             "support": (support_service, "support_command"),
+            "channels": (bot_mod, "list_channels"),
         }
         implemented = {
             m.key for m in admin_control.MODULES if m.command is not None
