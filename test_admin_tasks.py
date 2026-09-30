@@ -51,8 +51,8 @@ Coverage required by MT-ADMIN-36 §TESTS (brief number → test name):
         → test_24..32
 
  G. CREATE TASK (delegation only)
-        → test_33..34  ctl:tasks:new → the EXISTING /addtask entry →
-           admin_task_wizard; never a second creation path
+        → test_33..34  ctl:tasks:new → admin_task_wizard DIRECTLY
+           (never bot.add_task); never a second creation path
 
  H. SAFETY (20-22)
   20  → test_35   existing task lifecycle/reward semantics intact
@@ -61,7 +61,11 @@ Coverage required by MT-ADMIN-36 §TESTS (brief number → test name):
 
  I. REGRESSION (23-25)
   23  → test_37..39  no duplicate bot registration; the edit-text
-      catch-all attaches LAZILY and idempotently (bot.py untouched)
+      catch-all is STATICALLY registered in bot.py (group 3) and
+      opening ctl:tasks mutates NO handler registry — proven through
+      a REAL Application.process_update (regression guard: a lazy
+      add_handler during dispatch raised RuntimeError 'dictionary
+      changed size during iteration' and froze the update fetcher)
   24  → test_40..42  Control Center navigation remains intact
   25  → full suite (run separately; only the documented baseline
       failure test_task_lifecycle::TestStart::
@@ -82,7 +86,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from telegram import InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+)
 
 import admin_control
 import admin_task_wizard
@@ -138,7 +146,8 @@ _SQL_STATEMENT_RE = re.compile(
 
 class _FakeApplication:
     """Minimal Application stand-in: real dict bot_data + recorded
-    add_handler calls (proves the lazy attach contract)."""
+    add_handler calls. A non-empty ``added`` would prove a handler
+    was registered DURING callback processing — forbidden."""
 
     def __init__(self):
         self.bot_data: dict = {}
@@ -1047,14 +1056,17 @@ class TestTasksEditFlow(TasksTestBase):
 class TestTasksCreation(TasksTestBase):
 
     def test_33_new_delegates_to_existing_addtask_wizard(self) -> None:
-        """``ctl:tasks:new`` presents the /addtask command to the
-        EXISTING bot.add_task entry, which opens the canonical
-        admin_task_wizard — one creation path, never two."""
+        """``ctl:tasks:new`` opens the canonical admin_task_wizard
+        DIRECTLY with the /addtask shim — ``bot.add_task`` must never
+        be called — one creation path, never two."""
         with mock.patch.object(
             admin_task_wizard, "start_wizard", new=mock.AsyncMock()
-        ) as wizard:
+        ) as wizard, mock.patch(
+            "bot.add_task", new=mock.AsyncMock()
+        ) as add_task:
             update = self._press("ctl:tasks:new")
         wizard.assert_awaited_once()
+        add_task.assert_not_called()
         shim, _ctx = wizard.await_args.args
         self.assertEqual(shim.message.text, "/addtask")
         self.assertEqual(shim.effective_user.id, ADMIN_ID)
@@ -1218,14 +1230,16 @@ class TestTasksSafety(TasksTestBase):
 
 class TestTasksRegistration(unittest.TestCase):
 
-    """23. No duplicate bot registration; bot.py untouched."""
+    """23. No duplicate bot registration; the catch-alls are static
+    in bot.py, never attached from a callback."""
 
-    def test_37_no_static_registration_and_single_ctl_entry(
+    def test_37_static_registration_and_single_ctl_entry(
         self,
     ) -> None:
         """One ^ctl: CallbackQueryHandler (group 5), one /control
-        CommandHandler (group 0), and NO static registration of the
-        edit-text catch-all — it attaches lazily from admin_control."""
+        CommandHandler (group 0), and the edit-text catch-all IS
+        statically registered in bot.py (group 3) — never attached
+        lazily while the application is running."""
         captured, _bot_mod = _capture_handlers()
 
         ctl_handlers = [
@@ -1250,29 +1264,34 @@ class TestTasksRegistration(unittest.TestCase):
         self.assertEqual(len(control_handlers), 1)
         self.assertEqual(control_handlers[0][1], 0)
 
-        for registered, _group in captured:
-            self.assertIsNot(
-                getattr(registered, "callback", None),
-                admin_control.task_edit_text_input,
-                "the edit-text catch-all must attach lazily, not here",
-            )
+        task_text = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and getattr(h, "callback", None)
+            is admin_control.task_edit_text_input
+        ]
+        self.assertEqual(
+            len(task_text), 1,
+            "the edit-text catch-all must be registered in bot.py",
+        )
+        self.assertEqual(task_text[0][1], 3)
 
         import bot as bot_mod
 
         source = open(bot_mod.__file__, encoding="utf-8").read()
-        self.assertNotIn("task_edit_text_input", source)
+        self.assertIn("task_edit_text_input", source)
         self.assertEqual(source.count('pattern=r"^ctl:"'), 1)
 
 
-class TestTasksLazyRegistration(TasksTestBase):
+class TestTasksNoDynamicRegistration(TasksTestBase):
 
-    """23. The lazy, idempotent edit-text handler attach."""
+    """23. Opening ctl:tasks must NOT touch the handler registry."""
 
-    def test_38_text_handler_attached_once_on_first_press(
-        self,
-    ) -> None:
-        """The first ctl:tasks press attaches MessageHandler(group=3)
-        ONCE (bot_data marker); later presses never double-register."""
+    def test_38_no_handler_added_during_press(self) -> None:
+        """Pressing ctl:tasks twice adds ZERO handlers through
+        context.application — the catch-all is static in bot.py, so
+        Application.handlers can never change size mid-dispatch."""
         self._seed_task("مهمة")
         app = _FakeApplication()
         ctx = SimpleNamespace(application=app)
@@ -1280,11 +1299,100 @@ class TestTasksLazyRegistration(TasksTestBase):
             update = _callback(ADMIN_ID, "ctl:tasks")
             update.callback_query.message.reply_text = mock.AsyncMock()
             _run(admin_control.control_callback(update, ctx))
-        self.assertEqual(len(app.added), 1)
-        handler, group = app.added[0]
-        self.assertEqual(group, 3)
-        self.assertIs(handler.callback, admin_control.task_edit_text_input)
-        self.assertTrue(app.bot_data[admin_control._TEXT_HANDLER_MARK])
+            update.callback_query.edit_message_text.assert_awaited_once()
+        self.assertEqual(app.added, [])
+
+    def test_38b_real_process_update_never_mutates_registry(
+        self,
+    ) -> None:
+        """REGRESSION — real python-telegram-bot dispatch: pressing
+        ctl:tasks inside a REAL Application.process_update (with the
+        exact production registrations captured from bot.main())
+        must not add a handler or change application.handlers in any
+        way, and the NEXT update must still be processed.
+
+        The old lazy attach created a new group key while
+        process_update iterated ``self.handlers.values()`` →
+        RuntimeError: dictionary changed size during iteration →
+        the _update_fetcher task died silently (updates kept being
+        ACKed by getUpdates but were never processed until restart)."""
+        from datetime import datetime, timezone
+
+        from telegram import (
+            CallbackQuery,
+            Chat,
+            Message,
+            Update,
+            User,
+        )
+        from telegram.ext import Application
+
+        self._seed_task("مهمة")
+
+        # The EXACT production registrations from bot.main().
+        captured, _bot_mod = _capture_handlers()
+        app = Application.builder().token("123456:TESTTOKEN").build()
+        for handler, group in captured:
+            if group is not None:
+                app.add_handler(handler, group)
+        app._initialized = True  # skip initialize() (needs network)
+
+        def _cb_update(data: str, update_id: int) -> Update:
+            user = User(id=ADMIN_ID, first_name="Admin", is_bot=False)
+            chat = Chat(id=ADMIN_ID, type="private")
+            msg = Message(
+                message_id=update_id,
+                date=datetime.now(timezone.utc),
+                chat=chat,
+                from_user=user,
+            )
+            query = CallbackQuery(
+                id=str(update_id),
+                from_user=user,
+                chat_instance="ci",
+                data=data,
+                message=msg,
+            )
+            return Update(update_id=update_id, callback_query=query)
+
+        registry_ref = app.handlers
+        before = {g: list(hs) for g, hs in app.handlers.items()}
+        self.assertIn(3, before, "catch-all must be pre-registered")
+
+        edit_tasks = mock.AsyncMock()
+        edit_refresh = mock.AsyncMock()
+
+        async def _drive() -> None:
+            with mock.patch.object(
+                CallbackQuery, "answer", new=mock.AsyncMock()
+            ), mock.patch.object(
+                CallbackQuery, "edit_message_text", new=edit_tasks
+            ):
+                await app.process_update(_cb_update("ctl:tasks", 1))
+            # The second update must still be dispatched afterwards.
+            with mock.patch.object(
+                CallbackQuery, "answer", new=mock.AsyncMock()
+            ), mock.patch.object(
+                CallbackQuery, "edit_message_text", new=edit_refresh
+            ):
+                await app.process_update(_cb_update("ctl:refresh", 2))
+
+        _run(_drive())
+
+        # 1. The tasks view actually rendered (not silently dropped).
+        self.assertEqual(edit_tasks.await_count, 1)
+        self.assertIn(
+            TASKS_PANEL_HEADER, edit_tasks.await_args.args[0]
+        )
+        # 2. Dispatch continued — the follow-up update was processed.
+        self.assertEqual(edit_refresh.await_count, 1)
+        self.assertIn(HEADER, edit_refresh.await_args.args[0])
+        # 3. THE POINT: the registry is byte-for-byte untouched —
+        #    same dict object, same groups, same handler lists.
+        self.assertIs(app.handlers, registry_ref)
+        self.assertEqual(list(app.handlers), list(before))
+        after = {g: list(hs) for g, hs in app.handlers.items()}
+        self.assertEqual(before, after)
 
     def test_39_context_without_live_application_is_noop(self) -> None:
         """Unit-test shims (no Application / MagicMock bot_data)

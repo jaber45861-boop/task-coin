@@ -68,7 +68,7 @@ Coverage required by MT-ADMIN-38 §TESTS (brief number → test name):
    44  → test_44   admins module remains functional
    45  → test_45   foreign namespaces (wd/dp/pm/mr/atw/mproof/sup)
                    remain untouched, ``^ctl:`` still exactly once
- L. EXTRAS (46+)  lazy group-7 registration, unknown-population
+ L. EXTRAS (46+)  static group-7 registration, unknown-population
                    guard, admin/user-table isolation, structural
                    security guards, secrets in output/logs
 
@@ -87,7 +87,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+)
 
 import admin_control
 import config
@@ -355,7 +359,7 @@ class TestBroadcastRegistry(BroadcastTestBase):
 
     def test_07_ctl_registration_exactly_once(self) -> None:
         """7. Still exactly one ``^ctl:`` registration; the broadcast
-        text catch-all is NOT statically registered in bot.py."""
+        text catch-all IS statically registered in bot.py (group 7)."""
         captured, bot_mod = _capture_handlers()
         ctl = [
             (h, g)
@@ -368,13 +372,19 @@ class TestBroadcastRegistry(BroadcastTestBase):
         self.assertEqual(ctl[0][1], 5)
 
         source = open(bot_mod.__file__, encoding="utf-8").read()
-        self.assertNotIn("broadcast_text_input", source)
-        for registered, _group in captured:
-            self.assertIsNot(
-                getattr(registered, "callback", None),
-                admin_control.broadcast_text_input,
-                "the broadcast catch-all must attach lazily, not here",
-            )
+        self.assertIn("broadcast_text_input", source)
+        broadcast_text = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and getattr(h, "callback", None)
+            is admin_control.broadcast_text_input
+        ]
+        self.assertEqual(
+            len(broadcast_text), 1,
+            "the broadcast catch-all must be registered in bot.py",
+        )
+        self.assertEqual(broadcast_text[0][1], 7)
         # No second /control entry either.
         control_handlers = [
             (h, g)
@@ -1171,39 +1181,40 @@ class TestBroadcastRegression(BroadcastTestBase):
 
 
 # ════════════════════════════════════════════════════════════════
-# L. EXTRAS (46+): lazy registration, guards, isolation, secrets
+# L. EXTRAS (46+): static registration, guards, isolation, secrets
 # ════════════════════════════════════════════════════════════════
 
 
 class TestBroadcastRegistration(BroadcastTestBase):
 
-    def test_46_text_handler_attached_once_group_7(self) -> None:
-        """46. The first ctl:broadcast press attaches
-        MessageHandler(group=7) ONCE (bot_data marker); later presses
-        never double-register, and groups 3/6/7 coexist — one
-        catch-all per group, so no admin text input is starved."""
+    def test_46_no_handler_added_group_7_static(self) -> None:
+        """46. Pressing ctl:broadcast (twice) adds ZERO handlers
+        through context.application — the group-7 catch-all is
+        already static in bot.py, and groups 3/6/7 all coexist there
+        — one catch-all per group, so no admin text input is
+        starved."""
         app = _FakeApplication()
         ctx = SimpleNamespace(application=app)
         for _ in range(2):
             update = _callback(ADMIN_ID, "ctl:broadcast")
             update.callback_query.message.reply_text = mock.AsyncMock()
             _run(admin_control.control_callback(update, ctx))
-        self.assertEqual(len(app.added), 1)
-        handler, group = app.added[0]
-        self.assertEqual(group, 7)
-        self.assertIs(handler.callback, admin_control.broadcast_text_input)
-        self.assertTrue(
-            app.bot_data[admin_control._BROADCAST_TEXT_HANDLER_MARK]
-        )
+        self.assertEqual(app.added, [])
 
-        # All three catch-alls coexist — one per group.
-        app2 = _FakeApplication()
-        ctx2 = SimpleNamespace(application=app2)
-        for data in ("ctl:tasks", "ctl:admins", "ctl:broadcast"):
-            update = _callback(ADMIN_ID, data)
-            update.callback_query.message.reply_text = mock.AsyncMock()
-            _run(admin_control.control_callback(update, ctx2))
-        self.assertEqual([g for _h, g in app2.added], [3, 6, 7])
+        # All three catch-alls — statically, one per group.
+        captured, _bot = _capture_handlers()
+        for callback, expected_group in (
+            (admin_control.task_edit_text_input, 3),
+            (admin_control.admin_add_text_input, 6),
+            (admin_control.broadcast_text_input, 7),
+        ):
+            groups = [
+                g
+                for h, g in captured
+                if isinstance(h, MessageHandler)
+                and getattr(h, "callback", None) is callback
+            ]
+            self.assertEqual(groups, [expected_group])
 
     def test_47_context_without_live_application_is_noop(self) -> None:
         """47. Unit-test shims (no Application / MagicMock bot_data)

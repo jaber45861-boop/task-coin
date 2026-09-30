@@ -2056,6 +2056,36 @@ def main() -> None:
         support_service.support_text_input,
     ), group=2)
 
+    # MT-ADMIN-32/39: admin_control free-text catch-alls, registered
+    # STATICALLY here instead of lazily from inside control_callback.
+    # Adding a handler during Application.process_update() mutates
+    # application.handlers while the update fetcher is iterating it
+    # (RuntimeError: dictionary changed size during iteration), which
+    # silently kills the _update_fetcher task — updates keep being
+    # ACKed by getUpdates but are never processed until restart.
+    # Each handler is self-gated (silent unless the sender is an admin
+    # with matching state), so early groups are unaffected.
+    #   group 3 — task-edit free text (title/target/instructions/...)
+    #   group 6 — /addtask admin text input
+    #   group 7 — broadcast text input
+    #   group 8 — settings text input
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.task_edit_text_input,
+    ), group=3)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.admin_add_text_input,
+    ), group=6)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.broadcast_text_input,
+    ), group=7)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.settings_text_input,
+    ), group=8)
+
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
         verify_subscription, pattern="^verify_subscription$",

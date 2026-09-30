@@ -138,6 +138,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import MessageHandler, filters
 
 import admin_review_queue
+import admin_task_wizard
 import db
 import deposit_proof_admin
 import deposit_proof_store
@@ -824,8 +825,8 @@ async def _open_support(shim, context) -> None:
 
 
 async def _open_channels(shim, context) -> None:
-    # Local import: bot.py imports this module (cycle), same pattern
-    # the tasks-new delegation uses.  Delegation ONLY — the existing
+    # Local import: bot.py imports this module (cycle).  Delegation
+    # ONLY — the existing
     # /listchannels handler keeps its own auth + private-chat guard
     # and renders its own list; nothing channel-related is
     # re-implemented or written here.
@@ -1155,10 +1156,10 @@ async def control_callback(update, context) -> None:
     if op == OP_TASKS or op.startswith(f"{OP_TASKS}:"):
         # MT-ADMIN-36: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
-        # task data was read or any mutation was confirmed.  First
-        # tasks press also attaches the edit-text catch-all ONCE
-        # (lazy, idempotent — no extra bot.py registration).
-        _ensure_text_input_handler(context)
+        # task data was read or any mutation was confirmed.  The
+        # edit-text catch-all is registered STATICALLY in bot.py —
+        # nothing is added here, so Application.handlers is never
+        # mutated while process_update iterates it.
         await _handle_tasks_op(update, context, query, op, actor)
         return
 
@@ -1166,24 +1167,18 @@ async def control_callback(update, context) -> None:
         # MT-ADMIN-37: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
         # administrator record was read or any role mutation was
-        # confirmed.  The first admins press also attaches the
-        # add-input catch-all ONCE (lazy, idempotent — no bot.py
-        # registration; its own group, so PTB's one-handler-per-group
-        # rule can never starve the MT-ADMIN-36 task catch-all).
-        _ensure_admins_text_input_handler(context)
+        # confirmed.  The add-input catch-all is registered
+        # STATICALLY in bot.py (own group 6) — no registry mutation
+        # during update processing.
         await _handle_admins_op(update, context, query, op, actor)
         return
 
     if op == OP_BROADCAST or op.startswith(f"{OP_BROADCAST}:"):
         # MT-ADMIN-38: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
-        # broadcast state or user count was read.  The first
-        # broadcast press also attaches the compose-text catch-all
-        # ONCE (lazy, idempotent; its own group 7, so PTB's
-        # one-handler-per-group rule can never starve the
-        # MT-ADMIN-36 (group 3) or MT-ADMIN-37 (group 6)
-        # catch-alls).
-        _ensure_broadcast_text_input_handler(context)
+        # broadcast state or user count was read.  The compose-text
+        # catch-all is registered STATICALLY in bot.py (own group 7)
+        # — no registry mutation during update processing.
         await _handle_broadcast_op(update, context, query, op, actor)
         return
 
@@ -1191,11 +1186,9 @@ async def control_callback(update, context) -> None:
         # MT-ADMIN-39: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
         # platform setting was read or any staged value confirmed.
-        # The first settings press also attaches the value-text
-        # catch-all ONCE (lazy, idempotent; its own group 8, so
-        # PTB's one-handler-per-group rule can never starve the
-        # groups 3/6/7 catch-alls).
-        _ensure_settings_text_input_handler(context)
+        # The value-text catch-all is registered STATICALLY in
+        # bot.py (own group 8) — no registry mutation during update
+        # processing.
         await _handle_settings_op(update, context, query, op, actor)
         return
 
@@ -1611,38 +1604,6 @@ def build_admin_confirm_add_keyboard(user_id: int):
 
 # Marker on Application.bot_data: the add-admin text catch-all has
 # been attached to the LIVE application (single-shot, idempotent).
-_ADMINS_TEXT_HANDLER_MARK = "admin_admins_add_text_handler"
-
-
-def _ensure_admins_text_input_handler(context) -> None:
-    """Attach ``admin_add_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern the MT-ADMIN-36 task catch-all
-    established (python-telegram-bot documents ``add_handler`` as
-    safe at any time) — no static registration in bot.py is needed
-    and ``^ctl:`` stays the single callback entry.  Group 6 is used
-    because groups 0-5 are occupied and PTB runs at most ONE handler
-    per group: the task catch-all owns group 3, so a separate group
-    guarantees both self-gated catch-alls always get their chance.
-    A context without a live Application (unit-test shims) degrades
-    to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_ADMINS_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_ADMINS_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            admin_add_text_input,
-        ),
-        group=6,
-    )
-
-
 def _apply_admin_confirm(user_id: int, kind: str, chat_id, actor: int):
     """Confirmation step → the EXISTING store operations.
 
@@ -2220,37 +2181,6 @@ def build_task_confirm_keyboard(op_kind: str, task_id: int):
 
 # Marker on Application.bot_data: the edit-text catch-all has been
 # attached to the LIVE application (single-shot, idempotent).
-_TEXT_HANDLER_MARK = "admin_tasks_edit_text_handler"
-
-
-def _ensure_text_input_handler(context) -> None:
-    """Attach ``task_edit_text_input`` to the live Application ONCE.
-
-    python-telegram-bot documents ``Application.add_handler`` as
-    safe to call at any time, so the text catch-all is registered
-    LAZY and idempotent (bot_data marker) from the first Control
-    Center tasks press — no second static registration in bot.py is
-    needed, and ``^ctl:`` stays the single callback entry.  A
-    context without a live Application (unit-test shims) degrades to
-    a no-op.  Group 3 mirrors the wizard (0) / support (2)
-    catch-all pattern; the body stays silent without pending state.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            task_edit_text_input,
-        ),
-        group=3,
-    )
-
-
 def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
     """Confirmation step → the EXISTING ``db.update_task`` contract.
 
@@ -2335,17 +2265,17 @@ async def _handle_tasks_op(update, context, query, op: str,
     toast: str | None = None
     try:
         if op == TASKS_NEW_OP:
-            # Creation delegates to the EXISTING /addtask entry →
-            # admin_task_wizard → task_creation service.  The target
-            # re-checks admin + private chat itself.
+            # Creation opens the canonical admin_task_wizard DIRECTLY
+            # (no bot.add_task intermediary) with the /addtask shim.
+            # The wizard re-checks admin + private chat itself and
+            # owns the flow through publish_draft →
+            # create_task_from_spec.
             view = "tasks:new"
             shim = _nav_update(update, "/addtask")
             if shim is None:
                 await _safe_answer(query, MSG_INVALID)
                 return
-            import bot  # local: bot.py imports this module (cycle)
-
-            await bot.add_task(shim, context)
+            await admin_task_wizard.start_wizard(shim, context)
             await _safe_answer(query, BACK_HINT)
             logger.info("Task creation opened: admin=%d", actor)
             return
@@ -2912,37 +2842,6 @@ async def broadcast_text_input(update, context) -> None:
 # Marker on Application.bot_data: the broadcast compose-text
 # catch-all has been attached to the LIVE application (single-shot,
 # idempotent).
-_BROADCAST_TEXT_HANDLER_MARK = "admin_broadcast_text_input_handler"
-
-
-def _ensure_broadcast_text_input_handler(context) -> None:
-    """Attach ``broadcast_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern the MT-ADMIN-36 (group 3) and
-    MT-ADMIN-37 (group 6) catch-alls established — no static
-    registration in bot.py is needed and ``^ctl:`` stays the single
-    callback entry.  Group 7 is used because groups 0-6 are occupied
-    and PTB runs at most ONE handler per group: a separate group
-    guarantees all three self-gated catch-alls always get their
-    chance.  A context without a live Application (unit-test shims)
-    degrades to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_BROADCAST_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_BROADCAST_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            broadcast_text_input,
-        ),
-        group=7,
-    )
-
-
 # ── Settings module (MT-ADMIN-39): platform configuration, in place ───
 # Authorization is re-checked by the caller BEFORE any read here.
 # The authoritative source for EVERY displayed or written value is
@@ -3404,31 +3303,4 @@ async def settings_text_input(update, context) -> None:
 
 # Marker on Application.bot_data: the settings-value catch-all has
 # been attached to the LIVE application (single-shot, idempotent).
-_SETTINGS_TEXT_HANDLER_MARK = "admin_settings_value_text_handler"
 
-
-def _ensure_settings_text_input_handler(context) -> None:
-    """Attach ``settings_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern as MT-ADMIN-36/37/38 — no static
-    registration in bot.py is needed and ``^ctl:`` stays the single
-    callback entry.  Group 8 is used because groups 0-7 are occupied
-    and PTB runs at most ONE handler per group: the task (3), admin
-    (6) and broadcast (7) catch-alls keep theirs, and this one can
-    never starve them.  A context without a live Application
-    (unit-test shims) degrades to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_SETTINGS_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_SETTINGS_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            settings_text_input,
-        ),
-        group=8,
-    )

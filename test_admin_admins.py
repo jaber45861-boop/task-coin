@@ -70,7 +70,7 @@ Coverage required by MT-ADMIN-37 §TESTS (brief number → test name):
   40  → test_40   no secrets in rendered output or logs
 
  H. TEXT INPUT SECURITY (extra) → test_41..45
- I. REGISTRATION (extra)       → test_46..48  (bot.py untouched)
+ I. REGISTRATION (extra)       → test_46..48  (static groups in bot.py)
  J. NAVIGATION (extra)         → test_49..52
  K. GRAMMAR (extra)            → parser-level class
 
@@ -91,7 +91,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from telegram import InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+)
 
 import admin_control
 import config
@@ -155,7 +159,8 @@ _FORBIDDEN_OUTPUT = (
 
 class _FakeApplication:
     """Minimal Application stand-in: real dict bot_data + recorded
-    add_handler calls (proves the lazy attach contract)."""
+    add_handler calls. A non-empty ``added`` would prove a handler
+    was registered DURING callback processing — forbidden."""
 
     def __init__(self):
         self.bot_data: dict = {}
@@ -1275,18 +1280,19 @@ class TestAdminsTextInput(AdminsTestBase):
 
 
 # ══════════════════════════════════════════════════════════════════
-# I. REGISTRATION (extra) — bot.py untouched
+# I. REGISTRATION (extra) — static groups in bot.py
 # ══════════════════════════════════════════════════════════════════
 
 
 class TestAdminsRegistration(unittest.TestCase):
 
-    def test_46_no_static_registration_and_single_ctl_entry(
+    def test_46_static_registration_and_single_ctl_entry(
         self,
     ) -> None:
         """46. One ^ctl: CallbackQueryHandler (group 5), one /control
-        CommandHandler (group 0), and NO static registration of the
-        add-admin catch-all — it attaches lazily from admin_control."""
+        CommandHandler (group 0), and the add-admin catch-all IS
+        statically registered in bot.py (group 6) — never attached
+        lazily while the application is running."""
         captured, _bot_mod = _capture_handlers()
 
         ctl_handlers = [
@@ -1311,54 +1317,53 @@ class TestAdminsRegistration(unittest.TestCase):
         self.assertEqual(len(control_handlers), 1)
         self.assertEqual(control_handlers[0][1], 0)
 
-        for registered, _group in captured:
-            self.assertIsNot(
-                getattr(registered, "callback", None),
-                admin_control.admin_add_text_input,
-                "the add-admin catch-all must attach lazily, not here",
-            )
+        admins_text = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and getattr(h, "callback", None)
+            is admin_control.admin_add_text_input
+        ]
+        self.assertEqual(
+            len(admins_text), 1,
+            "the add-admin catch-all must be registered in bot.py",
+        )
+        self.assertEqual(admins_text[0][1], 6)
 
         import bot as bot_mod
 
         source = open(bot_mod.__file__, encoding="utf-8").read()
-        self.assertNotIn("admin_add_text_input", source)
+        self.assertIn("admin_add_text_input", source)
         self.assertEqual(source.count('pattern=r"^ctl:"'), 1)
 
 
-class TestAdminsLazyRegistration(AdminsTestBase):
+class TestAdminsNoDynamicRegistration(AdminsTestBase):
 
-    def test_47_text_handler_attached_once_on_first_press(
-        self,
-    ) -> None:
-        """The first ctl:admins press attaches MessageHandler(group=6)
-        ONCE (bot_data marker); later presses never double-register,
-        and the MT-ADMIN-36 task catch-all keeps its own group."""
+    def test_47_no_handler_added_during_press(self) -> None:
+        """The ctl:admins press (twice) adds ZERO handlers through
+        context.application; both catch-alls are pre-registered
+        statically in bot.py — groups 3 (tasks) and 6 (admins)."""
         app = _FakeApplication()
         ctx = SimpleNamespace(application=app)
         for _ in range(2):
             update = _callback(ADMIN_ID, "ctl:admins")
             update.callback_query.message.reply_text = mock.AsyncMock()
             _run(admin_control.control_callback(update, ctx))
-        self.assertEqual(len(app.added), 1)
-        handler, group = app.added[0]
-        self.assertEqual(group, 6)
-        self.assertIs(
-            handler.callback, admin_control.admin_add_text_input
-        )
-        self.assertTrue(
-            app.bot_data[admin_control._ADMINS_TEXT_HANDLER_MARK]
-        )
+        self.assertEqual(app.added, [])
 
-        # Both catch-alls coexist — one per group.
-        app2 = _FakeApplication()
-        ctx2 = SimpleNamespace(application=app2)
-        for data in ("ctl:tasks", "ctl:admins"):
-            update = _callback(ADMIN_ID, data)
-            update.callback_query.message.reply_text = mock.AsyncMock()
-            _run(admin_control.control_callback(update, ctx2))
-        self.assertEqual(
-            [group for _h, group in app2.added], [3, 6]
-        )
+        # Both catch-alls coexist — one per STATIC group.
+        captured, _bot = _capture_handlers()
+        for callback, expected_group in (
+            (admin_control.task_edit_text_input, 3),
+            (admin_control.admin_add_text_input, 6),
+        ):
+            groups = [
+                g
+                for h, g in captured
+                if isinstance(h, MessageHandler)
+                and getattr(h, "callback", None) is callback
+            ]
+            self.assertEqual(groups, [expected_group])
 
     def test_48_context_without_live_application_is_noop(self) -> None:
         """Unit-test shims (no Application / MagicMock bot_data)
