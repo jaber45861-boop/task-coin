@@ -975,6 +975,11 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # creation path, never two.  The service builds the exact
     # MT-TASK-05 contract and proves it with the verifier's own
     # validator before anything is persisted.
+    #
+    # Roadmap 4: the sending admin is the authenticated advertiser —
+    # the service funds the task (reward + commission snapshot) from
+    # that account atomically with the INSERT, never from payload
+    # data.
     spec = task_creation.TaskSpec(
         title=title,
         description=description,
@@ -986,7 +991,9 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reward_units=reward_units,
     )
     try:
-        task_id = task_creation.create_task_from_spec(spec)
+        task_id = task_creation.create_task_from_spec(
+            spec, funding_advertiser_id=user_id
+        )
     except TelegramChannelTaskDataError as exc:
         await update.message.reply_text(
             f"❌ بيانات المهمة غير صالحة: {exc}"
