@@ -135,7 +135,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import MessageHandler, filters
+from telegram.ext import Application, MessageHandler, filters
 
 import admin_review_queue
 import admin_task_wizard
@@ -2442,7 +2442,11 @@ async def task_edit_text_input(update, context) -> None:
 # persistent ``broadcasts`` store — there is NO process-global
 # broadcast dict anywhere in this module.  Delivery is individual
 # ``context.bot.send_message`` calls issued by the EXISTING bot
-# instance through the handler's own context (never a Telegram
+# instance through the handler's own context — in production the
+# pass runs as a background worker scheduled with the REAL
+# ``Application.create_task`` AFTER the atomic claim, so the
+# callback answers and returns immediately while delivery
+# continues (never a Telegram
 # group/chat broadcast, never a second Bot object): one failed
 # recipient (blocked bot, invalid/unavailable chat, network error,
 # anything unexpected) is COUNTED and the pass continues, the
@@ -2598,21 +2602,92 @@ def build_broadcast_result_text(
     )
 
 
+async def _broadcast_delivery_worker(
+    context, query, actor: int, broadcast_id: int, message: str,
+    recipients: list[int],
+):
+    """Background delivery pass: individual sends → ONE finalize →
+    final aggregate card edit.
+
+    This is the ONLY site that calls ``db.finalize_broadcast`` on
+    the delivery path — a failed final-card edit is logged and
+    NEVER triggers another finalize.  Each recipient send is
+    isolated (one exception counts that recipient and the loop
+    CONTINUES), and logs carry admin id + broadcast id + aggregate
+    counts only — never the message body, never a recipient id.  In
+    production this coroutine runs as an
+    ``Application.create_task`` task scheduled by
+    ``_deliver_broadcast`` (the callback never awaits it); legacy
+    contexts without a real Application await it inline so
+    synchronous test doubles keep their established contract.
+    """
+    success = 0
+    failure = 0
+    for recipient in recipients:
+        try:
+            await context.bot.send_message(chat_id=recipient, text=message)
+            success += 1
+        except Exception:
+            # Blocked bot / invalid chat / network / unexpected: the
+            # recipient counts as failed and the pass CONTINUES.
+            # Only safe operational ids are logged — never the body.
+            failure += 1
+            logger.warning(
+                "Broadcast delivery failure: broadcast=%d failure_count=%d",
+                broadcast_id, failure,
+            )
+    try:
+        db.finalize_broadcast(broadcast_id, success, failure)
+    except Exception:
+        # The pass already ran; the row honestly stays 'sending'
+        # (never claimed complete) and the result below still reports
+        # the REAL counts.
+        logger.exception(
+            "Broadcast finalize failed: broadcast=%d", broadcast_id
+        )
+    logger.info(
+        "Broadcast completed: admin=%d broadcast=%d recipients=%d "
+        "success=%d failure=%d",
+        actor, broadcast_id, len(recipients), success, failure,
+    )
+    # The final result card is edited HERE — by the worker, AFTER
+    # delivery, never by the callback handler.  An edit failure
+    # degrades to a safe log and never re-finalizes.
+    try:
+        await query.edit_message_text(
+            build_broadcast_result_text(len(recipients), success, failure),
+            reply_markup=build_broadcast_panel_keyboard(),
+        )
+    except Exception:
+        logger.info(
+            "Broadcast result edit skipped: admin=%d broadcast=%d",
+            actor, broadcast_id,
+        )
+    return success, failure
+
+
 async def _deliver_broadcast(context, query, actor: int):
-    """Confirm → atomic claim → individual sends → aggregate result.
+    """Confirm → atomic claim → SENDING → answer → schedule worker.
 
     Order matters.  The draft and the recipient population are read
     FIRST — a failed read degrades to a NON-sendable card (no claim,
     no send, retryable), so an unknown population can never
     broadcast.  The atomic ``draft → sending`` claim comes next and
     is the SOLE duplicate-send authority: only the single rowcount-1
-    winner may begin Telegram sends; every loser answers the
-    deterministic already-processed notice with ZERO sends.  Each
-    recipient failure (blocked bot, invalid/unavailable chat,
-    network or unexpected error) is counted and the pass CONTINUES —
-    one failure never aborts the rest, no retry loop is invented and
-    no traceback reaches the administrator.  Returns
-    ``(text, markup, toast)`` for the caller to render.
+    winner may schedule Telegram sends; every loser answers the
+    deterministic already-processed notice with ZERO sends.  The
+    winner then edits the card to SENDING, answers the callback and
+    hands the pass to ``_broadcast_delivery_worker`` — scheduled on
+    the REAL ``Application.create_task`` in production (the callback
+    returns while delivery continues; NEVER ``asyncio.create_task``),
+    or awaited inline ONLY for legacy/mock contexts without a real
+    Application.
+
+    Returns ``(text, markup, toast)`` for the caller to render on
+    NON-delivery outcomes (error / already-processed / no-pending),
+    or None when a pass was started — the worker then owns the card:
+    SENDING is already shown and the worker edits the final
+    aggregate result itself.
     """
     panel = build_broadcast_panel_keyboard()
     try:
@@ -2673,41 +2748,35 @@ async def _deliver_broadcast(context, query, actor: int):
         "Broadcast started: admin=%d broadcast=%d recipients=%d",
         actor, draft["id"], len(recipients),
     )
-    message = draft["message"]
-    success = 0
-    failure = 0
-    for recipient in recipients:
+    worker = _broadcast_delivery_worker(
+        context, query, actor, draft["id"], draft["message"], recipients,
+    )
+    application = getattr(context, "application", None)
+    if isinstance(application, Application):
+        # Production path: schedule on the REAL Application so this
+        # callback returns immediately — /control and every other
+        # callback stay responsive while delivery runs in the
+        # background.  Application.create_task (never
+        # asyncio.create_task) ties the worker to the application's
+        # lifecycle and error handling, and the atomic claim above
+        # guarantees only ONE worker can ever exist for this
+        # broadcast.
         try:
-            await context.bot.send_message(chat_id=recipient, text=message)
-            success += 1
+            application.create_task(worker)
         except Exception:
-            # Blocked bot / invalid chat / network / unexpected: the
-            # recipient counts as failed and the pass CONTINUES.
-            # Only safe operational ids are logged — never the body.
-            failure += 1
-            logger.warning(
-                "Broadcast delivery failure: broadcast=%d failure_count=%d",
-                draft["id"], failure,
+            # Scheduling failed AFTER the claim: never lose the
+            # pass — run the same worker inline instead.
+            logger.exception(
+                "Broadcast task scheduling failed: admin=%d broadcast=%d",
+                actor, draft["id"],
             )
-    try:
-        db.finalize_broadcast(draft["id"], success, failure)
-    except Exception:
-        # The pass already ran; the row honestly stays 'sending'
-        # (never claimed complete) and the result below still reports
-        # the REAL counts.
-        logger.exception(
-            "Broadcast finalize failed: broadcast=%d", draft["id"]
-        )
-    logger.info(
-        "Broadcast completed: admin=%d broadcast=%d recipients=%d "
-        "success=%d failure=%d",
-        actor, draft["id"], len(recipients), success, failure,
-    )
-    return (
-        build_broadcast_result_text(len(recipients), success, failure),
-        panel,
-        None,
-    )
+            await worker
+        return None  # the worker owns the final result card
+    # Legacy/test contexts (MagicMock shims — no real Application):
+    # run the SAME worker inline so synchronous test doubles keep
+    # their established contract.  Production never takes this path.
+    await worker
+    return None
 
 
 async def _handle_broadcast_op(update, context, query, op: str,
@@ -2719,7 +2788,8 @@ async def _handle_broadcast_op(update, context, query, op: str,
     authoritative ``db.count_users`` / store operations; ALL state
     lives in the persistent ``broadcasts`` store; the only side
     effect beyond it is the individual delivery pass of the EXISTING
-    bot instance (no financial, task or admin-role mutation exists
+    bot instance, scheduled as an ``Application.create_task``
+    background worker in production (no financial, task or admin-role mutation exists
     on this path).  Failures degrade to a safe error answer.  Logs
     carry admin id + broadcast id + action + counts only — never the
     message body, recipient identities or tracebacks shown to the
@@ -2745,9 +2815,18 @@ async def _handle_broadcast_op(update, context, query, op: str,
             )
         elif op == BROADCAST_CONFIRM_OP:
             view = "broadcast:result"
-            text, markup, toast = await _deliver_broadcast(
-                context, query, actor
-            )
+            outcome = await _deliver_broadcast(context, query, actor)
+            if outcome is None:
+                # A delivery pass was started (or already ran): the
+                # SENDING card and its final aggregate edit belong
+                # to the delivery worker — NEVER overwrite them
+                # here with an older view.
+                logger.info(
+                    "Control broadcast view: admin=%d view=%s",
+                    actor, view,
+                )
+                return
+            text, markup, toast = outcome
         elif op == BROADCAST_CANCEL_OP:
             # Clear the pending draft: NO send, NO user mutation.
             view = "broadcast:cancel"
