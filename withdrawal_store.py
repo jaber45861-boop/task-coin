@@ -620,6 +620,29 @@ class SqliteWithdrawalRepository:
                 ).fetchone()
         return None if row is None else self._from_row(row)
 
+    def list_for_user(
+        self,
+        user_id: int,
+        *,
+        limit: int = 20,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[WithdrawalRequest]:
+        """One user's OWN requests, newest first, bounded.
+
+        Read-only (no business decision, no mutation) — the Mini App
+        status/list endpoint uses this to show the authenticated
+        user's withdrawal history.  ``limit`` is a positive int; the
+        transport validates the client-supplied value before calling.
+        """
+        with self._connection(connection) as conn:
+            with translated_errors():
+                rows = conn.execute(
+                    f"SELECT * FROM {TABLE} WHERE user_id = ? "
+                    "ORDER BY created_at DESC, request_id LIMIT ?",
+                    (user_id, limit),
+                ).fetchall()
+            return [self._from_row(row) for row in rows]
+
 
 def _rate_captured_text(request: WithdrawalRequest) -> str:
     """Exact stored text for rate_captured_at; missing -> domain error

@@ -12,6 +12,9 @@ Endpoints (all under ``/api/withdrawal``):
 - ``GET  /api/withdrawal/methods``   active payout methods (safe
                                      user-facing metadata only)
 - ``POST /api/withdrawal``           create a PENDING withdrawal
+- ``GET  /api/withdrawal/requests``  the authenticated user's own
+                                     withdrawal status/list (safe
+                                     user-facing facts only)
 
 Authoritative creation flow::
 
@@ -61,8 +64,10 @@ import payment_method_store
 import platform_settings
 import rate_quote
 import rate_store
+import withdrawal_notifications
 import withdrawal_rules
 import withdrawal_service
+import withdrawal_store
 from withdrawal_rules import (
     METHOD_USDT_BEP20,
     METHOD_VODAFONE_CASH,
@@ -221,10 +226,12 @@ def _request_payload(request_row) -> dict:
 # ── Payment-method → withdrawal-method mapping (transport level) ─────
 
 
-def _withdrawal_method_for(pm: payment_method_store.PaymentMethod) -> str | None:
+def withdrawal_method_for(pm: payment_method_store.PaymentMethod) -> str | None:
     """Map an ACTIVE method row to the closed withdrawal-method set.
 
-    Category/asset decide the payout rail — a user can never submit a
+    The ONE payout-rail routing decision, shared by BOTH transports
+    (this Mini App route and the Telegram ``/withdraw`` command):
+    category/asset decide the rail — a user can never submit a
     ``method`` value of their own; the server derives it from the
     trusted stored row.  ``None`` = this method cannot back a
     withdrawal today.
@@ -369,7 +376,7 @@ def create_withdrawal():
         logger.exception("Payment method lookup failed")
         return _server_error()
 
-    method = _withdrawal_method_for(pm)
+    method = withdrawal_method_for(pm)
     if method is None:
         return _error("unsupported_method", _MSG_UNSUPPORTED_METHOD, 400)
 
@@ -397,14 +404,54 @@ def create_withdrawal():
             return api_error
         logger.exception(
             "Withdrawal failed unexpectedly: user=%s method=%s",
-            user_id, method,
+            user_id,
+            method,
         )
         return _server_error()
+
+    # Post-commit side effect: best-effort admin notice for the new
+    # pending request.  Never raises — a notification failure must not
+    # affect the already-committed financial transaction.
+    withdrawal_notifications.notify_submission(created)
 
     return jsonify(
         {
             "ok": True,
             "message": _MSG_CREATED,
             "request": _request_payload(created),
+        }
+    ), 200
+
+
+@withdrawal_bp.get("/api/withdrawal/requests")
+def list_withdrawal_requests():
+    """The AUTHENTICATED user's own withdrawal status/list.
+
+    Transport only: initData identity (a client-supplied ``user_id``
+    query parameter is ignored) → bounded read through the repository
+    → the same safe ``_request_payload`` facts used by create.  Opens
+    no transaction and mutates nothing.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    # Optional bound: transport validation only.
+    limit_raw = request.args.get("limit", "10")
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+    if isinstance(limit, bool) or not (1 <= limit <= 20):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+
+    rows = withdrawal_store.SqliteWithdrawalRepository().list_for_user(
+        user_id, limit=limit
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "requests": [_request_payload(row) for row in rows],
         }
     ), 200

@@ -51,6 +51,8 @@ import support_service
 import task_creation
 import task_taxonomy
 import withdrawal_admin
+import withdrawal_notifications
+import withdrawal_user
 from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
@@ -1700,6 +1702,10 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         _schedule_notification,
     )
     support_service.bind(_admin_notifier)
+    # Withdrawal submission notices share the SAME AdminNotifier and
+    # loop scheduler (ADMINS private chats only) — bound only while
+    # this bot loop runs.
+    withdrawal_notifications.bind(_admin_notifier, _schedule_notification)
 
     def _error_callback(exc: TelegramError) -> None:
         application.create_task(application.process_error(error=exc, update=None))
@@ -1736,6 +1742,7 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         # never notifies.
         support_service.unbind()
         manual_proof_inbox.unbind()
+        withdrawal_notifications.unbind()
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
@@ -1981,6 +1988,13 @@ def main() -> None:
     #    invocations are silent (isolation enforced inside).
     app.add_handler(CommandHandler(
         "support", support_service.support_command,
+    ), group=0)
+    # User withdrawal flow — private chat ONLY (group/channel
+    #    invocations silent).  Identity comes from effective_user and
+    #    every mutation delegates to WithdrawalService (one atomic
+    #    transaction); no client-supplied user id is ever accepted.
+    app.add_handler(CommandHandler(
+        "withdraw", withdrawal_user.withdraw_command,
     ), group=0)
     # MT-ADMIN-08: payment-method management — private admin chat ONLY.
     #    /paymethods panel; /addpm + /editpm use the stateless
