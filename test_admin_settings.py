@@ -1215,6 +1215,7 @@ class TestSettingsRegression(SettingsTestBase):
                 "ctl:paymethods",
                 "ctl:rate",
                 "ctl:refresh",
+                "ctl:requests",
                 "ctl:reviews",
                 "ctl:rewards",
                 "ctl:settings",

@@ -147,6 +147,7 @@ import payment_method_store
 import rate_admin
 import rate_store
 import support_service
+import task_request_admin
 import task_taxonomy
 import withdrawal_admin
 import withdrawal_store
@@ -290,6 +291,9 @@ MODULES: tuple[AdminModule, ...] = (
     ),
     AdminModule(
         "channels", "📡 القنوات", "إدارة القنوات المطلوبة", "/listchannels"
+    ),
+    AdminModule(
+        "requests", "📝 طلبات المهام", "مراجعة طلبات المستخدمين", "/taskrequests"
     ),
     AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة"),
     AdminModule(
@@ -671,6 +675,7 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
         [_btn("broadcast")],
         [_btn("support")],
         [_btn("channels")],
+        [_btn("requests")],
         [_btn("settings"), _btn("admins")],
         [_btn("logs"), _btn("health")],
         [
@@ -835,6 +840,13 @@ async def _open_channels(shim, context) -> None:
     await bot.list_channels(shim, context)
 
 
+async def _open_requests(shim, context) -> None:
+    # Delegation ONLY — /taskrequests keeps its own admin gate +
+    # private-chat isolation and renders its own queue; no request
+    # data is read or written here.
+    await task_request_admin.taskrequests_command(shim, context)
+
+
 _NAVIGATORS = {
     "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
@@ -843,6 +855,7 @@ _NAVIGATORS = {
     "rate": _open_rate,
     "support": _open_support,
     "channels": _open_channels,
+    "requests": _open_requests,
 }
 
 

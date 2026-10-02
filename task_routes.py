@@ -102,6 +102,7 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
+import task_request_store
 from task_catalog import TaskCatalog
 from task_lifecycle import TaskLifecycle
 from task_start import StartGateError
@@ -166,6 +167,13 @@ _MSG_INVALID_PROOF = "الإثبات غير صالح، أرسل رابطاً أ�
 
 _MSG_STARTED_OK = "تم بدء المهمة"
 _MSG_COMPLETED_OK = "تم إنجاز المهمة بنجاح"
+
+# User task requests (Mini App «إضافة مهمة») — proposed tasks that
+# enter admin review BEFORE ever becoming catalog tasks.
+_MSG_TRQ_SUBMITTED = "تم إرسال المهمة للمراجعة من الإدارة."
+_MSG_TRQ_INVALID = "بيانات طلب المهمة غير صالحة"
+_MSG_TRQ_NOT_FOUND = "الطلب غير موجود"
+_MSG_TRQ_INVALID_STATUS = "لا يمكن تعديل هذا الطلب في وضعه الحالي"
 
 
 # ── Authentication (existing miniapp_auth initData validation) ────────
@@ -856,5 +864,181 @@ def decide_claim(task_id: int, submission_id: int):
                 if outcome.state == "approved"
                 else _MSG_REJECTED_OK
             ),
+        }
+    ), 200
+
+
+# ════════════════════════════════════════════════════════════════════
+# User task requests (Mini App «إضافة مهمة ➕»)
+# ════════════════════════════════════════════════════════════════════
+#
+# A user proposes a task; it lands in the ``user_task_requests``
+# table as ``pending`` and NEVER becomes a catalog task until an
+# admin approves it from Telegram (``task_request_admin`` — this
+# HTTP surface carries no approve/reject/return capability of any
+# kind):
+#
+# - ``POST /api/task-requests``               create a pending request
+# - ``GET  /api/task-requests``               the caller's own requests
+# - ``GET  /api/task-requests/<request_id>``  one OWN request (404 else)
+# - ``PATCH /api/task-requests/<request_id>`` edit + resubmit
+#                                             (only when the admin
+#                                             returned it for changes)
+#
+# Security rules (same as every route above):
+# - identity comes ONLY from verified initData (``_authenticate``);
+#   a body/query/header ``user_id`` is never trusted, and every
+#   read/write is filtered by the verified owner column
+# - every field is validated server-side with the SAME validators
+#   the creation path uses (``task_request_store.validate_payload``);
+#   client validation is cosmetic only
+# - the response exposes safe presentation fields only: no history,
+#   no admin identity (``decided_by``), no internals
+
+
+def _trq_safe(req) -> dict:
+    """Safe presentation fields for one user task request."""
+    return {
+        "request_id": req.request_id,
+        "status": req.status,
+        "title": req.payload.get("title"),
+        "description": req.payload.get("description"),
+        "provider": req.payload.get("provider"),
+        "action": req.payload.get("action"),
+        "target_ref": req.payload.get("target_ref"),
+        "reward": req.reward,
+        "reward_units": req.reward_units,
+        "reason": req.decision_reason,
+        "task_id": req.published_task_id,
+        "created_at": req.created_at,
+        "updated_at": req.updated_at,
+    }
+
+
+@tasks_bp.post("/api/task-requests")
+def create_task_request():
+    """Create a pending task request for the verified caller.
+
+    The proposal is validated server-side and stored as ``pending``;
+    it does NOT appear in the public catalog until an admin approves
+    it (the catalog reads ``tasks`` exclusively).
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+
+    try:
+        created = task_request_store.create_request(user_id, body)
+    except task_request_store.TaskRequestError as exc:
+        return _error("invalid_payload", str(exc), 400)
+    except Exception:
+        logger.exception(
+            "Task request creation failed: user=%s", user_id
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "request": _trq_safe(created),
+            "message": _MSG_TRQ_SUBMITTED,
+        }
+    ), 200
+
+
+@tasks_bp.get("/api/task-requests")
+def list_task_requests():
+    """The verified caller's own requests (newest first)."""
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        requests = task_request_store.list_for_user(user_id)
+    except Exception:
+        logger.exception(
+            "Task request list failed: user=%s", user_id
+        )
+        return _server_error()
+    return jsonify(
+        {
+            "ok": True,
+            "requests": [_trq_safe(r) for r in requests],
+        }
+    ), 200
+
+
+@tasks_bp.get("/api/task-requests/<int:request_id>")
+def get_task_request(request_id: int):
+    """One of the caller's OWN requests — 404 for anyone else's."""
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        req = task_request_store.get_request(request_id)
+    except Exception:
+        logger.exception(
+            "Task request read failed: user=%s request=%s",
+            user_id, request_id,
+        )
+        return _server_error()
+    # Ownership is part of the lookup: a foreign request is
+    # indistinguishable from a missing one for this caller.
+    if req is None or req.user_id != user_id:
+        return _error("request_not_found", _MSG_TRQ_NOT_FOUND, 404)
+    return jsonify({"ok": True, "request": _trq_safe(req)}), 200
+
+
+@tasks_bp.patch("/api/task-requests/<int:request_id>")
+def resubmit_task_request(request_id: int):
+    """Edit + resubmit the caller's OWN request after the admin
+    returned it for changes (``changes_requested`` → ``pending``).
+
+    The body is the full proposal; every field is re-validated
+    server-side.  No status/user id can be client-set — the state
+    transition is decided by the store, never by the payload.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+
+    try:
+        updated = task_request_store.resubmit_request(
+            request_id, user_id, body
+        )
+    except task_request_store.TaskRequestError as exc:
+        message = str(exc)
+        if message == "الطلب غير موجود.":
+            return _error("request_not_found", _MSG_TRQ_NOT_FOUND, 404)
+        if message == "لا يمكن تعديل هذا الطلب في وضعه الحالي.":
+            return _error(
+                "invalid_status", _MSG_TRQ_INVALID_STATUS, 409
+            )
+        return _error("invalid_payload", message, 400)
+    except Exception:
+        logger.exception(
+            "Task request resubmit failed: user=%s request=%s",
+            user_id, request_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "request": _trq_safe(updated),
+            "message": _MSG_TRQ_SUBMITTED,
         }
     ), 200

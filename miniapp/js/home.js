@@ -25,6 +25,16 @@ const Home = (() => {
     // `true` to restore the section exactly as it is today.
     const SHOW_DAILY_REGISTRATION = false;
 
+    // ── Feature flag: user task submission («إضافة مهمة ➕») ──────
+    // SHOW_USER_TASK_SUBMISSION wires the «إضافة مهمة» CTA to the
+    // TaskRequestUI dialog (miniapp/js/task-request.js): the user
+    // proposes a task and it ALWAYS enters admin review first — the
+    // Mini App can never publish a task by itself.  The section
+    // itself stays unconditional; this flag only decides whether the
+    // button opens the form or stays a disabled placeholder (set it
+    // to `false` to hide the capability without touching markup).
+    const SHOW_USER_TASK_SUBMISSION = true;
+
     /**
      * Build and return the full Home page DOM element.
      */
@@ -205,10 +215,29 @@ const Home = (() => {
                     <span class="section-title">إضافة مهمة</span>
                 </div>
                 <div class="add-task-body">
-                    <button class="add-task-cta" data-testid="add-task-cta" disabled>➕ إضافة مهمة</button>
+                    <button class="add-task-cta" data-testid="add-task-cta">➕ إضافة مهمة</button>
                 </div>
             </div>
         `;
+
+        // The CTA opens the task-proposal dialog (TaskRequestUI owns
+        // every fetch/validation); with the flag off it degrades to
+        // the original disabled placeholder.  Home itself stays
+        // fetch-free and mutation-free.
+        const cta = section.querySelector('[data-testid="add-task-cta"]');
+        if (cta) {
+            if (SHOW_USER_TASK_SUBMISSION) {
+                cta.addEventListener('click', () => {
+                    if (typeof TaskRequestUI !== 'undefined' &&
+                        TaskRequestUI &&
+                        typeof TaskRequestUI.open === 'function') {
+                        TaskRequestUI.open();
+                    }
+                });
+            } else {
+                cta.disabled = true;
+            }
+        }
         return section;
     }
 

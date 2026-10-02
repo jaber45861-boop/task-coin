@@ -404,13 +404,30 @@ class TestAddTaskCTAButton:
         assert "إضافة مهمة" in nearby, \
             "CTA button should contain 'إضافة مهمة' text"
 
-    def test_cta_button_is_disabled(self):
-        """CTA button must be disabled — no business logic yet."""
+    def test_cta_button_enabled_by_default(self):
+        """CTA button is active: SHOW_USER_TASK_SUBMISSION defaults to
+        true and the rendered button carries no `disabled` attribute
+        (the user task submission workflow is live)."""
         content = _home_js()
-        idx = content.find("add-task-cta")
-        nearby = content[idx:idx + 200]
-        assert "disabled" in nearby, \
-            "CTA button should be disabled (UI-only placeholder)"
+        assert "const SHOW_USER_TASK_SUBMISSION = true;" in content, \
+            "Task submission flag must default to true (feature active)"
+        idx = content.find('data-testid="add-task-cta"')
+        assert idx != -1
+        start = content.rfind("<button", 0, idx)
+        end = content.find(">", idx)
+        button_tag = content[start:end + 1]
+        assert "disabled" not in button_tag, \
+            "CTA button must be enabled — it opens the task form"
+
+    def test_cta_button_opens_task_request_form(self):
+        """The CTA click opens TaskRequestUI — the form itself lives
+        in task-request.js, so Home stays fetch-free."""
+        content = _home_js()
+        assert "TaskRequestUI" in content, \
+            "CTA should be wired to the TaskRequestUI dialog"
+        assert "TaskRequestUI.open" in content or \
+            "TaskRequestUI.open()" in content
+        assert "fetch(" not in content
 
     def test_cta_button_is_html_button_element(self):
         """CTA should be a <button> element for proper semantics."""

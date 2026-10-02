@@ -49,6 +49,7 @@ import payment_method_admin
 import rate_admin
 import support_service
 import task_creation
+import task_request_admin
 import task_taxonomy
 import withdrawal_admin
 import withdrawal_notifications
@@ -2048,6 +2049,16 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "deposits", deposit_proof_admin.deposits_command,
     ), group=0)
+    # Mini App «إضافة مهمة» — user task requests review queue.
+    #    /taskrequests — private admin chat ONLY; authorization is
+    #    enforced inside the handler (config.is_admin) and every
+    #    decision delegates to task_request_store + the canonical
+    #    task_creation service (never a second creation path).  Not
+    #    added to the BotCommand menu, same as the other admin
+    #    commands.
+    app.add_handler(CommandHandler(
+        "taskrequests", task_request_admin.taskrequests_command,
+    ), group=0)
 
     # MT-ADMIN-32: /control — Admin Control Center foundation.  A
     #    thin, READ-ONLY dashboard over the existing stores (aggregate
@@ -2109,6 +2120,15 @@ def main() -> None:
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         admin_control.settings_text_input,
     ), group=8)
+    # Mini App «إضافة مهمة»: admin free text for a pending treq:
+    #    prompt (reject reason / return note / field edit).  Registered
+    #    STATICALLY in its OWN group (same rationale as groups 3/6/7/8)
+    #    and self-gated — silent unless the sender is an admin holding
+    #    a treq: input state, so every earlier text handler is unaffected.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        task_request_admin.task_request_text_input,
+    ), group=9)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
@@ -2180,6 +2200,15 @@ def main() -> None:
     #    admin's manual verification and never credits by itself.
     app.add_handler(CallbackQueryHandler(
         deposit_proof_admin.proof_callback, pattern=r"^dp:",
+    ), group=5)
+
+    # Mini App «إضافة مهمة»: user task-request review buttons
+    #    (list/view/edit/approve/return/reject).  Payloads are
+    #    treq:<op>[:<positive id>] lookup pointers only — the admin
+    #    gate (config.is_admin) and every fact are re-read server-side,
+    #    and approval flows through the ONE canonical creation service.
+    app.add_handler(CallbackQueryHandler(
+        task_request_admin.task_request_callback, pattern=r"^treq:",
     ), group=5)
 
     # MT-ADMIN-32/33: control-center navigation buttons (attention-

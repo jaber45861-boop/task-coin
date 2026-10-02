@@ -114,6 +114,7 @@ import platform_settings
 import rate_admin
 import rate_store
 import support_service
+import task_request_admin
 import wallet
 import withdrawal_admin
 import withdrawal_store
@@ -599,6 +600,7 @@ class TestNavigation(ControlTestBase):
                 "ctl:paymethods",
                 "ctl:rate",
                 "ctl:refresh",
+                "ctl:requests",
                 "ctl:reviews",
                 "ctl:rewards",
                 "ctl:settings",
@@ -741,6 +743,7 @@ class TestNavigation(ControlTestBase):
                 "ctl:broadcast",
                 "ctl:support",
                 "ctl:channels",
+                "ctl:requests",
                 "ctl:settings",
                 "ctl:admins",
                 "ctl:logs",
@@ -1028,6 +1031,7 @@ class TestAdminSystemFoundation(ControlTestBase):
                 "broadcast",
                 "support",
                 "channels",
+                "requests",
                 "settings",
                 "admins",
                 "logs",
@@ -1051,6 +1055,7 @@ class TestAdminSystemFoundation(ControlTestBase):
             "rate": "/setrate",
             "support": "/support",
             "channels": "/listchannels",
+            "requests": "/taskrequests",
         }
         for module in admin_control.MODULES:
             self.assertEqual(
@@ -1074,6 +1079,9 @@ class TestAdminSystemFoundation(ControlTestBase):
             "rate": (rate_admin, "setrate_command"),
             "support": (support_service, "support_command"),
             "channels": (bot_mod, "list_channels"),
+            "requests": (
+                task_request_admin, "taskrequests_command"
+            ),
         }
         implemented = {
             m.key for m in admin_control.MODULES if m.command is not None

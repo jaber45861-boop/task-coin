@@ -693,9 +693,13 @@ class TestScopePolicy(WalletTestBase):
         field (integer display only).  The account-linking feature
         flag adds one more: ``miniapp/js/home.js`` only gates the
         «ربط الحسابات» section behind ``SHOW_ACCOUNT_LINKING``
-        (visibility only — no wallet behaviour).  Every other Mini
-        App file — wallet.js, wallet-data.js, index.html, CSS, the
-        rest — must stay byte-identical.
+        (visibility only — no wallet behaviour).  The user task
+        submission workflow («إضافة مهمة ➕») adds its own surface:
+        ``miniapp/js/task-request.js`` (new), plus the script tag in
+        ``miniapp/index.html`` and the ``.taskreq-*`` styles in
+        ``miniapp/css/app.css`` — no wallet behaviour.  Every other
+        Mini App file — wallet.js, wallet-data.js, the rest — must
+        stay byte-identical.
         """
         repo_root = os.path.dirname(os.path.abspath(__file__))
         try:
@@ -710,6 +714,9 @@ class TestScopePolicy(WalletTestBase):
         allowed = {
             "miniapp/js/tasks.js",      # MT-ADMIN-14 exception
             "miniapp/js/home.js",       # account-linking flag (visibility only)
+            "miniapp/js/task-request.js",   # «إضافة مهمة ➕» submission UI
+            "miniapp/index.html",       # task-request.js script tag
+            "miniapp/css/app.css",      # .taskreq-* styles for the overlay
         }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse

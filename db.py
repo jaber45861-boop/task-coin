@@ -1244,6 +1244,55 @@ def init_db(db_path: str | None = None) -> None:
             ON admin_task_drafts (admin_user_id) WHERE status = 'open'
         """)
 
+        # ── User task requests (Mini App «إضافة مهمة») ────────────
+        # A user-proposed task that has NOT been published yet:
+        # additive CREATE TABLE IF NOT EXISTS — no existing table or
+        # row is touched, and pending requests live ONLY here (never
+        # in `tasks`), so a request can never appear in the public
+        # catalog before an admin approves it.
+        #   status  'pending'           — قيد المراجعة (awaiting admin)
+        #           'approved'          — published (published_task_id set)
+        #           'rejected'          — مرفوضة (decision_reason set)
+        #           'changes_requested' — تحتاج إلى تعديل (user may edit
+        #                                 + resubmit → back to pending)
+        #   payload_json    the validated proposal (title, description,
+        #                   provider, action, target_ref, reward_units)
+        #   history_json    append-only audit events (submitted, admin
+        #                   edits with the previous payload snapshot,
+        #                   decisions, resubmissions)
+        #   decided_by / decided_at / decision_reason — admin decision
+        #   published_task_id  the `tasks` row created on approve
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_task_requests (
+                request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN
+                        ('pending', 'approved', 'rejected',
+                         'changes_requested')),
+                payload_json TEXT NOT NULL,
+                history_json TEXT NOT NULL DEFAULT '[]',
+                decision_reason TEXT,
+                decided_by INTEGER,
+                decided_at TIMESTAMP,
+                published_task_id INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (published_task_id) REFERENCES tasks(id)
+            )
+        """)
+        # Admin queue: pending requests oldest first.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_task_requests_status
+            ON user_task_requests (status, request_id)
+        """)
+        # A user's own requests, newest first.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_task_requests_user
+            ON user_task_requests (user_id, request_id)
+        """)
+
         # ── Persistent Telegram user support (MT-ADMIN-06) ─────────
         # Additive migration only: brand-new tables.  A support
         # inquiry is ONE active conversation between one Telegram user
