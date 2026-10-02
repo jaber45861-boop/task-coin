@@ -51,6 +51,8 @@ import support_service
 import task_creation
 import task_taxonomy
 import withdrawal_admin
+import withdrawal_notifications
+import withdrawal_user
 from admin_notifier import AdminNotifier
 from telegram_channel_task_verifier import (
     TELEGRAM_CHANNEL_TASK_TYPE,
@@ -832,7 +834,13 @@ async def addchannel_cancel(
 # ── Admin: List Channels ─────────────────────────────────────────────
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all mandatory subscription channels. Admin only."""
+    """List all mandatory subscription channels. Admin only.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or read.
+    """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -908,7 +916,14 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Mandatory subscription channels are a separate concern: this
     handler only reads the registry to validate the slug and never
     adds, removes, or gates channels.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before authorization or parsing, so the
+    legacy pipe form never creates a task outside a private admin
+    chat (the bare-form wizard already re-checks it itself).
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
@@ -960,6 +975,11 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # creation path, never two.  The service builds the exact
     # MT-TASK-05 contract and proves it with the verifier's own
     # validator before anything is persisted.
+    #
+    # Roadmap 4: the sending admin is the authenticated advertiser —
+    # the service funds the task (reward + commission snapshot) from
+    # that account atomically with the INSERT, never from payload
+    # data.
     spec = task_creation.TaskSpec(
         title=title,
         description=description,
@@ -971,7 +991,9 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reward_units=reward_units,
     )
     try:
-        task_id = task_creation.create_task_from_spec(spec)
+        task_id = task_creation.create_task_from_spec(
+            spec, funding_advertiser_id=user_id
+        )
     except TelegramChannelTaskDataError as exc:
         await update.message.reply_text(
             f"❌ بيانات المهمة غير صالحة: {exc}"
@@ -1002,7 +1024,13 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     Admin only.  Read-only: queries the existing tasks table via
     db.list_tasks() and never creates, modifies, or disables tasks.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or read, so
+    task/reward listings never reach a group.
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -1049,7 +1077,13 @@ async def off_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is never removed: user_tasks history, task_submissions, approvals,
     and ledger rewards stay untouched, and the existing catalog,
     start-gate, and attempt-policy checks then exclude the task.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization, read or
+    write, so the mutation never runs from a group.
     """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         subscribed, missing = await check_subscription_access(
@@ -1460,7 +1494,13 @@ async def clear_command_menus(application: Application) -> None:
 async def admin_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Admin-only /admin command that shows the channel management panel."""
+    """Admin-only /admin command that shows the channel management panel.
+
+    MT-ADMIN-NEXT: private admin chat only — group/channel
+    invocations stay silent before any authorization or rendering.
+    """
+    if _non_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
@@ -1481,7 +1521,15 @@ async def admin_command(
 async def admin_panel_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle admin panel callbacks (add, remove, list)."""
+    """Handle admin panel callbacks (add, remove, list).
+
+    MT-ADMIN-NEXT: private admin chat only — a press from a group or
+    channel answers NOTHING (no callback answer, no read, no write)
+    before any authorization, so the panel family is silent outside
+    private chats.
+    """
+    if _non_private_chat(update):
+        return
     query = update.callback_query
     await query.answer()
 
@@ -1664,6 +1712,10 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         _schedule_notification,
     )
     support_service.bind(_admin_notifier)
+    # Withdrawal submission notices share the SAME AdminNotifier and
+    # loop scheduler (ADMINS private chats only) — bound only while
+    # this bot loop runs.
+    withdrawal_notifications.bind(_admin_notifier, _schedule_notification)
 
     def _error_callback(exc: TelegramError) -> None:
         application.create_task(application.process_error(error=exc, update=None))
@@ -1700,6 +1752,7 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         # never notifies.
         support_service.unbind()
         manual_proof_inbox.unbind()
+        withdrawal_notifications.unbind()
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
@@ -1946,6 +1999,13 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "support", support_service.support_command,
     ), group=0)
+    # User withdrawal flow — private chat ONLY (group/channel
+    #    invocations silent).  Identity comes from effective_user and
+    #    every mutation delegates to WithdrawalService (one atomic
+    #    transaction); no client-supplied user id is ever accepted.
+    app.add_handler(CommandHandler(
+        "withdraw", withdrawal_user.withdraw_command,
+    ), group=0)
     # MT-ADMIN-08: payment-method management — private admin chat ONLY.
     #    /paymethods panel; /addpm + /editpm use the stateless
     #    pipe-form convention (same as /addchannel).  Authorization is
@@ -2019,6 +2079,36 @@ def main() -> None:
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         support_service.support_text_input,
     ), group=2)
+
+    # MT-ADMIN-32/39: admin_control free-text catch-alls, registered
+    # STATICALLY here instead of lazily from inside control_callback.
+    # Adding a handler during Application.process_update() mutates
+    # application.handlers while the update fetcher is iterating it
+    # (RuntimeError: dictionary changed size during iteration), which
+    # silently kills the _update_fetcher task — updates keep being
+    # ACKed by getUpdates but are never processed until restart.
+    # Each handler is self-gated (silent unless the sender is an admin
+    # with matching state), so early groups are unaffected.
+    #   group 3 — task-edit free text (title/target/instructions/...)
+    #   group 6 — /addtask admin text input
+    #   group 7 — broadcast text input
+    #   group 8 — settings text input
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.task_edit_text_input,
+    ), group=3)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.admin_add_text_input,
+    ), group=6)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.broadcast_text_input,
+    ), group=7)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_control.settings_text_input,
+    ), group=8)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(

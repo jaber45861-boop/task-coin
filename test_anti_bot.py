@@ -235,7 +235,7 @@ class TestWrongTwiceThenCorrect(unittest.IsolatedAsyncioTestCase):
 
         # Second attempt: wrong
         answer2 = ctx.user_data["anti_bot_answer"]
-        update2 = _make_update(_TEST_USER_ID, "0")
+        update2 = _make_update(_TEST_USER_ID, "-1")
         await check_answer(update2, ctx)
         self.assertEqual(ctx.user_data["anti_bot_attempts"], 2)
 
@@ -254,7 +254,7 @@ class TestWrongTwiceThenCorrect(unittest.IsolatedAsyncioTestCase):
         await check_answer(update1, ctx)
 
         # Second wrong
-        update2 = _make_update(_TEST_USER_ID, "0")
+        update2 = _make_update(_TEST_USER_ID, "-1")
         await check_answer(update2, ctx)
 
         error_msg = update2.message.reply_text.call_args_list[0][0][0]

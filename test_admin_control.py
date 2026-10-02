@@ -113,6 +113,7 @@ import payment_method_store
 import platform_settings
 import rate_admin
 import rate_store
+import support_service
 import wallet
 import withdrawal_admin
 import withdrawal_store
@@ -591,6 +592,7 @@ class TestNavigation(ControlTestBase):
             [
                 "ctl:admins",
                 "ctl:broadcast",
+                "ctl:channels",
                 "ctl:deposits",
                 "ctl:health",
                 "ctl:logs",
@@ -600,6 +602,7 @@ class TestNavigation(ControlTestBase):
                 "ctl:reviews",
                 "ctl:rewards",
                 "ctl:settings",
+                "ctl:support",
                 "ctl:tasks",
                 "ctl:users",
                 "ctl:withdrawals",
@@ -736,6 +739,8 @@ class TestNavigation(ControlTestBase):
                 "ctl:rate",
                 "ctl:rewards",
                 "ctl:broadcast",
+                "ctl:support",
+                "ctl:channels",
                 "ctl:settings",
                 "ctl:admins",
                 "ctl:logs",
@@ -1021,6 +1026,8 @@ class TestAdminSystemFoundation(ControlTestBase):
                 "rate",
                 "rewards",
                 "broadcast",
+                "support",
+                "channels",
                 "settings",
                 "admins",
                 "logs",
@@ -1042,6 +1049,8 @@ class TestAdminSystemFoundation(ControlTestBase):
             "deposits": "/deposits",
             "paymethods": "/paymethods",
             "rate": "/setrate",
+            "support": "/support",
+            "channels": "/listchannels",
         }
         for module in admin_control.MODULES:
             self.assertEqual(
@@ -1063,6 +1072,8 @@ class TestAdminSystemFoundation(ControlTestBase):
             "deposits": (deposit_proof_admin, "deposits_command"),
             "paymethods": (payment_method_admin, "paymethods_command"),
             "rate": (rate_admin, "setrate_command"),
+            "support": (support_service, "support_command"),
+            "channels": (bot_mod, "list_channels"),
         }
         implemented = {
             m.key for m in admin_control.MODULES if m.command is not None

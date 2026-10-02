@@ -851,6 +851,58 @@ class TestMiniAppConnectUI:
         assert "youtube" not in html.lower().split("bottom-nav", 1)[-1]
 
 
+# ════════════════════════════════════════════════════════════════════
+# 29b. Home render wires the existing SocialAccounts module (MT-YT-FIX)
+# ════════════════════════════════════════════════════════════════════
+
+class TestHomeWiresSocialAccounts:
+    """Rendering Home attaches the existing SocialAccounts.attach() to
+    the existing account-linking section — no new handler is written."""
+
+    @staticmethod
+    def _app() -> str:
+        return Path("miniapp/js/app.js").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _social() -> str:
+        return Path("miniapp/js/social.js").read_text(encoding="utf-8")
+
+    def test_social_module_still_provides_attach(self):
+        """The contract: social.js already exposes attach(section)."""
+        social = self._social()
+        assert "function attach(section)" in social
+        assert re.search(r"return\s*\{\s*attach,", social)
+
+    def test_app_attaches_social_accounts_on_home(self):
+        """app.js wires SocialAccounts.attach() to the Home section."""
+        app = self._app()
+        assert "page === 'home' && typeof SocialAccounts !== 'undefined'" in app, \
+            "app.js must guard the wiring to the Home page render"
+        assert '[data-testid="home-account-linking"]' in app, \
+            "app.js must select the existing account-linking section"
+        assert "SocialAccounts.attach(accountLinkingSection)" in app, \
+            "app.js must call the existing SocialAccounts.attach()"
+
+    def test_attach_runs_after_home_element_is_appended(self):
+        """The wiring happens after the Home element is rendered/appended."""
+        app = self._app()
+        appended = app.index("contentEl.appendChild(pageEl)")
+        attached = app.index("SocialAccounts.attach(accountLinkingSection)")
+        assert appended < attached, \
+            "attach must run after the Home element is appended"
+
+    def test_app_does_not_duplicate_youtube_click_handler(self):
+        """The YouTube click handler stays in social.js only."""
+        app = self._app()
+        assert "connectYouTube" not in app, \
+            "app.js must not duplicate the YouTube click handler"
+        assert "social-youtube-connect" not in app, \
+            "app.js must not bind the connect button directly"
+        social = self._social()
+        assert "button.addEventListener('click', connectYouTube)" in social, \
+            "social.js must keep owning the click handler"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 30–32. Regressions are run via the suite (see the task report):
 #   python -m pytest test_miniapp_*.py  (Mini App)

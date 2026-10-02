@@ -108,6 +108,19 @@ MSG_INSUFFICIENT = (
 )
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 
+# Best-effort post-commit notices to the REQUESTER (safe facts only:
+# short id + status — never destinations, never credentials).
+MSG_USER_COMPLETED = (
+    "✅ تم إتمام طلب السحب الخاص بك.\n"
+    "رقم الطلب: #{short_id}\n"
+    "الحالة: مكتمل"
+)
+MSG_USER_REJECTED = (
+    "❌ تم رفض طلب السحب الخاص بك.\n"
+    "رقم الطلب: #{short_id}\n"
+    "الحالة: مرفوض — المبلغ المحجوز أُعيد إلى رصيدك."
+)
+
 LIST_HEADER = "💸 طلبات السحب المعلقة"
 MSG_NO_PENDING = "📭 لا توجد طلبات سحب معلقة حالياً."
 
@@ -430,6 +443,31 @@ def _list_again_button() -> InlineKeyboardMarkup:
 # ── The ONE production mutation boundary ──────────────────────────────
 
 
+async def _notify_user(context, request, action: str) -> None:
+    """Best-effort post-commit notice to the requester.
+
+    Runs strictly AFTER the service transaction committed — a delivery
+    failure is logged and swallowed, so it can never roll back or
+    repeat the financial operation.  The text carries safe facts only
+    (short id + status).
+    """
+    try:
+        template = (
+            MSG_USER_COMPLETED if action == "complete"
+            else MSG_USER_REJECTED
+        )
+        text = template.format(short_id=str(request.request_id)[:8])
+        await context.bot.send_message(
+            chat_id=request.user_id, text=text
+        )
+    except Exception:
+        logger.exception(
+            "Withdrawal user notification failed: request=%s action=%s",
+            getattr(request, "request_id", "?"),
+            action,
+        )
+
+
 def _service() -> withdrawal_service.WithdrawalService:
     """The existing production service — the sole financial path.
 
@@ -657,6 +695,11 @@ async def withdrawal_callback(update, context) -> None:
             )
             await _safe_answer(query, MSG_ERROR)
             return
+
+        # Post-commit side effect: tell the requester.  Strictly
+        # best-effort — the transaction above is already committed and
+        # a notification failure must never re-run or roll it back.
+        await _notify_user(context, updated, action)
 
         logger.info(
             "Withdrawal %s: request=%s admin=%d result=%s",

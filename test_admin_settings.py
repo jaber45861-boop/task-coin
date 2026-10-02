@@ -59,8 +59,8 @@ admin-only ``set_setting`` contract):
   41 → test_41   callback payloads stay closed (no values)
   42 → test_42   no process-global dict state for settings
  J. EXTRAS (43+)
-  43 → test_43   lazy text handler attaches once, group 8
-  44 → test_44   ^ctl: still exactly once; bot.py untouched
+  43 → test_43   no handler added during press; group 8 static
+  44 → test_44   ^ctl: still exactly once; input static in bot.py
   45-48          users/tasks/admins/dashboard regression
   49             exact display math (USDT units / basis points)
   50             settings read failure degrades per-row safely
@@ -1125,37 +1125,42 @@ class TestSettingsSecurity(SettingsTestBase):
 
 
 # ══════════════════════════════════════════════════════════════════
-# J. EXTRAS (43+): lazy registration, regression, edge cases
+# J. EXTRAS (43+): static registration, regression, edge cases
 # ══════════════════════════════════════════════════════════════════
 
 
 class TestSettingsRegistration(SettingsTestBase):
 
-    def test_43_lazy_handler_attaches_once_group_8(self) -> None:
-        """43. The value catch-all attaches ONCE, in its own group 8
-        (0-7 occupied), and never double-registers."""
+    def test_43_no_handler_added_group_8_static(self) -> None:
+        """43. Pressing ctl:settings adds ZERO handlers through
+        context.application; the value catch-all is statically
+        registered in bot.py in its own group 8 (0-7 occupied)."""
         app = _FakeApplication()
         ctx = self._ctx(app=app)
         self._press("ctl:settings", context=ctx)
-        self.assertEqual(len(app.added), 1)
-        handler, group = app.added[0]
-        self.assertEqual(group, 8)
-        self.assertIsInstance(handler, MessageHandler)
-        self.assertIs(
-            handler.callback, admin_control.settings_text_input
-        )
-        # idempotent: another press never re-attaches
+        self.assertEqual(app.added, [])
+        # a second press never registers anything either
         self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
-        self.assertEqual(len(app.added), 1)
+        self.assertEqual(app.added, [])
+
+        captured, _bot = _capture_handlers()
+        settings_text = [
+            g
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and getattr(h, "callback", None)
+            is admin_control.settings_text_input
+        ]
+        self.assertEqual(settings_text, [8])
 
     def test_44_registration_unchanged(self) -> None:
         """44. bot.py still registers ``^ctl:`` and ``/control``
-        exactly once; the settings text input is NOT statically
-        registered; foreign patterns are untouched."""
+        exactly once; the settings text input IS statically
+        registered there (group 8); foreign patterns are untouched."""
         import bot as bot_mod
 
         source = open(bot_mod.__file__, encoding="utf-8").read()
-        self.assertNotIn("settings_text_input", source)
+        self.assertIn("settings_text_input", source)
         captured, _bot = _capture_handlers()
         ctl = [
             h for h, _g in captured
@@ -1203,6 +1208,7 @@ class TestSettingsRegression(SettingsTestBase):
             [
                 "ctl:admins",
                 "ctl:broadcast",
+                "ctl:channels",
                 "ctl:deposits",
                 "ctl:health",
                 "ctl:logs",
@@ -1212,6 +1218,7 @@ class TestSettingsRegression(SettingsTestBase):
                 "ctl:reviews",
                 "ctl:rewards",
                 "ctl:settings",
+                "ctl:support",
                 "ctl:tasks",
                 "ctl:users",
                 "ctl:withdrawals",

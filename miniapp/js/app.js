@@ -83,6 +83,18 @@ const App = (() => {
 
         contentEl.appendChild(pageEl);
 
+        // Wire the existing SocialAccounts module (SA-YT-01) to the
+        // Home account-linking section; the module owns the YouTube
+        // connect handler, which is never duplicated here.
+        if (page === 'home' && typeof SocialAccounts !== 'undefined') {
+            const accountLinkingSection = pageEl.querySelector(
+                '[data-testid="home-account-linking"]'
+            );
+            if (accountLinkingSection) {
+                SocialAccounts.attach(accountLinkingSection);
+            }
+        }
+
         // In-page entries (e.g. the Account reviewer entry) reuse the
         // existing Navigation router — same pattern as the wallet
         // icon on Home; no second router is introduced.

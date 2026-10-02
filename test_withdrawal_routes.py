@@ -922,3 +922,152 @@ class TestRegistrationAndUi:
         assert "return { open, close }" in ui
         assert INIT_DATA_HEADER in ui
         assert "'/api/withdrawal'" in ui
+
+
+# ════════════════════════════════════════════════════════════════════
+# GET /api/withdrawal/requests — the user's own status/list
+# ════════════════════════════════════════════════════════════════════
+
+class TestStatusList:
+    """Authenticated read of the caller's OWN withdrawal requests —
+    transport-only: initData identity, bounded repository read, the
+    same safe payload as create, zero mutation."""
+
+    def _get(self, client, query: str = "", headers: dict | None = None):
+        return client.get(
+            "/api/withdrawal/requests" + query,
+            headers=headers if headers is not None else _auth(),
+        )
+
+    def test_requires_valid_init_data(self, client, env):
+        assert self._get(client, headers={}).status_code == 401
+        assert (
+            self._get(
+                client, headers={INIT_DATA_HEADER: "garbage"}
+            ).status_code
+            == 401
+        )
+
+    def test_empty_list_is_valid(self, client, env):
+        response = self._get(client)
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body["ok"] is True
+        assert body["requests"] == []
+
+    def test_client_user_id_param_cannot_impersonate(self, client, env):
+        """Identity comes only from initData — a ``user_id`` query
+        parameter can never select another user's rows."""
+        other_id = 4499
+        db.register_user(other_id, "mallory", "Mallory")
+
+        # A request exists for USER_A…
+        pm = _make_pm(env)
+        _seed_settings(env)
+        _set_rate(env)
+        _fund()
+        assert _post(client, _valid_cash_payload(pm.id)).status_code == 200
+
+        # …OTHER sees none, even when pointing at USER_A explicitly.
+        response = self._get(
+            client,
+            query=f"?user_id={USER_A}",
+            headers=_auth(other_id),
+        )
+        assert response.status_code == 200
+        assert response.get_json()["requests"] == []
+
+        # And USER_A still sees exactly their own.
+        own = self._get(client).get_json()["requests"]
+        assert len(own) == 1
+        assert own[0]["payment_method_id"] == pm.id
+
+    def test_payload_exposes_safe_fields_only(self, client, env):
+        pm = _make_pm(env)
+        _seed_settings(env)
+        _set_rate(env)
+        _fund()
+        assert _post(client, _valid_cash_payload(pm.id)).status_code == 200
+
+        body = self._get(client).get_json()
+        keys = _keys(body)
+        for forbidden in (
+            "pm_destination",
+            "user_destination",
+            "created_by",
+            "updated_by",
+        ):
+            assert forbidden not in keys, forbidden
+        # Platform payout coordinates can never appear as a VALUE.
+        assert PM_DESTINATION not in json.dumps(body)
+
+        row = body["requests"][0]
+        assert row["status"] == "pending"
+        assert row["request_id"]
+        assert Decimal(row["amount"]) == Decimal(CASH_AMOUNT)
+
+    def test_newest_first_and_bounded_limit(self, client, env):
+        """Own history in deterministic newest-first order, honoring
+        the bounded ``limit`` (transport-validated)."""
+        pm = _make_pm(env)
+        _seed_settings(env)
+        _set_rate(env)
+        _fund()
+
+        # An older, already-rejected request (outside the cooldown)…
+        older_id = "older-request-0001"
+        older_quote = RateQuote(
+            RATE, "manual",
+            datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        service = WithdrawalService(db_path=env)
+        service.create(
+            USER_A,
+            METHOD_VODAFONE_CASH,
+            CASH_AMOUNT,
+            payment_method_id=pm.id,
+            user_destination=USER_DEST,
+            request_id=older_id,
+            now=datetime.now(timezone.utc) - timedelta(hours=25),
+            quote=older_quote,
+        )
+        service.reject(older_id)
+
+        # …then a fresh PENDING creation through the API.
+        created = _post(
+            client, _valid_cash_payload(pm.id)
+        ).get_json()["request"]
+
+        body = self._get(client).get_json()["requests"]
+        assert [row["request_id"] for row in body] == [
+            created["request_id"],
+            older_id,
+        ]
+        assert [row["status"] for row in body] == [
+            "pending",
+            "rejected",
+        ]
+
+        bounded = self._get(client, query="?limit=1").get_json()[
+            "requests"
+        ]
+        assert len(bounded) == 1
+        assert bounded[0]["request_id"] == created["request_id"]
+
+    def test_invalid_limit_rejected(self, client, env):
+        for bad in ("0", "-1", "abc", "99", "1.5"):
+            response = self._get(client, query=f"?limit={bad}")
+            assert response.status_code == 400, bad
+
+    def test_read_mutates_nothing(self, client, env):
+        pm = _make_pm(env)
+        _seed_settings(env)
+        _set_rate(env)
+        _fund()
+        _post(client, _valid_cash_payload(pm.id))
+
+        before = _count_withdrawals(env)
+        wallet_before = _wallet_units(env)
+        assert self._get(client).status_code == 200
+        assert _count_withdrawals(env) == before
+        assert _wallet_units(env) == wallet_before

@@ -68,9 +68,18 @@ Coverage required by MT-ADMIN-38 §TESTS (brief number → test name):
    44  → test_44   admins module remains functional
    45  → test_45   foreign namespaces (wd/dp/pm/mr/atw/mproof/sup)
                    remain untouched, ``^ctl:`` still exactly once
- L. EXTRAS (46+)  lazy group-7 registration, unknown-population
+ L. EXTRAS (46+)  static group-7 registration, unknown-population
                    guard, admin/user-table isolation, structural
                    security guards, secrets in output/logs
+ M. BACKGROUND DELIVERY (52-57)
+  52  → test_52   production: claim → SENDING → answer →
+                  Application.create_task, callback never awaits
+                  delivery, /control stays live, worker edits card
+  53  → test_53   production path never uses asyncio.create_task
+  54  → test_54   simultaneous confirms → one claim, one worker
+  55  → test_55   worker isolates recipient failures; finalize once
+  56  → test_56   background logs carry no body, no recipient ids
+  57  → test_57   MagicMock contexts keep the sync inline contract
 
 Temp databases only; no production destinations or balances used.
 
@@ -80,14 +89,21 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+)
 
 import admin_control
 import config
@@ -355,7 +371,7 @@ class TestBroadcastRegistry(BroadcastTestBase):
 
     def test_07_ctl_registration_exactly_once(self) -> None:
         """7. Still exactly one ``^ctl:`` registration; the broadcast
-        text catch-all is NOT statically registered in bot.py."""
+        text catch-all IS statically registered in bot.py (group 7)."""
         captured, bot_mod = _capture_handlers()
         ctl = [
             (h, g)
@@ -368,13 +384,19 @@ class TestBroadcastRegistry(BroadcastTestBase):
         self.assertEqual(ctl[0][1], 5)
 
         source = open(bot_mod.__file__, encoding="utf-8").read()
-        self.assertNotIn("broadcast_text_input", source)
-        for registered, _group in captured:
-            self.assertIsNot(
-                getattr(registered, "callback", None),
-                admin_control.broadcast_text_input,
-                "the broadcast catch-all must attach lazily, not here",
-            )
+        self.assertIn("broadcast_text_input", source)
+        broadcast_text = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and getattr(h, "callback", None)
+            is admin_control.broadcast_text_input
+        ]
+        self.assertEqual(
+            len(broadcast_text), 1,
+            "the broadcast catch-all must be registered in bot.py",
+        )
+        self.assertEqual(broadcast_text[0][1], 7)
         # No second /control entry either.
         control_handlers = [
             (h, g)
@@ -1171,39 +1193,40 @@ class TestBroadcastRegression(BroadcastTestBase):
 
 
 # ════════════════════════════════════════════════════════════════
-# L. EXTRAS (46+): lazy registration, guards, isolation, secrets
+# L. EXTRAS (46+): static registration, guards, isolation, secrets
 # ════════════════════════════════════════════════════════════════
 
 
 class TestBroadcastRegistration(BroadcastTestBase):
 
-    def test_46_text_handler_attached_once_group_7(self) -> None:
-        """46. The first ctl:broadcast press attaches
-        MessageHandler(group=7) ONCE (bot_data marker); later presses
-        never double-register, and groups 3/6/7 coexist — one
-        catch-all per group, so no admin text input is starved."""
+    def test_46_no_handler_added_group_7_static(self) -> None:
+        """46. Pressing ctl:broadcast (twice) adds ZERO handlers
+        through context.application — the group-7 catch-all is
+        already static in bot.py, and groups 3/6/7 all coexist there
+        — one catch-all per group, so no admin text input is
+        starved."""
         app = _FakeApplication()
         ctx = SimpleNamespace(application=app)
         for _ in range(2):
             update = _callback(ADMIN_ID, "ctl:broadcast")
             update.callback_query.message.reply_text = mock.AsyncMock()
             _run(admin_control.control_callback(update, ctx))
-        self.assertEqual(len(app.added), 1)
-        handler, group = app.added[0]
-        self.assertEqual(group, 7)
-        self.assertIs(handler.callback, admin_control.broadcast_text_input)
-        self.assertTrue(
-            app.bot_data[admin_control._BROADCAST_TEXT_HANDLER_MARK]
-        )
+        self.assertEqual(app.added, [])
 
-        # All three catch-alls coexist — one per group.
-        app2 = _FakeApplication()
-        ctx2 = SimpleNamespace(application=app2)
-        for data in ("ctl:tasks", "ctl:admins", "ctl:broadcast"):
-            update = _callback(ADMIN_ID, data)
-            update.callback_query.message.reply_text = mock.AsyncMock()
-            _run(admin_control.control_callback(update, ctx2))
-        self.assertEqual([g for _h, g in app2.added], [3, 6, 7])
+        # All three catch-alls — statically, one per group.
+        captured, _bot = _capture_handlers()
+        for callback, expected_group in (
+            (admin_control.task_edit_text_input, 3),
+            (admin_control.admin_add_text_input, 6),
+            (admin_control.broadcast_text_input, 7),
+        ):
+            groups = [
+                g
+                for h, g in captured
+                if isinstance(h, MessageHandler)
+                and getattr(h, "callback", None) is callback
+            ]
+            self.assertEqual(groups, [expected_group])
 
     def test_47_context_without_live_application_is_noop(self) -> None:
         """47. Unit-test shims (no Application / MagicMock bot_data)
@@ -1294,7 +1317,13 @@ class TestBroadcastIsolationGuards(BroadcastTestBase):
             r"\bLedgerService\b",
             r"set_rate\s*\(",
             r"update_task\s*\(",
-            r"create_task\s*\(",
+            # Task-creation primitives stay out of the broadcast
+            # section — the ONLY create_task allowed there is the
+            # production ``Application.create_task`` scheduling
+            # (tested in test_52/test_53); asyncio.create_task is
+            # forbidden outright for this flow.
+            r"\bdb\.create_task\s*\(",
+            r"asyncio\.create_task\s*\(",
             r"credit_units\s*\(",
             r"reserve\s*\(",
             r"settle_units\s*\(",
@@ -1338,6 +1367,416 @@ class TestBroadcastIsolationGuards(BroadcastTestBase):
         source = open(admin_control.__file__, encoding="utf-8").read()
         marker = "# ── Broadcast module (MT-ADMIN-38)"
         return source[source.index(marker):]
+
+
+# ════════════════════════════════════════════════════════════════
+# M. BACKGROUND DELIVERY (52-57): production scheduling contract
+# ════════════════════════════════════════════════════════════════
+
+
+class TestBroadcastBackgroundDelivery(BroadcastTestBase):
+    """The production delivery architecture:
+
+    ``claim → SENDING → answer → Application.create_task →
+    background worker → ONE finalize → final card edit``.
+
+    Only a REAL ``telegram.ext.Application`` bound to the context
+    takes the background path; MagicMock/legacy contexts keep the
+    established synchronous inline contract (test_57), so both
+    behaviors are described and pinned by tests.
+    """
+
+    # ── production fixtures ────────────────────────────────────
+
+    @staticmethod
+    def _real_app():
+        """A REAL python-telegram-bot Application (no network)."""
+        app = Application.builder().token("123456:TESTTOKEN").build()
+        app._initialized = True  # skip initialize() (needs network)
+        return app
+
+    def _prod_ctx(self, app, send_side_effect=None):
+        """A context bound to a REAL Application + a recording bot."""
+        context = mock.MagicMock()
+        context.application = app      # isinstance() → production path
+        context.bot.send_message = mock.AsyncMock(
+            side_effect=send_side_effect
+        )
+        return context
+
+    @staticmethod
+    def _confirm_update():
+        update = _callback(ADMIN_ID, "ctl:broadcast:confirm")
+        update.callback_query.message.reply_text = mock.AsyncMock()
+        return update
+
+    @staticmethod
+    def _capture_created(created: list):
+        """Patch ``Application.create_task`` so worker tasks are
+        recorded — still REAL asyncio tasks created by the REAL
+        Application method."""
+        original = Application.create_task
+
+        def tracking(app_, coro, *args, **kwargs):
+            task = original(app_, coro, *args, **kwargs)
+            created.append(task)
+            return task
+
+        return mock.patch.object(Application, "create_task", tracking)
+
+    @staticmethod
+    def _drive_and_drain(update, context, created: list) -> None:
+        """Run one callback to completion, THEN await the worker
+        tasks it scheduled — in the SAME event loop, exactly as the
+        running application would."""
+        async def flow() -> None:
+            await admin_control.control_callback(update, context)
+            await asyncio.gather(*list(created))
+
+        with warnings.catch_warnings():
+            # The application is intentionally not running in tests;
+            # the worker is awaited manually right after scheduling.
+            warnings.simplefilter("ignore", UserWarning)
+            asyncio.run(flow())
+
+    # ── Test 1 — production scheduling ─────────────────────────
+
+    def test_52_production_schedules_background_worker(self) -> None:
+        """52. PRODUCTION ORDERING + non-blocking callback:
+        claim → SENDING edit → answer → ``Application.create_task``,
+        with ZERO sends and ZERO finalize before the callback
+        returns; /control keeps rendering while the worker is
+        pending; the worker then delivers, finalizes ONCE and edits
+        the final result card itself."""
+        self._compose(users=BIG_RECIPIENTS)   # 3 recipients + draft
+        app = self._real_app()
+        context = self._prod_ctx(app)
+        update = self._confirm_update()
+
+        events: list[str] = []
+        created: list = []
+        real_claim = db.claim_broadcast_sending
+
+        def tracking_claim(broadcast_id, recipient_count, db_path=None):
+            ok = real_claim(broadcast_id, recipient_count, db_path=db_path)
+            events.append("claim")
+            return ok
+
+        original_create = Application.create_task
+
+        def tracking_create(app_, coro, *args, **kwargs):
+            events.append("create_task")
+            task = original_create(app_, coro, *args, **kwargs)
+            created.append(task)
+            return task
+
+        edit = update.callback_query.edit_message_text
+        answer = update.callback_query.answer
+        edit.side_effect = lambda *a, **k: events.append("edit")
+        answer.side_effect = lambda *a, **k: events.append("answer")
+
+        async def flow() -> None:
+            with mock.patch.object(
+                db, "claim_broadcast_sending", tracking_claim
+            ), mock.patch.object(
+                Application, "create_task", tracking_create
+            ), mock.patch.object(
+                db, "finalize_broadcast", wraps=db.finalize_broadcast
+            ) as finalize:
+                await admin_control.control_callback(update, context)
+
+                # ── the callback returned WITHOUT awaiting delivery ──
+                self.assertEqual(
+                    events, ["claim", "edit", "answer", "create_task"]
+                )
+                self.assertEqual(context.bot.send_message.await_count, 0)
+                self.assertEqual(finalize.call_count, 0)
+                # SENDING card visible; NOT yet overwritten by the view
+                self.assertEqual(
+                    [c.args[0] for c in edit.call_args_list],
+                    [BROADCAST_SENDING_TEXT],
+                )
+                self.assertEqual(self._rows()[0]["status"], "sending")
+
+                # /control callbacks stay responsive while pending.
+                panel = _callback(ADMIN_ID, "ctl:broadcast")
+                panel.callback_query.message.reply_text = mock.AsyncMock()
+                await admin_control.control_callback(panel, context)
+                self.assertIn(BROADCAST_HEADER, _edited(panel.callback_query))
+                self.assertEqual(len(edit.call_args_list), 1)  # card intact
+                self.assertEqual(context.bot.send_message.await_count, 0)
+
+                # ── drain the background worker ──────────────────
+                await asyncio.gather(*created)
+                self.assertEqual(finalize.call_count, 1)
+
+            # The worker delivered exactly the users-table population.
+            self.assertEqual(context.bot.send_message.await_count, 3)
+            sent_to = sorted(
+                c.kwargs["chat_id"]
+                for c in context.bot.send_message.await_args_list
+            )
+            self.assertEqual(sent_to, list(BIG_RECIPIENTS))
+            for c in context.bot.send_message.await_args_list:
+                self.assertEqual(c.kwargs["text"], BODY)
+
+            # …and the WORKER edited the final card — exactly two
+            # edits overall: SENDING then the aggregate result.
+            result = _edited(update.callback_query)
+            self.assertEqual(
+                [c.args[0] for c in edit.call_args_list],
+                [BROADCAST_SENDING_TEXT, result],
+            )
+            self.assertIn(BROADCAST_RESULT_HEADER, result)
+            self.assertIn("✅ تم الإرسال: 3", result)
+            self.assertIn("❌ فشل الإرسال: 0", result)
+            row = self._rows()[0]
+            self.assertEqual(row["status"], "completed")
+            self.assertEqual(row["success_count"], 3)
+            self.assertEqual(row["failure_count"], 0)
+            self.assertEqual(
+                row["success_count"] + row["failure_count"],
+                row["recipient_count"],
+            )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            asyncio.run(flow())
+
+    # ── Test 2 — no asyncio.create_task ────────────────────────
+
+    def test_53_production_path_never_uses_asyncio_create_task(self) -> None:
+        """53. The scheduling path uses ``Application.create_task``
+        and NEVER ``asyncio.create_task`` — proven source-wide, with
+        the worker hand-off present in the broadcast section."""
+        source = open(admin_control.__file__, encoding="utf-8").read()
+        section = TestBroadcastIsolationGuards._broadcast_section()
+        self.assertIsNone(
+            re.search(r"asyncio\.create_task\s*\(", source),
+            "production scheduling must use Application.create_task",
+        )
+        self.assertIsNotNone(re.search(r"application\.create_task\s*\(", section))
+        self.assertIn("_broadcast_delivery_worker", section)
+
+    # ── Test 3 — double confirm ────────────────────────────────
+
+    def test_54_simultaneous_confirms_one_claim_one_worker(self) -> None:
+        """54. DOUBLE CONFIRM under true concurrency (two threads,
+        two event loops): both confirmations read the SAME draft and
+        race the DB claim — exactly ONE wins, ONE worker is created,
+        ONE set of recipients receives the message, finalize runs
+        once, and the loser answers the deterministic notice with
+        ZERO sends.  The DATABASE claim stays authoritative; no
+        in-memory flag or lock decides the outcome."""
+        self._compose(users=RECIPIENTS)
+        app = self._real_app()
+
+        claim_results: list[bool] = []
+        claim_lock = threading.Lock()
+        real_claim = db.claim_broadcast_sending
+        recipients_read = threading.Barrier(2, timeout=15)
+
+        def tracking_claim(broadcast_id, recipient_count, db_path=None):
+            ok = real_claim(broadcast_id, recipient_count, db_path=db_path)
+            with claim_lock:
+                claim_results.append(ok)
+            return ok
+
+        real_enumerate = db.list_broadcast_recipient_ids
+
+        def synced_enumerate(db_path=None):
+            ids = real_enumerate(db_path)
+            # Both confirmations read the draft BEFORE either may
+            # claim — a guaranteed two-way race at the DB claim.
+            recipients_read.wait()
+            return ids
+
+        tasks_lock = threading.Lock()
+        tasks_by_thread: dict = {}
+        original_create = Application.create_task
+
+        def tracking_create(app_, coro, *args, **kwargs):
+            task = original_create(app_, coro, *args, **kwargs)
+            with tasks_lock:
+                tasks_by_thread.setdefault(
+                    threading.get_ident(), []
+                ).append(task)
+            return task
+
+        outcomes_lock = threading.Lock()
+        outcomes: list = []
+        start = threading.Barrier(2, timeout=15)
+
+        def racer() -> None:
+            update = self._confirm_update()
+            context = self._prod_ctx(app)
+            start.wait()
+
+            async def flow() -> None:
+                await admin_control.control_callback(update, context)
+                # Drain ONLY the workers this thread created.
+                await asyncio.gather(
+                    *tasks_by_thread.get(threading.get_ident(), [])
+                )
+
+            asyncio.run(flow())
+            with outcomes_lock:
+                outcomes.append((update, context))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with mock.patch.object(
+                db, "claim_broadcast_sending", tracking_claim
+            ), mock.patch.object(
+                db, "list_broadcast_recipient_ids", synced_enumerate
+            ), mock.patch.object(
+                Application, "create_task", tracking_create
+            ), mock.patch.object(
+                db, "finalize_broadcast", wraps=db.finalize_broadcast
+            ) as finalize:
+                threads = [threading.Thread(target=racer) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30)
+                self.assertTrue(all(not t.is_alive() for t in threads))
+
+                # DB claim is THE authority: both raced, one won.
+                self.assertEqual(sorted(claim_results), [False, True])
+                # Exactly ONE worker for the whole race …
+                total_tasks = sum(
+                    len(v) for v in tasks_by_thread.values()
+                )
+                self.assertEqual(total_tasks, 1)
+                self.assertEqual(finalize.call_count, 1)
+
+        # …delivering ONE set of recipients, nothing double-sent.
+        self.assertEqual(len(outcomes), 2)
+        total_sends = sum(
+            ctx.bot.send_message.await_count for _u, ctx in outcomes
+        )
+        self.assertEqual(total_sends, len(RECIPIENTS))
+        winners = [o for o in outcomes if o[1].bot.send_message.await_count]
+        losers = [o for o in outcomes if not o[1].bot.send_message.await_count]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(losers), 1)
+        winner_update = winners[0][0]
+        loser_update = losers[0][0]
+        sent_to = sorted(
+            c.kwargs["chat_id"]
+            for c in winners[0][1].bot.send_message.await_args_list
+        )
+        self.assertEqual(sent_to, list(RECIPIENTS))
+
+        # Winner's card carries the aggregate result; the row is
+        # terminal with S + F = N exactly.
+        self.assertIn(
+            BROADCAST_RESULT_HEADER, _edited(winner_update.callback_query)
+        )
+        row = self._rows()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["success_count"], len(RECIPIENTS))
+        self.assertEqual(row["failure_count"], 0)
+
+        # The loser: deterministic already-processed notice, ZERO
+        # sends, and its card was never put into SENDING.
+        self.assertEqual(
+            _edited(loser_update.callback_query), MSG_BROADCAST_ALREADY
+        )
+        loser_edits = [
+            c.args[0]
+            for c in loser_update.callback_query.edit_message_text.call_args_list
+        ]
+        self.assertNotIn(BROADCAST_SENDING_TEXT, loser_edits)
+
+    # ── Test 4 + 5 — failure isolation & finalize exactly once ─
+
+    def test_55_worker_isolates_failures_and_finalizes_once(self) -> None:
+        """55. BACKGROUND delivery keeps per-recipient isolation:
+        the MIDDLE recipient (B) failing does NOT stop A or C —
+        all three are attempted, counts are correct, and
+        ``finalize_broadcast`` runs EXACTLY ONCE even when sends
+        fail."""
+        self._compose(users=BIG_RECIPIENTS)   # A, B, C
+        app = self._real_app()
+        context = self._prod_ctx(
+            app,
+            send_side_effect=[None, Forbidden("blocked"), None],
+        )
+        update = self._confirm_update()
+        created: list = []
+        with self._capture_created(created), mock.patch.object(
+            db, "finalize_broadcast", wraps=db.finalize_broadcast
+        ) as finalize:
+            self._drive_and_drain(update, context, created)
+
+        # B failed — C was STILL attempted after it.
+        self.assertEqual(context.bot.send_message.await_count, 3)
+        self.assertEqual(finalize.call_count, 1)      # EXACTLY once
+        row = self._rows()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["success_count"], 2)
+        self.assertEqual(row["failure_count"], 1)
+        self.assertEqual(
+            row["success_count"] + row["failure_count"],
+            row["recipient_count"],
+        )
+        result = _edited(update.callback_query)
+        self.assertIn(BROADCAST_RESULT_HEADER, result)
+        self.assertIn("✅ تم الإرسال: 2", result)
+        self.assertIn("❌ فشل الإرسال: 1", result)
+
+    # ── Test 6 — no sensitive logging ──────────────────────────
+
+    def test_56_background_logs_have_no_body_no_recipient_ids(self) -> None:
+        """56. BACKGROUND-path logs carry aggregate metadata only:
+        no message body, no recipient ids — while the safe admin id,
+        broadcast id and counts ARE present."""
+        self._compose(users=RECIPIENTS)
+        app = self._real_app()
+        context = self._prod_ctx(app)
+        update = self._confirm_update()
+        created: list = []
+        with self._capture_created(created), self.assertLogs(
+            "admin_control", level="INFO"
+        ) as logs:
+            self._drive_and_drain(update, context, created)
+
+        joined = "\n".join(logs.output)
+        self.assertNotIn(BODY, joined)
+        for uid in RECIPIENTS:
+            self.assertNotIn(str(uid), joined)
+            self.assertNotIn(f"u{uid}", joined)
+            self.assertNotIn(f"U{uid}", joined)
+        # Safe aggregate metadata IS present.
+        self.assertIn("Broadcast started", joined)
+        self.assertIn("Broadcast completed", joined)
+        self.assertIn(f"admin={ADMIN_ID}", joined)
+        self.assertIn("Broadcast completed", joined)
+
+    # ── Test 7 — MagicMock compatibility ───────────────────────
+
+    def test_57_mock_context_keeps_synchronous_contract(self) -> None:
+        """57. COMPATIBILITY — legacy MagicMock contexts (no real
+        Application) keep the established SYNCHRONOUS behavior: once
+        the callback returns, delivery is complete, NO task has been
+        scheduled anywhere, and the result card is already edited
+        (exactly what test_19-25 rely on)."""
+        self._compose(users=BIG_RECIPIENTS)
+        context = self._ctx()          # plain MagicMock context
+        update = self._confirm_update()
+        with mock.patch.object(
+            db, "finalize_broadcast", wraps=db.finalize_broadcast
+        ) as finalize:
+            _run(admin_control.control_callback(update, context))
+
+        self.assertEqual(context.bot.send_message.await_count, 3)
+        context.application.create_task.assert_not_called()  # no scheduling
+        self.assertEqual(finalize.call_count, 1)
+        row = self._rows()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["success_count"], 3)
+        self.assertIn(BROADCAST_RESULT_HEADER, _edited(update.callback_query))
 
 
 if __name__ == "__main__":

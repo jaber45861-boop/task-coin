@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import CHANNELS, Channel
 import db
+import wallet
 from bot import ADD_TASK_USAGE, add_task
 from telegram_channel_task_verifier import (
     parse_telegram_channel_task_data,
@@ -71,6 +72,13 @@ class TestAddTask(unittest.IsolatedAsyncioTestCase):
         self._original_db_path = db.DB_PATH
         db.DB_PATH = self.test_db_path
         db.init_db(self.test_db_path)
+
+        # Roadmap 4: the pipe handler funds each created task from the
+        # sending admin's wallet (reward + commission snapshot),
+        # atomically with the INSERT — register and seed the test
+        # admin so creation exercises the production funded path.
+        db.register_user(_TEST_ADMIN_ID, "test_admin", "Test Admin")
+        wallet.credit_units(_TEST_ADMIN_ID, 1_000_000 * wallet.USDT_SCALE)
 
         # Required-channel registry with one known slug.
         CHANNELS.clear()

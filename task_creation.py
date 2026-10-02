@@ -44,7 +44,14 @@ None the classic self-contained behavior is used.
 Boundaries (this module must NOT):
 - send Telegram messages, touch drafts/callbacks (admin_task_wizard
   owns that), or decide/approve claims (ManualReviewService owns that)
-- mutate wallets/ledger or complete tasks
+- write wallet/ledger SQL directly: advertiser funding goes through
+  ``task_funding.fund_task`` — wallet reserve+settle, the matching
+  ledger hold+settlement and the persisted ``task_funding`` record —
+  inside the SAME transaction as this task's INSERT whenever the
+  creation surface supplies its authenticated ``funding_advertiser_id``
+  (roadmap 4).  With no advertiser (direct/system callers) creation
+  stays the classic unfunded write, exactly as before.
+- complete tasks
 - invent provider APIs or verifiers
 """
 
@@ -57,7 +64,9 @@ from dataclasses import dataclass
 
 import db
 import platform_settings
+import task_funding
 import wallet
+from task_funding import TaskFundingError
 from config import CHANNELS
 from manual_task import MANUAL_TASK_TYPE, validate_manual_task_data
 from task_taxonomy import (
@@ -214,10 +223,14 @@ def reward_payload_value(units: int) -> int | str:
 # creation — an immutable snapshot: changing the setting later never
 # alters an existing task.
 #
-# This is the READ-PATH integration only.  Charging/collecting the
-# commission (advertiser funding, wallet movement — "commission on top
-# of the worker reward pool") is NOT implemented here: that belongs to
-# a later micro-task.  No float, no round(): exact Python int math.
+# This snapshot is the ONLY commission amount funding ever charges:
+# ``task_funding.fund_task`` reads ``tasks.commission_units`` back from
+# the persisted row (never this setting) when it moves the advertiser's
+# money — a later rate change cannot reprice an existing task.  The
+# wallet movement itself lives in ``task_funding`` (roadmap 4),
+# composed inside the creation transaction; this module only computes
+# and snapshots the amount.  No float, no round(): exact Python int
+# math.
 
 def commission_units_for(reward_units: int, commission_bp: int) -> int:
     """Exact advertiser commission in atomic units for a reward.
@@ -404,7 +417,10 @@ def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
 
 
 def create_task_from_spec(
-    spec: TaskSpec, *, conn=None
+    spec: TaskSpec,
+    *,
+    conn=None,
+    funding_advertiser_id: int | None = None,
 ) -> int:
     """Validate the spec, then create exactly one task. Returns its id.
 
@@ -419,8 +435,40 @@ def create_task_from_spec(
     and computed into this task's exact ``commission_units`` snapshot.
     A missing setting raises ``platform_settings.SettingNotFoundError``
     BEFORE any row is written — explicit and safe, never a silent 0.
+
+    Roadmap 4 — advertiser funding: when the creation surface supplies
+    ``funding_advertiser_id`` (the AUTHENTICATED creator: the wizard's
+    ownership-checked actor or the /addtask sender — never draft
+    payload or callback data), the task is funded atomically with its
+    INSERT: ``task_funding.fund_task`` charges ``reward_units +
+    commission_units`` (the just-persisted immutable snapshot) from
+    that advertiser's wallet — reserve → ledger hold → settle →
+    ledger settlement → ``task_funding`` record — on the SAME
+    connection.  Either everything commits (task exists, advertiser
+    charged exactly once, ledger rows committed) or nothing does: an
+    insufficient balance, an unknown advertiser or any financial write
+    failure rolls the INSERT back and zero rows remain.  Without an
+    advertiser (direct/system callers, legacy behavior) nothing is
+    charged and creation behaves exactly as before.
+
+    Raises:
+        TaskCreationError: invalid spec, invalid funding advertiser, or
+            the funding failure itself (insufficient balance / unknown
+            account) — admin-displayable message, zero rows written.
     """
     task_type, task_data = build_task_definition(spec)
+
+    # Funding identity is validated pre-write like every other input.
+    # The value itself always comes from the authenticated creation
+    # surface — this module never reads it from stored payloads.
+    if funding_advertiser_id is not None and (
+        isinstance(funding_advertiser_id, bool)
+        or not isinstance(funding_advertiser_id, int)
+        or funding_advertiser_id <= 0
+    ):
+        raise TaskCreationError(
+            "funding advertiser must be a positive user id"
+        )
 
     # Resolve the admin-mutable commission (no global cache: runtime
     # changes affect NEW creations only) and compute the snapshot —
@@ -435,6 +483,58 @@ def create_task_from_spec(
         effective_units = spec.reward * wallet.USDT_SCALE
     commission_units = commission_units_for(effective_units, commission_bp)
 
+    if conn is None and funding_advertiser_id is not None:
+        # Funding without a caller transaction: the INSERT and the
+        # charge must commit or roll back as one unit, so this service
+        # opens the ONE repository transaction itself (db.transaction —
+        # never a second transaction helper).
+        with db.transaction() as tx:
+            task_id = _insert_and_fund(
+                tx,
+                spec,
+                task_type,
+                task_data,
+                commission_units,
+                advertiser_id=funding_advertiser_id,
+            )
+    else:
+        task_id = _insert_and_fund(
+            conn,
+            spec,
+            task_type,
+            task_data,
+            commission_units,
+            advertiser_id=funding_advertiser_id,
+        )
+    logger.info(
+        "Task created from spec: id=%d type=%s provider=%s "
+        "action=%s verification=%s reward=%d reward_units=%s "
+        "commission_units=%d (commission_bp=%d) funded_by=%s",
+        task_id, task_type, spec.provider, spec.action,
+        spec.verification, spec.reward, spec.reward_units,
+        commission_units, commission_bp,
+        funding_advertiser_id,
+    )
+    return task_id
+
+
+def _insert_and_fund(
+    conn,
+    spec: TaskSpec,
+    task_type: str,
+    task_data: str,
+    commission_units: int,
+    *,
+    advertiser_id: int | None,
+) -> int:
+    """INSERT the task on ``conn``, then fund it on that same conn.
+
+    With no ``advertiser_id`` this is the classic unfunded INSERT
+    (``conn`` may be None → the db layer's self-contained scope).
+    With one, ``conn`` is ALWAYS the open transaction connection (the
+    caller's or the one ``create_task_from_spec`` just opened), so a
+    funding failure rolls the INSERT back with it.
+    """
     task_id = db.create_task(
         spec.title,
         spec.description,
@@ -447,12 +547,35 @@ def create_task_from_spec(
         reward_units=spec.reward_units,
         commission_units=commission_units,
     )
-    logger.info(
-        "Task created from spec: id=%d type=%s provider=%s "
-        "action=%s verification=%s reward=%d reward_units=%s "
-        "commission_units=%d (commission_bp=%d)",
-        task_id, task_type, spec.provider, spec.action,
-        spec.verification, spec.reward, spec.reward_units,
-        commission_units, commission_bp,
-    )
+    if advertiser_id is not None:
+        _fund_created_task(conn, task_id, advertiser_id)
     return task_id
+
+
+def _fund_created_task(conn, task_id: int, advertiser_id: int) -> None:
+    """Charge the advertiser inside the creation transaction.
+
+    Translates the financial failure vocabulary into this module's
+    admin-displayable ``TaskCreationError`` (Arabic, no internals) so
+    the existing surfaces (wizard "تعذر النشر", /addtask
+    "تعذر إنشاء المهمة") report it like any other creation rejection;
+    the original exception stays chained on ``__cause__`` for logs and
+    tests.  ``conn``'s transaction rolls every write back.
+    """
+    try:
+        task_funding.fund_task(
+            conn, task_id=task_id, advertiser_id=advertiser_id
+        )
+    except wallet.InsufficientBalanceError as exc:
+        raise TaskCreationError(
+            "رصيد المعلن غير كافٍ لتكلفة هذه المهمة "
+            "(المكافأة + العمولة)."
+        ) from exc
+    except wallet.UserNotFoundError as exc:
+        raise TaskCreationError(
+            "حساب المعلن غير مسجّل في البوت — شغّل /start أولًا."
+        ) from exc
+    except wallet.WalletError as exc:
+        raise TaskCreationError("تعذر تمويل المهمة من محفظة المعلن.") from exc
+    except TaskFundingError as exc:
+        raise TaskCreationError("تعذر تمويل المهمة.") from exc

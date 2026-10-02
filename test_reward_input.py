@@ -56,6 +56,7 @@ import db
 import serve_miniapp
 import task_draft_store
 import task_taxonomy
+import wallet
 from bot import add_task
 from channel_task_verifier import register_channel_task_verifier
 from config import CHANNELS, Channel
@@ -127,6 +128,12 @@ def path(monkeypatch, tmp_path):
     db.init_db(db_path)
     db.register_user(ADMIN, "admin14", "Admin 14")
     db.register_user(USER, "worker14", "Worker 14")
+
+    # Roadmap 4: pipe/wizard creation funds the task from the creating
+    # admin's wallet (reward + commission snapshot), atomically with
+    # the INSERT — seed the registered admin so the creation and
+    # settlement tests exercise the production funded path.
+    wallet.credit_units(ADMIN, 1_000_000 * USDT_SCALE)
 
     # Required-channel registry for the legacy pipe.
     CHANNELS.clear()

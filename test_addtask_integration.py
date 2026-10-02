@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import db
+import wallet
 import serve_miniapp
 from bot import add_task
 from config import CHANNELS, Channel
@@ -90,6 +91,12 @@ def env(monkeypatch, tmp_path, members):
     monkeypatch.setattr(db, "DB_PATH", db_path)
     db.init_db(db_path)
     db.register_user(USER_A, "alice", "Alice")
+
+    # Roadmap 4: /addtask funds the task from the sending admin's
+    # wallet (reward + commission snapshot) atomically — register and
+    # seed the test admin so creation exercises the funded path.
+    db.register_user(_TEST_ADMIN_ID, "test_admin", "Test Admin")
+    wallet.credit_units(_TEST_ADMIN_ID, 1_000_000 * wallet.USDT_SCALE)
 
     CHANNELS.clear()
     CHANNELS[CHANNEL_SLUG] = Channel(

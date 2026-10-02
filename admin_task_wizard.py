@@ -730,11 +730,20 @@ def publish_draft(draft_id: int, actor_id: int) -> int:
        the task on that same connection: a replayed or concurrent
        confirm loses the claim, reads ``published_task_id`` and
        creates nothing.
+    4. Roadmap 4 — funding: the ownership-checked actor is passed as
+       the authenticated ``funding_advertiser_id`` (NEVER from stored
+       payload), so inside that SAME transaction the task is funded
+       from the actor's wallet — reward + immutable commission
+       snapshot charged exactly once via ``task_funding.fund_task``.
+       An insufficient balance rolls the claim back with the task:
+       the draft stays open, zero rows, zero charges; a replayed
+       confirm returns the published id WITHOUT charging again.
 
     Raises:
         DraftGoneError / DraftAccessError: stale or foreign draft.
         ValueError (TaskCreationError, contract errors): invalid
-            draft content — zero tasks created, draft stays open.
+            draft content or an unfundable task — zero tasks created,
+            draft stays open.
     """
     draft = task_draft_store.get_draft(draft_id)
     if draft is None:
@@ -763,7 +772,9 @@ def publish_draft(draft_id: int, actor_id: int) -> int:
             if published is not None:
                 return published
             raise DraftGoneError(MSG_DRAFT_GONE)
-        task_id = create_task_from_spec(spec, conn=conn)
+        task_id = create_task_from_spec(
+            spec, conn=conn, funding_advertiser_id=actor_id
+        )
         task_draft_store.mark_published(conn, draft_id, task_id)
 
     logger.info(

@@ -245,8 +245,72 @@ def get_verifier(task_type: str) -> TaskVerifier | None:
 
 
 def clear_verifiers() -> None:
-    """Clear all registered verifiers. Use in test teardown only."""
+    """Clear all registered verifiers. Use in test teardown only.
+
+    Removes *every* registration, including the documented defaults
+    (``deterministic`` and the built-in channel verifier families),
+    so it stays a meaningful, complete clear.  Call
+    :func:`reset_verifiers` to restore the defaults afterwards.
+    """
     _verifier_registry.clear()
+
+
+def default_verifiers() -> dict[str, TaskVerifier]:
+    """Build the documented default registrations.
+
+    These are the task types production code expects to be registered
+    in any freshly-started process:
+
+    - ``deterministic`` — registered at import time at the bottom of
+      this module.
+    - ``channel_subscription`` / ``telegram_channel`` — the built-in
+      channel verifier families, registered when their modules import
+      (either from their own module bottom or from the import blocks
+      at the bottom of this module, depending on which module is
+      imported first).
+
+    A pristine instance of each default is built per call, so callers
+    can re-install the defaults without depending on import order or
+    on what happened to the live registry.
+    """
+    defaults: dict[str, TaskVerifier] = {
+        "deterministic": DeterministicTaskVerifier(),
+    }
+    # Imported lazily: this module and the channel verifier modules are
+    # mutually circular, so these imports are only safe once import
+    # time has finished.  ``reset_verifiers()`` is a runtime lifecycle
+    # operation and is never called during module initialisation.
+    from channel_task_verifier import (
+        CHANNEL_TASK_TYPE,
+        ChannelTaskVerifier,
+    )
+    from telegram_channel_task_verifier import (
+        TELEGRAM_CHANNEL_TASK_TYPE,
+        TelegramChannelTaskVerifier,
+    )
+
+    defaults[CHANNEL_TASK_TYPE] = ChannelTaskVerifier()
+    defaults[TELEGRAM_CHANNEL_TASK_TYPE] = TelegramChannelTaskVerifier()
+    return defaults
+
+
+def reset_verifiers() -> None:
+    """Restore the registry to the documented default registrations.
+
+    Lifecycle counterpart to :func:`clear_verifiers`:
+
+    - ``clear_verifiers()`` empties the registry completely — it stays
+      meaningful for tearing down custom registrations.
+    - ``reset_verifiers()`` re-installs the documented defaults so the
+      registry matches what production code expects after process
+      start (``deterministic`` + the built-in channel families).
+
+    The test suite calls this before every test (see ``conftest.py``)
+    so a clear or replacement inside one test can never leak into any
+    other test, regardless of execution order.
+    """
+    _verifier_registry.clear()
+    _verifier_registry.update(default_verifiers())
 
 
 # ── Deterministic Task Verifier ───────────────────────────────────

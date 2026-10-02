@@ -60,6 +60,7 @@ import admin_task_wizard
 import db
 import task_draft_store
 import task_taxonomy
+import wallet
 from config import CHANNELS, ADMINS, Channel
 from manual_task import (
     MANUAL_TASK_TYPE,
@@ -134,6 +135,13 @@ class WizardTestBase(unittest.TestCase):
         db.register_user(ADMIN_B, "admin_b", "Admin B")
         db.register_user(STRANGER, "stranger", "Stranger")
         db.register_user(WORKER, "worker", "Worker")
+
+        # Roadmap 4: publishing funds the task from the publishing
+        # admin's wallet (reward + commission snapshot) atomically
+        # inside the publish transaction — seed both admins so the
+        # creation tests exercise the production funded path.
+        wallet.credit_units(ADMIN_A, 1_000_000 * wallet.USDT_SCALE)
+        wallet.credit_units(ADMIN_B, 1_000_000 * wallet.USDT_SCALE)
 
     def tearDown(self) -> None:
         db.DB_PATH = self._original_db_path

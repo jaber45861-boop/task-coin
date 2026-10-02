@@ -135,9 +135,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import MessageHandler, filters
+from telegram.ext import Application, MessageHandler, filters
 
 import admin_review_queue
+import admin_task_wizard
 import db
 import deposit_proof_admin
 import deposit_proof_store
@@ -145,6 +146,7 @@ import payment_method_admin
 import payment_method_store
 import rate_admin
 import rate_store
+import support_service
 import task_taxonomy
 import withdrawal_admin
 import withdrawal_store
@@ -282,6 +284,12 @@ MODULES: tuple[AdminModule, ...] = (
     AdminModule("rewards", "🎁 المكافآت", "إدارة المكافآت (قريباً)"),
     AdminModule(
         "broadcast", "📢 الإرسال الجماعي", "إرسال رسالة للمستخدمين المسجلين"
+    ),
+    AdminModule(
+        "support", "🎧 الدعم", "إدارة طلبات الدعم", "/support"
+    ),
+    AdminModule(
+        "channels", "📡 القنوات", "إدارة القنوات المطلوبة", "/listchannels"
     ),
     AdminModule("settings", "⚙️ الإعدادات", "إعدادات المنصة"),
     AdminModule(
@@ -661,6 +669,8 @@ def build_dashboard_keyboard() -> InlineKeyboardMarkup:
         [_btn("deposits"), _btn("paymethods")],
         [_btn("rate"), _btn("rewards")],
         [_btn("broadcast")],
+        [_btn("support")],
+        [_btn("channels")],
         [_btn("settings"), _btn("admins")],
         [_btn("logs"), _btn("health")],
         [
@@ -810,12 +820,29 @@ async def _open_rate(shim, context) -> None:
     await rate_admin.setrate_command(shim, context)
 
 
+async def _open_support(shim, context) -> None:
+    await support_service.support_command(shim, context)
+
+
+async def _open_channels(shim, context) -> None:
+    # Local import: bot.py imports this module (cycle).  Delegation
+    # ONLY — the existing
+    # /listchannels handler keeps its own auth + private-chat guard
+    # and renders its own list; nothing channel-related is
+    # re-implemented or written here.
+    import bot  # local: bot.py imports this module (cycle)
+
+    await bot.list_channels(shim, context)
+
+
 _NAVIGATORS = {
     "reviews": _open_reviews,
     "withdrawals": _open_withdrawals,
     "deposits": _open_deposits,
     "paymethods": _open_paymethods,
     "rate": _open_rate,
+    "support": _open_support,
+    "channels": _open_channels,
 }
 
 
@@ -1129,10 +1156,10 @@ async def control_callback(update, context) -> None:
     if op == OP_TASKS or op.startswith(f"{OP_TASKS}:"):
         # MT-ADMIN-36: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
-        # task data was read or any mutation was confirmed.  First
-        # tasks press also attaches the edit-text catch-all ONCE
-        # (lazy, idempotent — no extra bot.py registration).
-        _ensure_text_input_handler(context)
+        # task data was read or any mutation was confirmed.  The
+        # edit-text catch-all is registered STATICALLY in bot.py —
+        # nothing is added here, so Application.handlers is never
+        # mutated while process_update iterates it.
         await _handle_tasks_op(update, context, query, op, actor)
         return
 
@@ -1140,24 +1167,18 @@ async def control_callback(update, context) -> None:
         # MT-ADMIN-37: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
         # administrator record was read or any role mutation was
-        # confirmed.  The first admins press also attaches the
-        # add-input catch-all ONCE (lazy, idempotent — no bot.py
-        # registration; its own group, so PTB's one-handler-per-group
-        # rule can never starve the MT-ADMIN-36 task catch-all).
-        _ensure_admins_text_input_handler(context)
+        # confirmed.  The add-input catch-all is registered
+        # STATICALLY in bot.py (own group 6) — no registry mutation
+        # during update processing.
         await _handle_admins_op(update, context, query, op, actor)
         return
 
     if op == OP_BROADCAST or op.startswith(f"{OP_BROADCAST}:"):
         # MT-ADMIN-38: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
-        # broadcast state or user count was read.  The first
-        # broadcast press also attaches the compose-text catch-all
-        # ONCE (lazy, idempotent; its own group 7, so PTB's
-        # one-handler-per-group rule can never starve the
-        # MT-ADMIN-36 (group 3) or MT-ADMIN-37 (group 6)
-        # catch-alls).
-        _ensure_broadcast_text_input_handler(context)
+        # broadcast state or user count was read.  The compose-text
+        # catch-all is registered STATICALLY in bot.py (own group 7)
+        # — no registry mutation during update processing.
         await _handle_broadcast_op(update, context, query, op, actor)
         return
 
@@ -1165,11 +1186,9 @@ async def control_callback(update, context) -> None:
         # MT-ADMIN-39: rendered in place by this module — the auth
         # gate above already re-checked config.is_admin BEFORE any
         # platform setting was read or any staged value confirmed.
-        # The first settings press also attaches the value-text
-        # catch-all ONCE (lazy, idempotent; its own group 8, so
-        # PTB's one-handler-per-group rule can never starve the
-        # groups 3/6/7 catch-alls).
-        _ensure_settings_text_input_handler(context)
+        # The value-text catch-all is registered STATICALLY in
+        # bot.py (own group 8) — no registry mutation during update
+        # processing.
         await _handle_settings_op(update, context, query, op, actor)
         return
 
@@ -1585,38 +1604,6 @@ def build_admin_confirm_add_keyboard(user_id: int):
 
 # Marker on Application.bot_data: the add-admin text catch-all has
 # been attached to the LIVE application (single-shot, idempotent).
-_ADMINS_TEXT_HANDLER_MARK = "admin_admins_add_text_handler"
-
-
-def _ensure_admins_text_input_handler(context) -> None:
-    """Attach ``admin_add_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern the MT-ADMIN-36 task catch-all
-    established (python-telegram-bot documents ``add_handler`` as
-    safe at any time) — no static registration in bot.py is needed
-    and ``^ctl:`` stays the single callback entry.  Group 6 is used
-    because groups 0-5 are occupied and PTB runs at most ONE handler
-    per group: the task catch-all owns group 3, so a separate group
-    guarantees both self-gated catch-alls always get their chance.
-    A context without a live Application (unit-test shims) degrades
-    to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_ADMINS_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_ADMINS_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            admin_add_text_input,
-        ),
-        group=6,
-    )
-
-
 def _apply_admin_confirm(user_id: int, kind: str, chat_id, actor: int):
     """Confirmation step → the EXISTING store operations.
 
@@ -2194,37 +2181,6 @@ def build_task_confirm_keyboard(op_kind: str, task_id: int):
 
 # Marker on Application.bot_data: the edit-text catch-all has been
 # attached to the LIVE application (single-shot, idempotent).
-_TEXT_HANDLER_MARK = "admin_tasks_edit_text_handler"
-
-
-def _ensure_text_input_handler(context) -> None:
-    """Attach ``task_edit_text_input`` to the live Application ONCE.
-
-    python-telegram-bot documents ``Application.add_handler`` as
-    safe to call at any time, so the text catch-all is registered
-    LAZY and idempotent (bot_data marker) from the first Control
-    Center tasks press — no second static registration in bot.py is
-    needed, and ``^ctl:`` stays the single callback entry.  A
-    context without a live Application (unit-test shims) degrades to
-    a no-op.  Group 3 mirrors the wizard (0) / support (2)
-    catch-all pattern; the body stays silent without pending state.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            task_edit_text_input,
-        ),
-        group=3,
-    )
-
-
 def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
     """Confirmation step → the EXISTING ``db.update_task`` contract.
 
@@ -2309,17 +2265,17 @@ async def _handle_tasks_op(update, context, query, op: str,
     toast: str | None = None
     try:
         if op == TASKS_NEW_OP:
-            # Creation delegates to the EXISTING /addtask entry →
-            # admin_task_wizard → task_creation service.  The target
-            # re-checks admin + private chat itself.
+            # Creation opens the canonical admin_task_wizard DIRECTLY
+            # (no bot.add_task intermediary) with the /addtask shim.
+            # The wizard re-checks admin + private chat itself and
+            # owns the flow through publish_draft →
+            # create_task_from_spec.
             view = "tasks:new"
             shim = _nav_update(update, "/addtask")
             if shim is None:
                 await _safe_answer(query, MSG_INVALID)
                 return
-            import bot  # local: bot.py imports this module (cycle)
-
-            await bot.add_task(shim, context)
+            await admin_task_wizard.start_wizard(shim, context)
             await _safe_answer(query, BACK_HINT)
             logger.info("Task creation opened: admin=%d", actor)
             return
@@ -2486,7 +2442,11 @@ async def task_edit_text_input(update, context) -> None:
 # persistent ``broadcasts`` store — there is NO process-global
 # broadcast dict anywhere in this module.  Delivery is individual
 # ``context.bot.send_message`` calls issued by the EXISTING bot
-# instance through the handler's own context (never a Telegram
+# instance through the handler's own context — in production the
+# pass runs as a background worker scheduled with the REAL
+# ``Application.create_task`` AFTER the atomic claim, so the
+# callback answers and returns immediately while delivery
+# continues (never a Telegram
 # group/chat broadcast, never a second Bot object): one failed
 # recipient (blocked bot, invalid/unavailable chat, network error,
 # anything unexpected) is COUNTED and the pass continues, the
@@ -2642,21 +2602,92 @@ def build_broadcast_result_text(
     )
 
 
+async def _broadcast_delivery_worker(
+    context, query, actor: int, broadcast_id: int, message: str,
+    recipients: list[int],
+):
+    """Background delivery pass: individual sends → ONE finalize →
+    final aggregate card edit.
+
+    This is the ONLY site that calls ``db.finalize_broadcast`` on
+    the delivery path — a failed final-card edit is logged and
+    NEVER triggers another finalize.  Each recipient send is
+    isolated (one exception counts that recipient and the loop
+    CONTINUES), and logs carry admin id + broadcast id + aggregate
+    counts only — never the message body, never a recipient id.  In
+    production this coroutine runs as an
+    ``Application.create_task`` task scheduled by
+    ``_deliver_broadcast`` (the callback never awaits it); legacy
+    contexts without a real Application await it inline so
+    synchronous test doubles keep their established contract.
+    """
+    success = 0
+    failure = 0
+    for recipient in recipients:
+        try:
+            await context.bot.send_message(chat_id=recipient, text=message)
+            success += 1
+        except Exception:
+            # Blocked bot / invalid chat / network / unexpected: the
+            # recipient counts as failed and the pass CONTINUES.
+            # Only safe operational ids are logged — never the body.
+            failure += 1
+            logger.warning(
+                "Broadcast delivery failure: broadcast=%d failure_count=%d",
+                broadcast_id, failure,
+            )
+    try:
+        db.finalize_broadcast(broadcast_id, success, failure)
+    except Exception:
+        # The pass already ran; the row honestly stays 'sending'
+        # (never claimed complete) and the result below still reports
+        # the REAL counts.
+        logger.exception(
+            "Broadcast finalize failed: broadcast=%d", broadcast_id
+        )
+    logger.info(
+        "Broadcast completed: admin=%d broadcast=%d recipients=%d "
+        "success=%d failure=%d",
+        actor, broadcast_id, len(recipients), success, failure,
+    )
+    # The final result card is edited HERE — by the worker, AFTER
+    # delivery, never by the callback handler.  An edit failure
+    # degrades to a safe log and never re-finalizes.
+    try:
+        await query.edit_message_text(
+            build_broadcast_result_text(len(recipients), success, failure),
+            reply_markup=build_broadcast_panel_keyboard(),
+        )
+    except Exception:
+        logger.info(
+            "Broadcast result edit skipped: admin=%d broadcast=%d",
+            actor, broadcast_id,
+        )
+    return success, failure
+
+
 async def _deliver_broadcast(context, query, actor: int):
-    """Confirm → atomic claim → individual sends → aggregate result.
+    """Confirm → atomic claim → SENDING → answer → schedule worker.
 
     Order matters.  The draft and the recipient population are read
     FIRST — a failed read degrades to a NON-sendable card (no claim,
     no send, retryable), so an unknown population can never
     broadcast.  The atomic ``draft → sending`` claim comes next and
     is the SOLE duplicate-send authority: only the single rowcount-1
-    winner may begin Telegram sends; every loser answers the
-    deterministic already-processed notice with ZERO sends.  Each
-    recipient failure (blocked bot, invalid/unavailable chat,
-    network or unexpected error) is counted and the pass CONTINUES —
-    one failure never aborts the rest, no retry loop is invented and
-    no traceback reaches the administrator.  Returns
-    ``(text, markup, toast)`` for the caller to render.
+    winner may schedule Telegram sends; every loser answers the
+    deterministic already-processed notice with ZERO sends.  The
+    winner then edits the card to SENDING, answers the callback and
+    hands the pass to ``_broadcast_delivery_worker`` — scheduled on
+    the REAL ``Application.create_task`` in production (the callback
+    returns while delivery continues; NEVER ``asyncio.create_task``),
+    or awaited inline ONLY for legacy/mock contexts without a real
+    Application.
+
+    Returns ``(text, markup, toast)`` for the caller to render on
+    NON-delivery outcomes (error / already-processed / no-pending),
+    or None when a pass was started — the worker then owns the card:
+    SENDING is already shown and the worker edits the final
+    aggregate result itself.
     """
     panel = build_broadcast_panel_keyboard()
     try:
@@ -2717,41 +2748,35 @@ async def _deliver_broadcast(context, query, actor: int):
         "Broadcast started: admin=%d broadcast=%d recipients=%d",
         actor, draft["id"], len(recipients),
     )
-    message = draft["message"]
-    success = 0
-    failure = 0
-    for recipient in recipients:
+    worker = _broadcast_delivery_worker(
+        context, query, actor, draft["id"], draft["message"], recipients,
+    )
+    application = getattr(context, "application", None)
+    if isinstance(application, Application):
+        # Production path: schedule on the REAL Application so this
+        # callback returns immediately — /control and every other
+        # callback stay responsive while delivery runs in the
+        # background.  Application.create_task (never
+        # asyncio.create_task) ties the worker to the application's
+        # lifecycle and error handling, and the atomic claim above
+        # guarantees only ONE worker can ever exist for this
+        # broadcast.
         try:
-            await context.bot.send_message(chat_id=recipient, text=message)
-            success += 1
+            application.create_task(worker)
         except Exception:
-            # Blocked bot / invalid chat / network / unexpected: the
-            # recipient counts as failed and the pass CONTINUES.
-            # Only safe operational ids are logged — never the body.
-            failure += 1
-            logger.warning(
-                "Broadcast delivery failure: broadcast=%d failure_count=%d",
-                draft["id"], failure,
+            # Scheduling failed AFTER the claim: never lose the
+            # pass — run the same worker inline instead.
+            logger.exception(
+                "Broadcast task scheduling failed: admin=%d broadcast=%d",
+                actor, draft["id"],
             )
-    try:
-        db.finalize_broadcast(draft["id"], success, failure)
-    except Exception:
-        # The pass already ran; the row honestly stays 'sending'
-        # (never claimed complete) and the result below still reports
-        # the REAL counts.
-        logger.exception(
-            "Broadcast finalize failed: broadcast=%d", draft["id"]
-        )
-    logger.info(
-        "Broadcast completed: admin=%d broadcast=%d recipients=%d "
-        "success=%d failure=%d",
-        actor, draft["id"], len(recipients), success, failure,
-    )
-    return (
-        build_broadcast_result_text(len(recipients), success, failure),
-        panel,
-        None,
-    )
+            await worker
+        return None  # the worker owns the final result card
+    # Legacy/test contexts (MagicMock shims — no real Application):
+    # run the SAME worker inline so synchronous test doubles keep
+    # their established contract.  Production never takes this path.
+    await worker
+    return None
 
 
 async def _handle_broadcast_op(update, context, query, op: str,
@@ -2763,7 +2788,8 @@ async def _handle_broadcast_op(update, context, query, op: str,
     authoritative ``db.count_users`` / store operations; ALL state
     lives in the persistent ``broadcasts`` store; the only side
     effect beyond it is the individual delivery pass of the EXISTING
-    bot instance (no financial, task or admin-role mutation exists
+    bot instance, scheduled as an ``Application.create_task``
+    background worker in production (no financial, task or admin-role mutation exists
     on this path).  Failures degrade to a safe error answer.  Logs
     carry admin id + broadcast id + action + counts only — never the
     message body, recipient identities or tracebacks shown to the
@@ -2789,9 +2815,18 @@ async def _handle_broadcast_op(update, context, query, op: str,
             )
         elif op == BROADCAST_CONFIRM_OP:
             view = "broadcast:result"
-            text, markup, toast = await _deliver_broadcast(
-                context, query, actor
-            )
+            outcome = await _deliver_broadcast(context, query, actor)
+            if outcome is None:
+                # A delivery pass was started (or already ran): the
+                # SENDING card and its final aggregate edit belong
+                # to the delivery worker — NEVER overwrite them
+                # here with an older view.
+                logger.info(
+                    "Control broadcast view: admin=%d view=%s",
+                    actor, view,
+                )
+                return
+            text, markup, toast = outcome
         elif op == BROADCAST_CANCEL_OP:
             # Clear the pending draft: NO send, NO user mutation.
             view = "broadcast:cancel"
@@ -2886,37 +2921,6 @@ async def broadcast_text_input(update, context) -> None:
 # Marker on Application.bot_data: the broadcast compose-text
 # catch-all has been attached to the LIVE application (single-shot,
 # idempotent).
-_BROADCAST_TEXT_HANDLER_MARK = "admin_broadcast_text_input_handler"
-
-
-def _ensure_broadcast_text_input_handler(context) -> None:
-    """Attach ``broadcast_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern the MT-ADMIN-36 (group 3) and
-    MT-ADMIN-37 (group 6) catch-alls established — no static
-    registration in bot.py is needed and ``^ctl:`` stays the single
-    callback entry.  Group 7 is used because groups 0-6 are occupied
-    and PTB runs at most ONE handler per group: a separate group
-    guarantees all three self-gated catch-alls always get their
-    chance.  A context without a live Application (unit-test shims)
-    degrades to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_BROADCAST_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_BROADCAST_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            broadcast_text_input,
-        ),
-        group=7,
-    )
-
-
 # ── Settings module (MT-ADMIN-39): platform configuration, in place ───
 # Authorization is re-checked by the caller BEFORE any read here.
 # The authoritative source for EVERY displayed or written value is
@@ -3378,31 +3382,4 @@ async def settings_text_input(update, context) -> None:
 
 # Marker on Application.bot_data: the settings-value catch-all has
 # been attached to the LIVE application (single-shot, idempotent).
-_SETTINGS_TEXT_HANDLER_MARK = "admin_settings_value_text_handler"
 
-
-def _ensure_settings_text_input_handler(context) -> None:
-    """Attach ``settings_text_input`` to the live Application ONCE.
-
-    Same lazy, idempotent pattern as MT-ADMIN-36/37/38 — no static
-    registration in bot.py is needed and ``^ctl:`` stays the single
-    callback entry.  Group 8 is used because groups 0-7 are occupied
-    and PTB runs at most ONE handler per group: the task (3), admin
-    (6) and broadcast (7) catch-alls keep theirs, and this one can
-    never starve them.  A context without a live Application
-    (unit-test shims) degrades to a no-op.
-    """
-    app = getattr(context, "application", None)
-    bot_data = getattr(app, "bot_data", None)
-    if app is None or not isinstance(bot_data, dict):
-        return  # no live application (or a test shim) — no-op
-    if bot_data.get(_SETTINGS_TEXT_HANDLER_MARK):
-        return  # single-shot: never double-register
-    bot_data[_SETTINGS_TEXT_HANDLER_MARK] = True
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            settings_text_input,
-        ),
-        group=8,
-    )

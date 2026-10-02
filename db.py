@@ -751,6 +751,38 @@ def init_db(db_path: str | None = None) -> None:
             )
         """)
 
+        # ── Task funding record (roadmap 4: advertiser funding) ────
+        # One row per funded task — the immutable per-task funding
+        # amounts actually charged from the advertiser's wallet inside
+        # the creation transaction.  ``task_id`` is the PRIMARY KEY, so
+        # the database itself makes "charged twice for one task"
+        # impossible: the second insert fails and the whole funding
+        # transaction rolls back.  The CHECK constraint pins
+        # ``total_units = reward_units + commission_units`` (the
+        # advertiser's total cost is worker reward + the immutable
+        # commission snapshot — never recomputed from the live
+        # setting).  Additive CREATE IF NOT EXISTS: pre-existing
+        # databases gain the table on the next init_db(), existing
+        # unfunded tasks simply have no row (funding was deferred for
+        # them at creation time — nothing is invented retroactively).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_funding (
+                task_id INTEGER PRIMARY KEY,
+                advertiser_id INTEGER NOT NULL,
+                reward_units INTEGER NOT NULL,
+                commission_units INTEGER NOT NULL,
+                total_units INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CHECK (reward_units >= 0),
+                CHECK (commission_units >= 0),
+                CHECK (total_units >= 0),
+                CHECK (total_units = reward_units + commission_units),
+                FOREIGN KEY (task_id) REFERENCES tasks(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (advertiser_id) REFERENCES users(user_id)
+            )
+        """)
+
         # ── Task submissions / attempts table (MT-TASK-04) ──────────
         # Auditable history of verification attempts.  Deliberately
         # separate from user_tasks (which keeps only the current cycle):
