@@ -690,9 +690,12 @@ class TestScopePolicy(WalletTestBase):
 
         MT-ADMIN-14 adds the single allowed exception:
         ``miniapp/js/tasks.js`` renders the task's exact atomic reward
-        field (integer display only).  Every other Mini App file —
-        wallet.js, wallet-data.js, index.html, CSS, the rest — must
-        stay byte-identical.
+        field (integer display only).  The account-linking feature
+        flag adds one more: ``miniapp/js/home.js`` only gates the
+        «ربط الحسابات» section behind ``SHOW_ACCOUNT_LINKING``
+        (visibility only — no wallet behaviour).  Every other Mini
+        App file — wallet.js, wallet-data.js, index.html, CSS, the
+        rest — must stay byte-identical.
         """
         repo_root = os.path.dirname(os.path.abspath(__file__))
         try:
@@ -704,7 +707,10 @@ class TestScopePolicy(WalletTestBase):
             self.skipTest("git is not available in this environment")
         if result.returncode != 0:
             self.skipTest(f"git status failed: {result.stderr.strip()}")
-        allowed = {"miniapp/js/tasks.js"}
+        allowed = {
+            "miniapp/js/tasks.js",      # MT-ADMIN-14 exception
+            "miniapp/js/home.js",       # account-linking flag (visibility only)
+        }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse
             # from the RAW output so a leading status space survives.

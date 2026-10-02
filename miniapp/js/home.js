@@ -5,6 +5,16 @@
  */
 const Home = (() => {
 
+    // ── Feature flag: Account Linking section ─────────────────────
+    // SHOW_ACCOUNT_LINKING controls whether the «ربط الحسابات»
+    // section (YouTube card + «ربط YouTube» button) is rendered on
+    // Home.  The section markup and its social.js linking
+    // functionality are fully intact — this flag only decides
+    // visibility.  When false the section element is never created,
+    // so no empty gap or container is left behind.  Set it to `true`
+    // to restore the section exactly as it is today.
+    const SHOW_ACCOUNT_LINKING = false;
+
     /**
      * Build and return the full Home page DOM element.
      */
@@ -18,7 +28,9 @@ const Home = (() => {
         page.appendChild(_buildDailyCheckinSection());
         page.appendChild(_buildOfficialGuideSection());
         page.appendChild(_buildAddTaskSection());
-        page.appendChild(_buildAccountLinkingSection());
+        if (SHOW_ACCOUNT_LINKING) {
+            page.appendChild(_buildAccountLinkingSection());
+        }
         page.appendChild(_buildHotTasksSection());
 
         return page;
