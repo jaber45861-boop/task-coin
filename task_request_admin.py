@@ -473,6 +473,12 @@ async def _approve(query, actor: int, request_id: int) -> None:
     authenticated creator — the same semantics the wizard applies to
     its actor).  Any failure (invalid content surfaced late, funding)
     rolls the claim back: the request stays pending, zero tasks.
+
+    Concurrency: NO Telegram round-trip may ever run while the
+    ``BEGIN IMMEDIATE`` write transaction is open — the loser-path
+    answers are recorded inside the transaction and sent only after
+    it exits, so a slow Bot API call can never stall other writers
+    (up to ``db.BUSY_TIMEOUT_MS`` → SQLITE_BUSY).
     """
     current = task_request_store.get_request(request_id)
     if current is None:
@@ -491,6 +497,9 @@ async def _approve(query, actor: int, request_id: int) -> None:
         await _safe_answer(query, MSG_STALE)
         return
 
+    # Chosen INSIDE the transaction, awaited only AFTER it exits.
+    loser_answer: str | None = None
+
     try:
         with db.transaction() as conn:
             claimed = task_request_store.claim_for_approval(
@@ -498,7 +507,9 @@ async def _approve(query, actor: int, request_id: int) -> None:
             )
             if claimed is None:
                 # Lost the race (or state changed under us): the
-                # winner's published task id is authoritative.
+                # winner's published task id is authoritative.  The
+                # callback answer itself is deferred until the
+                # transaction has exited.
                 published = task_request_store.read_published_task_id(
                     conn, request_id
                 )
@@ -508,21 +519,21 @@ async def _approve(query, actor: int, request_id: int) -> None:
                         "task=%s",
                         request_id, published,
                     )
-                    await _safe_answer(query, MSG_APPROVED_ALREADY)
-                    return
-                await _safe_answer(query, MSG_STALE)
-                return
-            spec = task_request_store.spec_from_request(
-                claimed, approver_id=actor
-            )
-            task_id = create_task_from_spec(
-                spec,
-                conn=conn,
-                funding_advertiser_id=claimed.user_id,
-            )
-            task_request_store.mark_approved(
-                conn, request_id, actor, task_id
-            )
+                    loser_answer = MSG_APPROVED_ALREADY
+                else:
+                    loser_answer = MSG_STALE
+            else:
+                spec = task_request_store.spec_from_request(
+                    claimed, approver_id=actor
+                )
+                task_id = create_task_from_spec(
+                    spec,
+                    conn=conn,
+                    funding_advertiser_id=claimed.user_id,
+                )
+                task_request_store.mark_approved(
+                    conn, request_id, actor, task_id
+                )
     except TaskCreationError as exc:
         # Arabic, admin-displayable (validation / funding refusal) —
         # the claim rolled back, the request stays pending.
@@ -538,6 +549,12 @@ async def _approve(query, actor: int, request_id: int) -> None:
             request_id, actor,
         )
         await _safe_answer(query, MSG_ERROR)
+        return
+
+    if loser_answer is not None:
+        # Transaction already committed/rolled back — the write lock
+        # is free before this (possibly slow) network await runs.
+        await _safe_answer(query, loser_answer)
         return
 
     approved = task_request_store.get_request(request_id)
