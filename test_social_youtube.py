@@ -838,10 +838,10 @@ class TestMiniAppConnectUI:
         css = Path("miniapp/css/app.css").read_text(encoding="utf-8")
         assert ".social-connect-btn" in css
         assert ".social-account-row" in css
-        assert "--neon-red" in css
+        assert "--danger-color" in css
         # Uses project variables rather than inventing a palette.
-        assert "var(--neon-red)" in css
-        assert "var(--neon-green)" in css
+        assert "var(--danger-color)" in css
+        assert "var(--success-color)" in css
 
     def test_wallet_is_not_a_new_navigation_item(self):
         """Still exactly three tabs — linking is not a nav item."""

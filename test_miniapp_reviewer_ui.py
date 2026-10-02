@@ -518,12 +518,12 @@ class TestReviewStyling:
             "review cards must use the existing dark card token"
         approve = css[css.find(".review-approve-btn {"):]
         approve = approve[:approve.find("}")]
-        assert "--neon-green" in approve, \
-            "approve must keep the neon-green language"
+        assert "--success-color" in approve, \
+            "approve must keep the success-green language"
         reject = css[css.find(".review-reject-btn {"):]
         reject = reject[:reject.find("}")]
-        assert "255, 45, 45" in reject, \
-            "reject must keep the neon-red language"
+        assert "--danger-color" in reject, \
+            "reject must keep the danger-red language"
 
     def test_review_shell_reuses_existing_state_classes(self):
         content = _review_js()

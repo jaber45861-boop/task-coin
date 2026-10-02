@@ -418,8 +418,8 @@ class TestProofStyling:
         block = css[idx:css.find("}", idx)]
         assert "--home-text" in block, \
             "proof input must use the existing text token"
-        assert "255, 45, 45" in block, \
-            "proof input must keep the neon-red language"
+        assert "var(--border-color)" in block, \
+            "proof input must use the shared border (red is danger-only)"
 
     def test_existing_task_selectors_kept(self):
         css = _css()

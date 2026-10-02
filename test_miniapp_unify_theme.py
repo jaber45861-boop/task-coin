@@ -149,11 +149,11 @@ class TestActionButtonsScopedToHome:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. Unified dark / red-neon theme on Tasks & Account
+# 2. Unified Dark Premium theme on Tasks & Account
 # ══════════════════════════════════════════════════════════════════
 
 class TestUnifiedTheme:
-    """Tasks & Account share Home's dark/black + red-neon theme."""
+    """Tasks & Account share Home's Dark Premium theme."""
 
     def test_tasks_page_dark_background(self):
         block = _rule_block(".page-tasks,\n.page-profile")
@@ -166,21 +166,25 @@ class TestUnifiedTheme:
         assert ".page-profile" in block, \
             "Account page must be part of the shared dark rule"
 
-    def test_tasks_cards_have_neon_border_and_glow(self):
+    def test_tasks_cards_have_premium_border_and_elevation(self):
         block = _rule_block(".page-tasks .page-content")
         assert block, "Missing .page-tasks .page-content rule"
-        assert "neon-red-border" in block, \
-            "Tasks cards must use the red neon border"
-        assert "box-shadow" in block and "neon-red-glow" in block, \
-            "Tasks cards must glow like Home cards"
+        assert "var(--border-color)" in block, \
+            "Tasks cards must use the shared Border #243447"
+        assert "box-shadow" in block, \
+            "Tasks cards must keep the Home elevation"
+        assert "neon-red" not in block, \
+            "red must never be a default card border (danger only)"
 
-    def test_profile_cards_have_neon_border_and_glow(self):
+    def test_profile_cards_have_premium_border_and_elevation(self):
         block = _rule_block(".page-profile .page-content")
         assert block, "Missing .page-profile .page-content rule"
-        assert "neon-red-border" in block, \
-            "Account cards must use the red neon border"
-        assert "box-shadow" in block and "neon-red-glow" in block, \
-            "Account cards must glow like Home cards"
+        assert "var(--border-color)" in block, \
+            "Account cards must use the shared Border #243447"
+        assert "box-shadow" in block, \
+            "Account cards must keep the Home elevation"
+        assert "neon-red" not in block, \
+            "red must never be a default card border (danger only)"
 
     def test_cards_share_home_shape(self):
         """Same border-radius (14px) as Home cards."""
@@ -197,30 +201,30 @@ class TestUnifiedTheme:
         assert "--home-text-secondary" in block, \
             "Placeholder text must use the Home secondary text colour"
 
-    def test_red_active_nav_light_theme(self):
+    def test_primary_active_nav_root_theme(self):
         css = _css()
         root = css[css.find(":root"):]
         root = root[:root.find("}")]
-        assert "--nav-active-color: #ff2d2d" in root, \
-            "Active navigation state must be red (light theme)"
+        assert "--nav-active-color: #38BDF8" in root, \
+            "Active navigation state must be Primary #38BDF8"
 
-    def test_red_active_nav_dark_theme(self):
+    def test_primary_active_nav_dark_theme(self):
         css = _css()
         idx = css.find("body.dark")
         assert idx >= 0, "Dark mode block missing"
         block = css[idx:css.find("}", idx)]
-        assert "--nav-active-color: #ff2d2d" in block, \
-            "Active navigation state must be red (dark theme)"
+        assert "--nav-active-color: #38BDF8" in block, \
+            "Active navigation state must be Primary #38BDF8 (dark theme)"
 
     def test_action_button_colors_retained(self):
         """Unification must not drop the red/green action gradients
         (now living on the Wallet page buttons)."""
         css = _css()
         w = css[css.find(".wallet-action-withdraw"):]
-        assert "#ff5252" in w[:400] and "#d50000" in w[:400], \
+        assert "#EF4444" in w[:400] and "#DC2626" in w[:400], \
             "Withdraw must stay RED"
         c = css[css.find(".wallet-action-deposit"):]
-        assert "#4dff9f" in c[:400] and "#009e4f" in c[:400], \
+        assert "#22C55E" in c[:400] and "#16A34A" in c[:400], \
             "Deposit must stay GREEN"
 
 

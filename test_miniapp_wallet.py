@@ -389,27 +389,28 @@ class TestResponsiveAndTheme:
             "Profile text must ellipsize on narrow screens"
 
     def test_theme_consistent(self):
-        """(21) Wallet page reuses the dark/neon system."""
+        """(21) Wallet page reuses the Dark Premium system."""
         css = _css()
         # dark page background
         page_wallet = css[css.find(".page-wallet"):]
         page_wallet = page_wallet[:page_wallet.find("}") + 1]
         assert "var(--home-bg)" in page_wallet, \
             "Wallet page must use the shared dark background"
-        # red neon card
+        # hero balance card: primary-tinted edge + deeper elevation
         balance = css[css.find(".wallet-balance-card"):]
         balance = balance[:balance.find("}") + 1]
-        assert "neon-red-border" in balance, "Balance card must use neon border"
-        assert "box-shadow" in balance and "neon-red-glow" in balance, \
-            "Balance card must glow like Home cards"
+        assert "rgba(56, 189, 248" in balance, \
+            "Balance card must carry the primary-tinted edge"
+        assert "box-shadow" in balance, \
+            "Balance card must keep the hero elevation"
         # wallet button ring matches the avatar ring language
         button = css[css.find(".wallet-button"):]
         button = button[:button.find("}") + 1]
-        assert "var(--neon-red)" in button, \
-            "Wallet button must keep the neon red ring"
-        # green accent + gold EGP display exist
-        assert "--neon-green" in css
-        assert "--home-gold" in css
+        assert "var(--accent-color)" in button, \
+            "Wallet button must keep the primary ring"
+        # success accent + gold EGP display exist
+        assert "--success-color" in css
+        assert "--gold-color" in css
 
 
 # ══════════════════════════════════════════════════════════════════════

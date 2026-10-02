@@ -620,10 +620,12 @@ class TestProfileSummaryTelegramIntegration:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 14. Home Dark/Black theme with Red neon accents
+# 14. Home Dark Premium palette (background #0B1118, primary #38BDF8)
 # ══════════════════════════════════════════════════════════════════
-class TestHomeDarkNeonTheme:
-    """Verify the Home UI uses a dark/black background with red neon accents."""
+class TestHomeDarkPremiumTheme:
+    """Verify the Home UI uses the Dark Premium palette: dark
+    background, shared card borders, primary accents — red reserved
+    for danger/error only."""
 
     def _home_theme(self) -> str:
         """Return the Home-theme portion of the stylesheet."""
@@ -631,11 +633,11 @@ class TestHomeDarkNeonTheme:
         idx = css.find(".page-home")
         return css[idx:] if idx >= 0 else ""
 
-    def test_home_bg_variable_is_black(self):
-        """Home background variable must be a near-black colour."""
+    def test_home_bg_variable_is_dark_premium_background(self):
+        """Home background variable must be the Premium #0B1118."""
         css = _css()
-        assert re.search(r"--home-bg:\s*#0a0a0a", css), \
-            "--home-bg must be #0a0a0a (dark/black)"
+        assert re.search(r"--home-bg:\s*#0B1118", css), \
+            "--home-bg must be #0B1118 (Dark Premium background)"
 
     def test_page_home_uses_dark_background(self):
         """.page-home must paint the dark background."""
@@ -644,30 +646,55 @@ class TestHomeDarkNeonTheme:
         assert "background-color: var(--home-bg)" in theme, \
             ".page-home should use the dark --home-bg background"
 
-    def test_red_neon_variables_defined(self):
-        """Red neon accent variables must be defined."""
+    def test_palette_variables_defined(self):
+        """The Dark Premium palette (and its legacy aliases) must be
+        defined."""
         css = _css()
-        assert "--neon-red" in css, "CSS must define --neon-red accent"
-        assert "--neon-red-glow" in css, "CSS must define --neon-red-glow"
+        for token in ("--bg-color: #0B1118", "--card-color: #111923",
+                      "--accent-color: #38BDF8", "--danger-color: #EF4444",
+                      "--success-color: #22C55E", "--gold-color: #F5C451",
+                      "--neon-red", "--neon-red-glow"):
+            assert token in css, f"CSS must define {token}"
 
-    def test_home_cards_have_neon_border_and_glow(self):
-        """Home cards must have a red neon border + glow shadow."""
+    def test_home_cards_have_premium_border_and_elevation(self):
+        """Home cards use the shared Border #243447 + soft elevation.
+        Red is NEVER a default card border (danger/error only)."""
         theme = self._home_theme()
         idx = theme.find(".page-home .welcome-card")
         assert idx >= 0, "Home cards must be styled within .page-home"
         block = theme[idx:idx + 500]
-        assert "neon-red-border" in block, \
-            "Home cards should use the red neon border"
-        assert "box-shadow" in block and "neon-red-glow" in block, \
-            "Home cards should glow with red neon shadow"
+        assert "var(--border-color)" in block, \
+            "Home cards should use the shared Border #243447"
+        assert "box-shadow" in block, \
+            "Home cards should keep an elevation shadow"
+        assert "neon-red" not in block and "rgba(255, 45, 45" not in block, \
+            "red must never be a default card border"
 
-    def test_home_section_icons_are_red(self):
-        """Section icons inside Home should be red neon."""
+    def test_hero_card_reads_stronger_than_secondary_cards(self):
+        """The welcome (hero) card carries a primary-tinted edge and a
+        deeper lift than the secondary cards — colour/shadow only,
+        layout untouched."""
+        css = _css()
+        idx = css.rfind(".page-home .welcome-card")
+        assert idx >= 0, "hero rule for .page-home .welcome-card missing"
+        hero = css[idx:css.find("}", idx)]
+        assert "rgba(56, 189, 248" in hero, \
+            "Hero card must carry the primary-tinted border/glow"
+        assert "box-shadow" in hero, "Hero card must keep a deeper lift"
+        # The secondary cards keep the plain shared border.
+        grouped = css.find(".page-home .welcome-card,\n.page-home .balance-card")
+        assert grouped >= 0
+        secondary = css[grouped:css.find("}", grouped)]
+        assert "var(--border-color)" in secondary, \
+            "Secondary cards must stay on the plain shared border"
+
+    def test_home_section_icons_use_primary(self):
+        """Section icons inside Home use the Primary accent."""
         theme = self._home_theme()
         idx = theme.find(".page-home .section-icon")
         assert idx >= 0, ".page-home .section-icon must exist"
         nearby = theme[idx:idx + 200]
-        assert "--neon-red" in nearby
+        assert "--accent-color" in nearby
 
     def test_theme_scoped_to_the_three_pages(self):
         """Dark theme may only target Home/Tasks/Account (+ theme vars).
@@ -700,7 +727,7 @@ class TestWalletActionButtonsTheme:
         block = css[idx:idx + 400]
         assert "linear-gradient" in block, \
             "Withdraw button should use a gradient fill"
-        assert "#ff5252" in block and "#d50000" in block, \
+        assert "#EF4444" in block and "#DC2626" in block, \
             "Withdraw button must be RED"
 
     def test_deposit_button_is_green(self):
@@ -711,7 +738,7 @@ class TestWalletActionButtonsTheme:
         block = css[idx:idx + 400]
         assert "linear-gradient" in block, \
             "Deposit button should use a gradient fill"
-        assert "#4dff9f" in block and "#009e4f" in block, \
+        assert "#22C55E" in block and "#16A34A" in block, \
             "Deposit button must be GREEN"
 
     def test_withdraw_button_has_up_arrow(self):

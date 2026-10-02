@@ -351,8 +351,8 @@ class TestTasksStyling:
         block = block[:block.find("}")]
         assert "--home-card-inner-bg" in block, \
             "task cards must use the existing dark card token"
-        assert "--neon-red" in block or "rgba(255, 45, 45" in block, \
-            "task cards must keep the neon-red language"
+        assert "var(--border-color)" in block, \
+            "task cards must use the shared Border #243447 (red is danger-only)"
 
     def test_existing_theme_rules_untouched(self):
         css = _css()

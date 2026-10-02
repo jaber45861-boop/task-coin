@@ -1,34 +1,53 @@
 /* Task Coin Mini App Styles */
 
-/* CSS Variables - Telegram Theme Integration */
+/* CSS Variables — Dark Premium palette
+   ═══════════════════════════════════════════════════════════
+   Background  #0B1118   Card            #111923
+   Card 2nd    #16212C   Border          #243447
+   Primary     #38BDF8   Primary Dark    #0EA5E9
+   Success     #22C55E   Gold            #F5C451
+   Warning     #F59E0B   Danger          #EF4444
+   Text        #F8FAFC   Text Secondary  #94A3B8
+   Text Muted  #64748B
+   Danger red (#EF4444) is reserved for error/destructive states —
+   never a default card border. */
 :root {
-    --bg-color: #ffffff;
-    --bg-secondary: #f5f5f5;
-    --text-color: #000000;
-    --text-secondary: #666666;
-    --border-color: #e0e0e0;
-    --accent-color: #0088cc;
-    --header-bg: #ffffff;
-    --nav-bg: #ffffff;
-    --nav-active-color: #ff2d2d;
-    --nav-inactive-color: #888888;
+    --bg-color: #0B1118;
+    --card-color: #111923;
+    --bg-secondary: #16212C;
+    --border-color: #243447;
+    --accent-color: #38BDF8;
+    --accent-dark: #0EA5E9;
+    --success-color: #22C55E;
+    --gold-color: #F5C451;
+    --warning-color: #F59E0B;
+    --danger-color: #EF4444;
+    --text-color: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --text-muted: #64748B;
+    --header-bg: #0B1118;
+    --nav-bg: #0B1118;
+    --nav-active-color: #38BDF8;
+    --nav-inactive-color: #64748B;
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
     --header-height: 56px;
     --nav-height: 60px;
 }
 
-/* Dark Mode Support */
+/* Dark Mode Support — same premium values (Telegram theme toggle). */
 body.dark {
-    --bg-color: #1a1a1a;
-    --bg-secondary: #2a2a2a;
-    --text-color: #ffffff;
-    --text-secondary: #aaaaaa;
-    --border-color: #3a3a3a;
-    --header-bg: #1a1a1a;
-    --nav-bg: #1a1a1a;
-    --nav-active-color: #ff2d2d;
-    --nav-inactive-color: #888888;
+    --bg-color: #0B1118;
+    --card-color: #111923;
+    --bg-secondary: #16212C;
+    --border-color: #243447;
+    --text-color: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --text-muted: #64748B;
+    --header-bg: #0B1118;
+    --nav-bg: #0B1118;
+    --nav-active-color: #38BDF8;
+    --nav-inactive-color: #64748B;
 }
 
 /* Reset & Base */
@@ -90,7 +109,7 @@ body {
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    background-color: var(--bg-secondary);
+    background-color: var(--bg-color);
 }
 
 /* Page Styles */
@@ -110,7 +129,7 @@ body {
 }
 
 .page-content {
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     border-radius: 12px;
     padding: 20px;
     min-height: 200px;
@@ -235,7 +254,7 @@ body {
     align-items: center;
     gap: 14px;
     padding: 16px;
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     border-radius: 14px;
 }
 
@@ -294,7 +313,7 @@ body {
 /* Balance / Reward Summary */
 .balance-card {
     padding: 16px;
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     border-radius: 14px;
 }
 
@@ -333,7 +352,7 @@ body {
 /* Generic section card */
 .section-card {
     padding: 16px;
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     border-radius: 14px;
 }
 
@@ -386,7 +405,7 @@ body {
     border: none;
     border-radius: 12px;
     background-color: var(--accent-color);
-    color: #ffffff;
+    color: var(--bg-color);
     font-size: 16px;
     font-weight: 600;
     cursor: pointer;
@@ -405,9 +424,10 @@ body {
 }
 
 .add-task-cta:disabled {
-    opacity: 0.5;
+    opacity: 0.7;
     cursor: not-allowed;
-    background-color: var(--text-secondary);
+    background-color: var(--text-muted);
+    color: var(--bg-color);
 }
 
 .add-task-cta:disabled:active {
@@ -431,22 +451,25 @@ body {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   Home UI Theme — Dark/Black background with Red neon accents
-   Scoped to .page-home only — other pages stay unchanged.
+   Home UI Theme — Dark Premium (background #0B1118, cards #111923,
+   primary sky #38BDF8). Scoped to .page-home only.
    ══════════════════════════════════════════════════════════════ */
 
 :root {
-    --home-bg: #0a0a0a;
-    --home-card-bg: #141414;
-    --home-card-inner-bg: #1d1d1d;
-    --home-text: #f2f2f2;
-    --home-text-secondary: #9a9a9a;
-    --neon-red: #ff2d2d;
-    --neon-red-border: rgba(255, 45, 45, 0.55);
-    --neon-red-glow: rgba(255, 45, 45, 0.35);
-    --neon-green: #00e676;
-    --neon-green-glow: rgba(0, 230, 118, 0.40);
-    --home-gold: #ffd166;
+    /* Legacy aliases → Dark Premium palette. Kept so older rules
+       (and the guards that watch them) keep a single source of
+       truth: every value below IS the palette value. */
+    --home-bg: #0B1118;
+    --home-card-bg: #111923;
+    --home-card-inner-bg: #16212C;
+    --home-text: #F8FAFC;
+    --home-text-secondary: #94A3B8;
+    /* Danger red — error/destructive states ONLY. */
+    --neon-red: #EF4444;
+    --neon-red-glow: rgba(239, 68, 68, 0.35);
+    --neon-green: #22C55E;
+    --neon-green-glow: rgba(34, 197, 94, 0.40);
+    --home-gold: #F5C451;
 }
 
 /* Home page background — dark/black */
@@ -455,35 +478,47 @@ body {
     color: var(--home-text);
 }
 
-/* Home cards — near-black with red neon outline + glow */
+/* Home cards — Card #111923 with the shared Border #243447 and a
+   soft elevation. Red is never a card border (danger-only rule). */
 .page-home .welcome-card,
 .page-home .balance-card,
 .page-home .section-card {
     background-color: var(--home-card-bg);
-    border: 1px solid var(--neon-red-border);
-    box-shadow: 0 0 10px var(--neon-red-glow), inset 0 0 8px rgba(255, 45, 45, 0.05);
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
 }
 
-/* Inner tiles — dark with subtle red tint */
+/* Hero card — the welcome/profile card at the top of Home reads
+   clearly stronger than the secondary cards: primary-tinted edge,
+   deeper lift and a subtle top sheen. Colour/shadow only — the
+   layout (padding, gaps, structure) is untouched. */
+.page-home .welcome-card {
+    background: linear-gradient(165deg, #16212C 0%, #111923 62%);
+    border-color: rgba(56, 189, 248, 0.45);
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45),
+                0 0 18px rgba(56, 189, 248, 0.12);
+}
+
+/* Inner tiles — Card Secondary #16212C on the shared border */
 .page-home .balance-item,
 .page-home .add-task-body,
 .page-home .account-linking-body,
 .page-home .hot-tasks-body {
     background-color: var(--home-card-inner-bg);
-    border: 1px solid rgba(255, 45, 45, 0.22);
+    border: 1px solid var(--border-color);
 }
 
 .page-home .checkin-body,
 .page-home .guide-body {
-    background-color: rgba(255, 45, 45, 0.07);
-    border: 1px solid rgba(255, 45, 45, 0.35);
+    background-color: rgba(56, 189, 248, 0.07);
+    border: 1px solid rgba(56, 189, 248, 0.30);
 }
 
-/* Avatar ring — red neon */
+/* Avatar ring — primary accent */
 .page-home .welcome-avatar {
     background-color: var(--home-card-inner-bg);
-    border: 2px solid var(--neon-red);
-    box-shadow: 0 0 8px var(--neon-red-glow);
+    border: 2px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.30);
 }
 
 /* Home text colors */
@@ -494,7 +529,7 @@ body {
 }
 
 .page-home .section-icon {
-    color: var(--neon-red);
+    color: var(--accent-color);
 }
 
 .page-home .welcome-username,
@@ -507,38 +542,38 @@ body {
     color: var(--home-text-secondary);
 }
 
-/* Level badge — green pill (matches reference) */
+/* Level badge — Success green pill (matches reference) */
 .page-home .welcome-level {
     align-self: flex-start;
-    color: var(--neon-green);
-    background-color: rgba(0, 230, 118, 0.10);
-    border: 1px solid rgba(0, 230, 118, 0.45);
+    color: var(--success-color);
+    background-color: rgba(34, 197, 94, 0.10);
+    border: 1px solid rgba(34, 197, 94, 0.45);
     border-radius: 999px;
     padding: 4px 10px;
     font-weight: 600;
 }
 
-/* Disabled Add-Task CTA on dark background */
+/* Disabled Add-Task CTA — muted, never danger-red */
 .page-home .add-task-cta:disabled {
-    background-color: #242424;
-    color: #7a7a7a;
-    border: 1px solid rgba(255, 45, 45, 0.25);
+    background-color: var(--bg-secondary);
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
     opacity: 1;
 }
 
 /* ── Action buttons ──────────────────────────────────────────
-   Withdraw (السحب) = RED with up arrow /
-   Deposit (الإيداع) = GREEN with down arrow */
+   Withdraw (السحب) = Danger red gradient / up arrow
+   Deposit (الإيداع) = Success green gradient / down arrow */
 .wallet-action-withdraw {
-    background: linear-gradient(180deg, #ff5252 0%, #d50000 100%);
-    color: #ffffff;
-    box-shadow: 0 0 12px rgba(255, 45, 45, 0.55);
+    background: linear-gradient(180deg, #EF4444 0%, #DC2626 100%);
+    color: var(--bg-color);
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.45);
 }
 
 .wallet-action-deposit {
-    background: linear-gradient(180deg, #4dff9f 0%, #009e4f 100%);
-    color: #ffffff;
-    box-shadow: 0 0 12px var(--neon-green-glow);
+    background: linear-gradient(180deg, #22C55E 0%, #16A34A 100%);
+    color: var(--bg-color);
+    box-shadow: 0 0 12px rgba(34, 197, 94, 0.40);
 }
 
 .btn-arrow {
@@ -580,12 +615,12 @@ body[data-page="profile"] .app-content {
     color: var(--home-text);
 }
 
-/* Cards — same neon border + glow as Home */
+/* Cards — Card #111923, shared Border #243447, soft elevation */
 .page-tasks .page-content,
 .page-profile .page-content {
     background-color: var(--home-card-bg);
-    border: 1px solid var(--neon-red-border);
-    box-shadow: 0 0 10px var(--neon-red-glow), inset 0 0 8px rgba(255, 45, 45, 0.05);
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
     border-radius: 14px;
 }
 
@@ -596,7 +631,7 @@ body[data-page="profile"] .app-content {
 
 /* ══════════════════════════════════════════════════════════════
    MT-UI-03 — Wallet UI (State B) + Home wallet button (State A)
-   Same black / neon-red / green visual system as Home.
+   Dark Premium system shared with Home (primary ring + palette).
    ══════════════════════════════════════════════════════════════ */
 
 /* ── Home: circular wallet button beside the profile ──────────── */
@@ -606,9 +641,9 @@ body[data-page="profile"] .app-content {
     flex-shrink: 0;
     padding: 0;
     border-radius: 50%;
-    background-color: #0d0d0d;
-    border: 2px solid var(--neon-red);
-    box-shadow: 0 0 10px var(--neon-red-glow);
+    background-color: var(--card-color);
+    border: 2px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.30);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -621,11 +656,11 @@ body[data-page="profile"] .app-content {
 
 .wallet-button:active {
     transform: scale(0.94);
-    box-shadow: 0 0 16px rgba(255, 45, 45, 0.6);
+    box-shadow: 0 0 16px rgba(56, 189, 248, 0.45);
 }
 
 .wallet-button:focus-visible {
-    outline: 2px solid #ffffff;
+    outline: 2px solid var(--text-color);
     outline-offset: 2px;
 }
 
@@ -657,8 +692,8 @@ body[data-page="profile"] .app-content {
     gap: 2px;
     margin-top: 2px;
     padding: 6px 10px;
-    background-color: rgba(0, 230, 118, 0.08);
-    border: 1px solid rgba(0, 230, 118, 0.45);
+    background-color: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.45);
     border-radius: 10px;
     min-width: 0;
 }
@@ -675,7 +710,7 @@ body[data-page="profile"] .app-content {
 .welcome-balance-egp {
     font-size: 12px;
     font-weight: 600;
-    color: var(--home-gold);
+    color: var(--gold-color);
     direction: ltr;
     unicode-bidi: isolate;
     white-space: nowrap;
@@ -722,12 +757,12 @@ body[data-page="profile"] .app-content {
 }
 
 .wallet-back:active {
-    background-color: rgba(255, 45, 45, 0.18);
+    background-color: rgba(56, 189, 248, 0.15);
     transform: scale(0.94);
 }
 
 .wallet-back:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -755,11 +790,11 @@ body[data-page="profile"] .app-content {
     gap: 6px;
     margin-bottom: 16px;
     padding: 22px 14px;
-    background-color: var(--home-card-bg);
-    border: 1px solid var(--neon-red-border);
+    background: linear-gradient(165deg, #16212C 0%, #111923 62%);
+    border: 1px solid rgba(56, 189, 248, 0.35);
     border-radius: 16px;
-    box-shadow: 0 0 14px var(--neon-red-glow),
-                inset 0 0 10px rgba(255, 45, 45, 0.05);
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45),
+                0 0 18px rgba(56, 189, 248, 0.10);
 }
 
 .wallet-balance-title {
@@ -779,21 +814,21 @@ body[data-page="profile"] .app-content {
 .wallet-balance-value {
     font-size: 30px;
     font-weight: 800;
-    color: #ffffff;
+    color: var(--text-color);
     letter-spacing: 0.5px;
 }
 
 .wallet-balance-currency {
     font-size: 22px;
     font-weight: 800;
-    color: var(--neon-green);
+    color: var(--success-color);
 }
 
 .wallet-balance-egp {
     direction: ltr;
     font-size: 17px;
     font-weight: 700;
-    color: var(--home-gold);
+    color: var(--gold-color);
 }
 
 /* ── Withdraw / Deposit actions ───────────────────────────────── */
@@ -823,7 +858,7 @@ body[data-page="profile"] .app-content {
     align-items: center;
     justify-content: center;
     gap: 4px;
-    color: #ffffff;
+    color: var(--bg-color);
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     transition: transform 0.1s, filter 0.2s;
@@ -847,7 +882,7 @@ body[data-page="profile"] .app-content {
 }
 
 .wallet-action:focus-visible {
-    outline: 2px solid #ffffff;
+    outline: 2px solid var(--text-color);
     outline-offset: 2px;
 }
 
@@ -861,10 +896,9 @@ body[data-page="profile"] .app-content {
 .wallet-history {
     padding: 16px;
     background-color: var(--home-card-bg);
-    border: 1px solid var(--neon-red-border);
+    border: 1px solid var(--border-color);
     border-radius: 16px;
-    box-shadow: 0 0 14px var(--neon-red-glow),
-                inset 0 0 10px rgba(255, 45, 45, 0.05);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
 }
 
 .wallet-history-header {
@@ -886,9 +920,9 @@ body[data-page="profile"] .app-content {
     text-align: center;
     padding: 24px 12px;
     font-size: 14px;
-    color: var(--home-text-secondary);
-    background-color: rgba(255, 45, 45, 0.05);
-    border: 1px dashed rgba(255, 45, 45, 0.3);
+    color: var(--text-secondary);
+    background-color: rgba(148, 163, 184, 0.05);
+    border: 1px dashed rgba(148, 163, 184, 0.30);
     border-radius: 12px;
 }
 
@@ -901,7 +935,7 @@ body[data-page="profile"] .app-content {
     gap: 10px;
     padding: 10px 14px;
     background-color: var(--home-card-inner-bg);
-    border: 1px solid rgba(255, 45, 45, 0.3);
+    border: 1px solid var(--border-color);
     border-radius: 12px;
     color: var(--home-text);
     font-size: 15px;
@@ -913,11 +947,11 @@ body[data-page="profile"] .app-content {
 
 .wallet-history-more:active {
     transform: scale(0.98);
-    box-shadow: 0 0 10px var(--neon-red-glow);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.30);
 }
 
 .wallet-history-more:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -946,7 +980,7 @@ body[data-page="profile"] .app-content {
     gap: 10px;
     padding: 10px 12px;
     background-color: var(--home-card-inner-bg);
-    border: 1px solid rgba(255, 45, 45, 0.22);
+    border: 1px solid var(--border-color);
     border-radius: 12px;
 }
 
@@ -958,7 +992,7 @@ body[data-page="profile"] .app-content {
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    color: #ffffff;
+    color: var(--bg-color);
     font-size: 15px;
 }
 
@@ -969,13 +1003,13 @@ body[data-page="profile"] .app-content {
 }
 
 .wallet-tx-icon--withdraw {
-    background: linear-gradient(180deg, #ff5252 0%, #d50000 100%);
-    box-shadow: 0 0 8px rgba(255, 45, 45, 0.5);
+    background: linear-gradient(180deg, #EF4444 0%, #DC2626 100%);
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.40);
 }
 
 .wallet-tx-icon--deposit {
-    background: linear-gradient(180deg, #4dff9f 0%, #009e4f 100%);
-    box-shadow: 0 0 8px var(--neon-green-glow);
+    background: linear-gradient(180deg, #22C55E 0%, #16A34A 100%);
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.40);
 }
 
 .wallet-tx-info {
@@ -1012,17 +1046,17 @@ body[data-page="profile"] .app-content {
 }
 
 .wallet-tx-amount--withdraw {
-    color: #ff6b6b;
+    color: var(--danger-color);
 }
 
 .wallet-tx-amount--deposit {
-    color: var(--neon-green);
+    color: var(--success-color);
 }
 
 .wallet-tx-status {
     font-size: 12px;
     font-weight: 600;
-    color: var(--neon-green);
+    color: var(--success-color);
 }
 
 .wallet-tx-chevron {
@@ -1038,7 +1072,7 @@ body[data-page="profile"] .app-content {
 }
 
 /* ── Account linking: YouTube (SA-YT-01) ─────────────────────────────
-   Same black / neon-red / green visual system as Home. */
+   Dark Premium palette system shared with Home. */
 
 .account-linking-body {
     flex-direction: column;
@@ -1069,7 +1103,7 @@ body[data-page="profile"] .app-content {
 }
 
 .social-account-state.is-linked {
-    color: var(--neon-green);
+    color: var(--success-color);
     font-weight: 700;
 }
 
@@ -1078,9 +1112,9 @@ body[data-page="profile"] .app-content {
     min-height: 40px;
     padding: 8px 14px;
     border-radius: 10px;
-    background-color: #0d0d0d;
-    border: 1px solid var(--neon-red);
-    box-shadow: 0 0 10px var(--neon-red-glow);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
     color: var(--text-color);
     font-size: 13px;
     font-weight: 700;
@@ -1090,7 +1124,7 @@ body[data-page="profile"] .app-content {
 }
 
 .social-connect-btn:hover {
-    box-shadow: 0 0 14px rgba(255, 45, 45, 0.55);
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.45);
 }
 
 .social-connect-btn:active {
@@ -1098,7 +1132,7 @@ body[data-page="profile"] .app-content {
 }
 
 .social-connect-btn:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1113,7 +1147,7 @@ body[data-page="profile"] .app-content {
 
 /* ══════════════════════════════════════════════════════════════
    MT-TASK-03 — Tasks page (real API data)
-   Same black / neon-red / gold visual system as Home & Wallet.
+   Dark Premium palette shared with Home & Wallet.
    ══════════════════════════════════════════════════════════════ */
 
 /* ── Loading / empty / error states ──────────────────────────── */
@@ -1126,7 +1160,7 @@ body[data-page="profile"] .app-content {
 
 .tasks-error-text {
     display: block;
-    color: #ff8a80;
+    color: var(--danger-color);
     margin-bottom: 14px;
     line-height: 1.7;
 }
@@ -1135,10 +1169,10 @@ body[data-page="profile"] .app-content {
     min-height: 40px;
     padding: 8px 18px;
     border-radius: 10px;
-    background-color: #0d0d0d;
-    border: 1px solid var(--neon-red);
-    box-shadow: 0 0 10px var(--neon-red-glow);
-    color: var(--home-text);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+    color: var(--text-color);
     font-size: 13px;
     font-weight: 700;
     cursor: pointer;
@@ -1151,7 +1185,7 @@ body[data-page="profile"] .app-content {
 }
 
 .tasks-retry-btn:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1165,15 +1199,15 @@ body[data-page="profile"] .app-content {
 }
 
 .tasks-notice-error {
-    background-color: rgba(255, 45, 45, 0.10);
-    border: 1px solid var(--neon-red-border);
-    color: #ff8a80;
+    background-color: rgba(239, 68, 68, 0.10);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: var(--danger-color);
 }
 
 .tasks-notice-success {
-    background-color: rgba(0, 230, 118, 0.08);
-    border: 1px solid rgba(0, 230, 118, 0.45);
-    color: var(--neon-green);
+    background-color: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.45);
+    color: var(--success-color);
 }
 
 /* ── Task list & cards ───────────────────────────────────────── */
@@ -1185,7 +1219,7 @@ body[data-page="profile"] .app-content {
 
 .task-card {
     background-color: var(--home-card-inner-bg);
-    border: 1px solid rgba(255, 45, 45, 0.22);
+    border: 1px solid var(--border-color);
     border-radius: 14px;
     padding: 14px;
 }
@@ -1214,21 +1248,21 @@ body[data-page="profile"] .app-content {
 }
 
 .task-status-available {
-    color: var(--home-gold);
-    background-color: rgba(255, 209, 102, 0.10);
-    border: 1px solid rgba(255, 209, 102, 0.45);
+    color: var(--gold-color);
+    background-color: rgba(245, 196, 81, 0.10);
+    border: 1px solid rgba(245, 196, 81, 0.45);
 }
 
 .task-status-started {
-    color: var(--neon-red);
-    background-color: rgba(255, 45, 45, 0.10);
-    border: 1px solid var(--neon-red-border);
+    color: var(--accent-color);
+    background-color: rgba(56, 189, 248, 0.10);
+    border: 1px solid rgba(56, 189, 248, 0.35);
 }
 
 .task-status-completed {
-    color: var(--neon-green);
-    background-color: rgba(0, 230, 118, 0.10);
-    border: 1px solid rgba(0, 230, 118, 0.45);
+    color: var(--success-color);
+    background-color: rgba(34, 197, 94, 0.10);
+    border: 1px solid rgba(34, 197, 94, 0.45);
 }
 
 .task-description {
@@ -1249,9 +1283,9 @@ body[data-page="profile"] .app-content {
 
 .task-type-badge {
     font-size: 12px;
-    color: var(--home-text-secondary);
-    background-color: rgba(255, 45, 45, 0.07);
-    border: 1px solid rgba(255, 45, 45, 0.35);
+    color: var(--text-secondary);
+    background-color: rgba(56, 189, 248, 0.07);
+    border: 1px solid rgba(56, 189, 248, 0.22);
     border-radius: 999px;
     padding: 3px 10px;
 }
@@ -1259,7 +1293,7 @@ body[data-page="profile"] .app-content {
 .task-reward {
     font-size: 13px;
     font-weight: 700;
-    color: var(--home-gold);
+    color: var(--gold-color);
 }
 
 /* ── Card actions ────────────────────────────────────────────── */
@@ -1275,9 +1309,9 @@ body[data-page="profile"] .app-content {
     min-height: 40px;
     padding: 8px 14px;
     border-radius: 10px;
-    background-color: #0d0d0d;
-    border: 1px solid var(--neon-red);
-    box-shadow: 0 0 10px var(--neon-red-glow);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
     color: var(--home-text);
     font-size: 13px;
     font-weight: 700;
@@ -1292,7 +1326,7 @@ body[data-page="profile"] .app-content {
 }
 
 .task-action-btn:hover {
-    box-shadow: 0 0 14px rgba(255, 45, 45, 0.55);
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.45);
 }
 
 .task-action-btn:active {
@@ -1300,7 +1334,7 @@ body[data-page="profile"] .app-content {
 }
 
 .task-action-btn:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1310,7 +1344,7 @@ body[data-page="profile"] .app-content {
 }
 
 .task-join-btn {
-    border-color: var(--home-text-secondary);
+    border-color: var(--text-muted);
     box-shadow: none;
 }
 
@@ -1321,9 +1355,9 @@ body[data-page="profile"] .app-content {
     align-items: center;
     justify-content: center;
     border-radius: 10px;
-    background-color: rgba(0, 230, 118, 0.08);
-    border: 1px solid rgba(0, 230, 118, 0.45);
-    color: var(--neon-green);
+    background-color: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.45);
+    color: var(--success-color);
     font-size: 13px;
     font-weight: 700;
 }
@@ -1334,18 +1368,18 @@ body[data-page="profile"] .app-content {
     min-height: 40px;
     padding: 8px 12px;
     border-radius: 10px;
-    background-color: #0d0d0d;
-    border: 1px solid rgba(255, 45, 45, 0.35);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
     color: var(--home-text);
     font-size: 13px;
 }
 
 .task-proof-input::placeholder {
-    color: var(--home-text-secondary);
+    color: var(--text-secondary);
 }
 
 .task-proof-input:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1359,10 +1393,10 @@ body[data-page="profile"] .app-content {
     margin-top: 14px;
     padding: 10px 14px;
     border-radius: 10px;
-    background-color: #0d0d0d;
-    border: 1px solid var(--neon-red);
-    box-shadow: 0 0 10px var(--neon-red-glow);
-    color: var(--home-text);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+    color: var(--text-color);
     font-size: 14px;
     font-weight: 700;
     cursor: pointer;
@@ -1371,7 +1405,7 @@ body[data-page="profile"] .app-content {
 }
 
 .review-entry:hover {
-    box-shadow: 0 0 14px rgba(255, 45, 45, 0.55);
+    box-shadow: 0 0 14px rgba(56, 189, 248, 0.45);
 }
 
 .review-entry:active {
@@ -1379,7 +1413,7 @@ body[data-page="profile"] .app-content {
 }
 
 .review-entry:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1391,7 +1425,7 @@ body[data-page="profile"] .app-content {
 
 .review-task {
     background-color: var(--home-card-inner-bg);
-    border: 1px solid rgba(255, 45, 45, 0.22);
+    border: 1px solid var(--border-color);
     border-radius: 14px;
     padding: 14px;
 }
@@ -1417,15 +1451,15 @@ body[data-page="profile"] .app-content {
     font-weight: 600;
     border-radius: 999px;
     padding: 3px 10px;
-    color: var(--home-gold);
-    background-color: rgba(255, 209, 102, 0.10);
-    border: 1px solid rgba(255, 209, 102, 0.45);
+    color: var(--gold-color);
+    background-color: rgba(245, 196, 81, 0.10);
+    border: 1px solid rgba(245, 196, 81, 0.45);
 }
 
 .review-claim {
     border-radius: 10px;
-    border: 1px solid rgba(255, 45, 45, 0.35);
-    background-color: rgba(255, 45, 45, 0.05);
+    border: 1px solid var(--border-color);
+    background-color: rgba(148, 163, 184, 0.05);
     padding: 10px 12px;
 }
 
@@ -1447,8 +1481,8 @@ body[data-page="profile"] .app-content {
     padding: 8px 10px;
     margin-bottom: 10px;
     border-radius: 8px;
-    background-color: #0d0d0d;
-    border: 1px solid rgba(255, 45, 45, 0.25);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
     color: var(--home-text);
     font-size: 13px;
     line-height: 1.7;
@@ -1457,7 +1491,7 @@ body[data-page="profile"] .app-content {
 }
 
 a.review-proof {
-    color: var(--home-gold);
+    color: var(--gold-color);
     text-decoration: underline;
 }
 
@@ -1471,7 +1505,7 @@ a.review-proof {
     min-height: 38px;
     padding: 8px 14px;
     border-radius: 10px;
-    background-color: #0d0d0d;
+    background-color: var(--bg-secondary);
     font-size: 13px;
     font-weight: 700;
     cursor: pointer;
@@ -1484,7 +1518,7 @@ a.review-proof {
 }
 
 .review-action-btn:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }
 
@@ -1494,23 +1528,23 @@ a.review-proof {
 }
 
 .review-approve-btn {
-    border: 1px solid rgba(0, 230, 118, 0.55);
-    color: var(--neon-green);
-    background-color: rgba(0, 230, 118, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.55);
+    color: var(--success-color);
+    background-color: rgba(34, 197, 94, 0.08);
 }
 
 .review-approve-btn:hover {
-    box-shadow: 0 0 10px var(--neon-green-glow);
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.35);
 }
 
 .review-reject-btn {
-    border: 1px solid rgba(255, 45, 45, 0.55);
-    color: var(--neon-red);
-    background-color: rgba(255, 45, 45, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.55);
+    color: var(--danger-color);
+    background-color: rgba(239, 68, 68, 0.08);
 }
 
 .review-reject-btn:hover {
-    box-shadow: 0 0 10px var(--neon-red-glow);
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.35);
 }
 
 /* ── Withdrawal form (MT-ADMIN-25) ───────────────────────────── */
@@ -1534,9 +1568,9 @@ a.review-proof {
     padding: 18px 16px 20px;
     border: 1px solid var(--border-color);
     border-radius: 14px;
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     color: var(--text-color);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
 }
 
 .withdrawal-head {
@@ -1605,8 +1639,8 @@ a.review-proof {
     padding: 12px;
     font-size: 15px;
     font-weight: 700;
-    color: #ffffff;
-    background-color: #e53935;
+    color: var(--bg-color);
+    background-color: var(--accent-color);
     border: none;
     border-radius: 10px;
     cursor: pointer;
@@ -1618,7 +1652,7 @@ a.review-proof {
 }
 
 .withdrawal-submit:focus-visible {
-    outline: 2px solid var(--neon-red);
+    outline: 2px solid var(--accent-dark);
     outline-offset: 2px;
 }
 
@@ -1633,9 +1667,9 @@ a.review-proof {
     margin-bottom: 12px;
     padding: 10px 12px;
     font-size: 13px;
-    color: var(--neon-red);
-    background-color: rgba(255, 45, 45, 0.08);
-    border: 1px solid rgba(255, 45, 45, 0.35);
+    color: var(--danger-color);
+    background-color: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.35);
     border-radius: 10px;
 }
 
@@ -1648,9 +1682,9 @@ a.review-proof {
     padding: 10px 12px;
     font-size: 14px;
     font-weight: 700;
-    color: var(--neon-green);
-    background-color: rgba(0, 230, 118, 0.08);
-    border: 1px solid rgba(0, 230, 118, 0.35);
+    color: var(--success-color);
+    background-color: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.35);
     border-radius: 10px;
     text-align: center;
 }
@@ -1705,9 +1739,9 @@ a.review-proof {
     padding: 18px 16px 20px;
     border: 1px solid var(--border-color);
     border-radius: 14px;
-    background-color: var(--bg-color);
+    background-color: var(--card-color);
     color: var(--text-color);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
 }
 
 .taskreq-head {
@@ -1751,9 +1785,9 @@ a.review-proof {
     margin-bottom: 12px;
     padding: 10px 12px;
     font-size: 13px;
-    color: var(--neon-red);
-    background-color: rgba(255, 45, 45, 0.08);
-    border: 1px solid rgba(255, 45, 45, 0.35);
+    color: var(--danger-color);
+    background-color: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.35);
     border-radius: 10px;
 }
 
@@ -1766,9 +1800,9 @@ a.review-proof {
     padding: 10px 12px;
     font-size: 14px;
     font-weight: 700;
-    color: var(--neon-green);
-    background-color: rgba(0, 230, 118, 0.08);
-    border: 1px solid rgba(0, 230, 118, 0.35);
+    color: var(--success-color);
+    background-color: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.35);
     border-radius: 10px;
     text-align: center;
 }
@@ -1787,22 +1821,22 @@ a.review-proof {
 
 .taskreq-chip-pending {
     color: var(--accent-color);
-    border-color: rgba(0, 200, 255, 0.35);
+    border-color: rgba(56, 189, 248, 0.35);
 }
 
 .taskreq-chip-approved {
-    color: var(--neon-green);
-    border-color: rgba(0, 230, 118, 0.35);
+    color: var(--success-color);
+    border-color: rgba(34, 197, 94, 0.35);
 }
 
 .taskreq-chip-rejected {
-    color: var(--neon-red);
-    border-color: rgba(255, 45, 45, 0.35);
+    color: var(--danger-color);
+    border-color: rgba(239, 68, 68, 0.35);
 }
 
 .taskreq-chip-changes_requested {
-    color: #ffb300;
-    border-color: rgba(255, 179, 0, 0.35);
+    color: var(--warning-color);
+    border-color: rgba(245, 158, 11, 0.35);
 }
 
 .taskreq-section-label {
@@ -1861,9 +1895,9 @@ a.review-proof {
     margin-bottom: 12px;
     padding: 10px 12px;
     font-size: 13px;
-    color: #ffb300;
-    background-color: rgba(255, 179, 0, 0.08);
-    border: 1px solid rgba(255, 179, 0, 0.35);
+    color: var(--warning-color);
+    background-color: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.35);
     border-radius: 10px;
 }
 
@@ -1913,7 +1947,7 @@ a.review-proof {
     padding: 12px;
     font-size: 15px;
     font-weight: 700;
-    color: #ffffff;
+    color: var(--bg-color);
     background-color: var(--accent-color);
     border: none;
     border-radius: 10px;
