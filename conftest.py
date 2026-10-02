@@ -30,3 +30,19 @@ def verifier_registry_isolated():
 
     reset_verifiers()
     yield
+
+
+@pytest.fixture(autouse=True)
+def task_request_rate_limit_isolated():
+    """Start (and end) every test with an empty rate-limit window.
+
+    ``task_request_rate_limit`` keeps per-user windows as in-process
+    state so a burst of POSTs inside one test can never bleed into
+    the next test's budget.  The module is stdlib-only, so this
+    fixture never drags an application import chain into collection.
+    """
+    from task_request_rate_limit import reset
+
+    reset()
+    yield
+    reset()

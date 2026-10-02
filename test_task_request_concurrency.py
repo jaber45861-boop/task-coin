@@ -25,6 +25,9 @@ Security
   statements; tables intact).
 - admin prompt state is per-admin: another admin's text can never
   consume or apply someone else's pending prompt.
+- the POST-only rate limit (``task_request_rate_limit``) counts a
+  synchronized burst under ONE lock: exactly the limit is admitted,
+  a denial never extends the window, and windows are per-user.
 
 Run:
     python3 -m pytest test_task_request_concurrency.py -v
@@ -484,6 +487,110 @@ class TestSecurity:
         re-verified here through the store contract."""
         with pytest.raises(store.TaskRequestError):
             store.create_request(OWNER, _payload_with_user_id())
+
+
+# ════════════════════════════════════════════════════════════════════
+# 5. Rate-limit check + count is ONE atomic step (POST /api/task-requests)
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRateLimitAtomicity:
+    """The per-user limiter's check/update must be race-free: a
+    synchronized burst can never admit more than the limit, and a
+    denied attempt can never ratchet a user into a longer block."""
+
+    def test_concurrent_check_and_count_admits_exactly_max(
+        self, monkeypatch
+    ):
+        import task_request_rate_limit as rate_limit
+
+        limit = 7
+        total = 64
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", limit)
+        rate_limit.reset()
+
+        barrier = threading.Barrier(total)
+        results: list = []
+        results_lock = threading.Lock()
+
+        def attempt():
+            barrier.wait()
+            outcome = rate_limit.check_attempt(OWNER)
+            with results_lock:
+                results.append(outcome)
+
+        workers = [
+            threading.Thread(target=attempt) for _ in range(total)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+
+        assert len(results) == total
+        allowed = [r for r in results if r is None]
+        denied = [r for r in results if r is not None]
+        assert len(allowed) == limit, (
+            f"admitted {len(allowed)} attempts under concurrency, "
+            f"limit was {limit}"
+        )
+        assert len(denied) == total - limit
+        # Every denial carries a positive retry hint (whole seconds).
+        assert all(isinstance(r, int) and r >= 1 for r in denied)
+
+    def test_denied_attempt_does_not_extend_the_window(self, monkeypatch):
+        import task_request_rate_limit as rate_limit
+
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 2)
+        rate_limit.reset()
+        assert rate_limit.check_attempt(OWNER) is None
+        assert rate_limit.check_attempt(OWNER) is None
+        assert rate_limit.check_attempt(OWNER) is not None  # denied
+        assert rate_limit.check_attempt(OWNER) is not None  # still denied
+
+        real_now = rate_limit._now
+        monkeypatch.setattr(
+            rate_limit,
+            "_now",
+            lambda: real_now() + rate_limit.WINDOW_SECONDS + 1,
+        )
+        # After the window the very next attempt is admitted again:
+        # rejected attempts were never counted against it.
+        assert rate_limit.check_attempt(OWNER) is None
+        assert rate_limit.check_attempt(OWNER) is None
+        assert rate_limit.check_attempt(OWNER) is not None
+
+    def test_windows_are_isolated_per_user(self, monkeypatch):
+        import task_request_rate_limit as rate_limit
+
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        rate_limit.reset()
+        assert rate_limit.check_attempt(OWNER) is None
+        assert rate_limit.check_attempt(OWNER) is not None
+
+        # Another verified user starts with their own untouched budget.
+        assert rate_limit.check_attempt(STRANGER) is None
+        assert rate_limit.check_attempt(STRANGER) is not None
+
+        # …and reset() is the test-only hook that clears everything.
+        rate_limit.reset()
+        assert rate_limit.check_attempt(OWNER) is None
+
+    def test_limiter_critical_section_is_pure_in_process_state(self):
+        """No sqlite/network inside the lock: the limiter can never
+        deadlock against the store's write lock, and it adds no new
+        dependency."""
+        import inspect
+        import task_request_rate_limit as rate_limit
+
+        source = inspect.getsource(rate_limit)
+        for forbidden in (
+            "db.", "sqlite", "requests.", "urllib", "socket",
+            "subprocess", "http.client",
+        ):
+            assert forbidden not in source, forbidden
+        assert "import threading" in source
+        assert "import time" in source
 
 
 def _press_for_test(data, context):

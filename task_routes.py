@@ -102,6 +102,7 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
+import task_request_rate_limit
 import task_request_store
 from task_catalog import TaskCatalog
 from task_lifecycle import TaskLifecycle
@@ -174,6 +175,7 @@ _MSG_TRQ_SUBMITTED = "تم إرسال المهمة للمراجعة من الإ�
 _MSG_TRQ_INVALID = "بيانات طلب المهمة غير صالحة"
 _MSG_TRQ_NOT_FOUND = "الطلب غير موجود"
 _MSG_TRQ_INVALID_STATUS = "لا يمكن تعديل هذا الطلب في وضعه الحالي"
+_MSG_TRQ_RATE_LIMITED = "تجاوزت الحد المسموح لطلبات المهام، حاول بعد قليل"
 
 
 # ── Authentication (existing miniapp_auth initData validation) ────────
@@ -894,6 +896,11 @@ def decide_claim(task_id: int, submission_id: int):
 #   client validation is cosmetic only
 # - the response exposes safe presentation fields only: no history,
 #   no admin identity (``decided_by``), no internals
+# - POST alone is rate-limited per VERIFIED user_id
+#   (``task_request_rate_limit`` — atomic check+count, HTTP 429);
+#   GET/PATCH, the admin workflow and the state machine are never
+#   consulted by it, and resubmit-after-changes (PATCH) can never
+#   be blocked by it
 
 
 def _trq_safe(req) -> dict:
@@ -927,6 +934,19 @@ def create_task_request():
     if user is None:
         return _unauthenticated()
     user_id = _ensure_user(user)
+
+    # Rate limit — POST only, keyed by the verified user_id, counted
+    # atomically BEFORE the payload is parsed so a flood of invalid
+    # bodies is bounded too.  GET/PATCH/admin handlers never reach
+    # this line.
+    retry_after = task_request_rate_limit.check_attempt(user_id)
+    if retry_after is not None:
+        body, status = _error(
+            "rate_limited", _MSG_TRQ_RATE_LIMITED, 429,
+            retry_after=retry_after,
+        )
+        body.headers["Retry-After"] = str(retry_after)
+        return body, status
 
     body = request.get_json(silent=True)
     if not isinstance(body, dict):

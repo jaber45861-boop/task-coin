@@ -29,6 +29,11 @@ User-side HTTP contract for the user-proposed task workflow:
   - invalid data rejected with no state change
   - client cannot set status/approval through the body
 
+  Rate limit (POST only)
+  - exceeding the per-verified-user limit returns a clear HTTP 429;
+    GET, PATCH (the resend-after-changes flow), the admin workflow
+    and the state machine are never consulted by the limiter
+
   No privilege escalation
   - there is NO user-side approve/reject endpoint at all
 
@@ -36,10 +41,13 @@ Run:
     python3 -m pytest test_task_requests_api.py -v
 """
 
+import threading
+
 import pytest
 
 import db
 import serve_miniapp
+import task_request_rate_limit as rate_limit
 import task_request_store
 
 from test_miniapp_auth import _TEST_BOT_TOKEN, _make_init_data
@@ -459,3 +467,245 @@ class TestNoUserApprovalPower:
             '@tasks_bp.post("/api/task-requests/<int:request_id>/reject")',
         ):
             assert forbidden not in source
+
+
+# ════════════════════════════════════════════════════════════════════
+# Rate limit — POST only, per verified user, race-free
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRateLimit:
+    """POST /api/task-requests alone carries a per-user rate limit.
+
+    GET list/detail, PATCH resubmit (the resend-after-changes flow),
+    the admin workflow and the request state machine must behave
+    exactly as before — proven here both at HTTP level and in the
+    module sources.
+    """
+
+    def test_normal_post_succeeds_within_limit(self, client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 3)
+        for i in range(3):
+            response = client.post(
+                "/api/task-requests",
+                headers=_auth(),
+                json=_payload(title=f"طلب رقم {i}"),
+            )
+            assert response.status_code == 200, response.get_data(
+                as_text=True
+            )
+        # The budget is now spent — the very next attempt is limited.
+        response = client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        )
+        assert response.status_code == 429
+
+    def test_exceeding_limit_returns_clear_429(self, client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 2)
+        for _ in range(2):
+            assert client.post(
+                "/api/task-requests", headers=_auth(), json=_payload()
+            ).status_code == 200
+
+        response = client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        )
+        assert response.status_code == 429
+        body = response.get_json()
+        assert body["ok"] is False
+        assert body["error"] == "rate_limited"
+        assert body["message"]  # user-facing Arabic message, not a blank
+        assert body["retry_after"] >= 1
+        # Standard Retry-After header mirrors the JSON hint.
+        assert response.headers.get("Retry-After") == str(body["retry_after"])
+
+    def test_blocked_post_creates_no_state(self, client, monkeypatch):
+        """A rejected attempt must leave the store untouched: the
+        limiter rejects BEFORE the state machine can run."""
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        created = client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        )
+        assert created.status_code == 200
+        request_id = created.get_json()["request"]["request_id"]
+
+        for _ in range(3):
+            blocked = client.post(
+                "/api/task-requests", headers=_auth(), json=_payload()
+            )
+            assert blocked.status_code == 429
+
+        own = task_request_store.list_for_user(USER_A)
+        assert [r.request_id for r in own] == [request_id]
+
+    def test_rate_limit_is_isolated_per_user(self, client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        assert client.post(
+            "/api/task-requests", headers=_auth(USER_A), json=_payload()
+        ).status_code == 200
+        assert client.post(
+            "/api/task-requests", headers=_auth(USER_A), json=_payload()
+        ).status_code == 429
+
+        # User B has their own budget — A's exhaustion cannot touch it.
+        assert client.post(
+            "/api/task-requests", headers=_auth(USER_B), json=_payload()
+        ).status_code == 200
+        assert client.post(
+            "/api/task-requests", headers=_auth(USER_B), json=_payload()
+        ).status_code == 429
+
+        # …and A is still blocked afterwards.
+        assert client.post(
+            "/api/task-requests", headers=_auth(USER_A), json=_payload()
+        ).status_code == 429
+
+    def test_unauthenticated_attempts_never_consume_budget(
+        self, client, monkeypatch
+    ):
+        """The counter is keyed by VERIFIED identity: strangers
+        hammering the endpoint without valid initData cannot spend
+        a real user's budget (and never reach the limiter at all)."""
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        for _ in range(4):
+            assert client.post(
+                "/api/task-requests", json=VALID_PAYLOAD
+            ).status_code == 401
+            assert client.post(
+                "/api/task-requests",
+                headers={INIT_DATA_HEADER: "not-valid"},
+                json=VALID_PAYLOAD,
+            ).status_code == 401
+
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 200
+
+    def test_get_unaffected_while_post_is_blocked(self, client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        created = _create(client)  # spends the whole budget
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 429
+
+        listing = client.get("/api/task-requests", headers=_auth())
+        assert listing.status_code == 200
+        assert len(listing.get_json()["requests"]) == 1
+
+        detail = client.get(
+            f"/api/task-requests/{created['request_id']}",
+            headers=_auth(),
+        )
+        assert detail.status_code == 200
+
+    def test_patch_resend_unaffected_while_post_is_blocked(
+        self, client, monkeypatch
+    ):
+        """The natural resend-after-changes_requested flow is PATCH
+        and must never be blocked by the POST limiter."""
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        created = _create(client)  # spends the whole budget
+        task_request_store.admin_return_request(
+            created["request_id"], 999, "عدّل الوصف"
+        )
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 429  # POST blocked…
+
+        response = client.patch(
+            f"/api/task-requests/{created['request_id']}",
+            headers=_auth(),
+            json=_payload(title="عنوان معدل بعد التعديل"),
+        )
+        assert response.status_code == 200  # …PATCH still works
+        assert response.get_json()["request"]["status"] == "pending"
+        # No state-machine regression: the store recorded the resubmit.
+        stored = task_request_store.get_request(created["request_id"])
+        assert stored.status == "pending"
+        assert stored.payload["title"] == "عنوان معدل بعد التعديل"
+
+    def test_window_lifts_after_window_seconds(self, client, monkeypatch):
+        """The block is temporary: once the window passes, the next
+        attempt is admitted again (rejected attempts never extend it)."""
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", 1)
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 200
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 429
+
+        real_now = rate_limit._now
+        monkeypatch.setattr(
+            rate_limit,
+            "_now",
+            lambda: real_now() + rate_limit.WINDOW_SECONDS + 1,
+        )
+        assert client.post(
+            "/api/task-requests", headers=_auth(), json=_payload()
+        ).status_code == 200
+
+    def test_concurrent_requests_cannot_bypass_limit(self, env, monkeypatch):
+        """A synchronized burst of simultaneous POSTs admits EXACTLY
+        the limit: check+count is one locked step, so no interleaving
+        of the two can squeeze an extra attempt through."""
+        limit = 5
+        total = 30
+        monkeypatch.setattr(rate_limit, "MAX_ATTEMPTS_PER_WINDOW", limit)
+        serve_miniapp.app.config["TESTING"] = True
+
+        barrier = threading.Barrier(total)
+        statuses: list[int] = []
+        statuses_lock = threading.Lock()
+
+        def worker():
+            client = serve_miniapp.app.test_client()
+            barrier.wait()
+            # Invalid body: an ADMITTED attempt stops at the 400 (no
+            # store write), a DENIED one at the 429 — the split is
+            # exactly the limiter's decision.
+            response = client.post(
+                "/api/task-requests", headers=_auth(), json=[]
+            )
+            with statuses_lock:
+                statuses.append(response.status_code)
+
+        threads = [
+            threading.Thread(target=worker) for _ in range(total)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert len(statuses) == total
+        assert statuses.count(400) == limit, \
+            f"admitted {statuses.count(400)} attempts, limit was {limit}"
+        assert statuses.count(429) == total - limit
+
+    def test_rate_limit_is_confined_to_the_post_handler(self):
+        """GET/PATCH handlers, the store and the admin workflow must
+        never consult the limiter."""
+        import inspect
+        import task_request_admin
+        import task_routes
+
+        source = inspect.getsource(task_routes)
+        # Exactly ONE call site in the whole module.
+        assert source.count("check_attempt(") == 1
+        # …and it sits inside create_task_request (POST).
+        post_only = source.split("def create_task_request()")[1].split(
+            "def list_task_requests()"
+        )[0]
+        assert "check_attempt(" in post_only
+        # Everything after POST (GET list, GET detail, PATCH) is clean.
+        assert "check_attempt(" not in source.split(
+            "def list_task_requests()"
+        )[1]
+        # The store and the Telegram admin workflow never see it.
+        assert "task_request_rate_limit" not in inspect.getsource(
+            task_request_admin
+        )
+        assert "task_request_rate_limit" not in inspect.getsource(
+            task_request_store
+        )

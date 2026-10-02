@@ -349,6 +349,10 @@ const TaskRequestUI = (() => {
             return;
         }
         list.innerHTML = requestsCache.map((r) => {
+            // Defense-in-depth: an unknown status is server data
+            // just like title/reason, so it is escaped at the
+            // injection point too. Known labels pass through _esc
+            // unchanged — the rendered text never differs.
             const label = STATUS_LABELS[r.status] || r.status;
             const chipClass = 'taskreq-chip taskreq-chip-' + _esc(r.status);
             const reason = r.reason
@@ -358,7 +362,7 @@ const TaskRequestUI = (() => {
             return `<div class="taskreq-item"
                      data-testid="taskreq-item" data-status="${_esc(r.status)}">
                 <span class="taskreq-item-title">${_esc(r.title)}</span>
-                <span class="${chipClass}">${label}</span>
+                <span class="${chipClass}">${_esc(label)}</span>
                 ${reason}
             </div>`;
         }).join('');
