@@ -1541,11 +1541,14 @@ def create_mini_app() -> Flask:
     from withdrawal_routes import withdrawal_bp
     # MT-ADMIN-28: user deposit API (methods + pending intent).
     from deposit_routes import deposit_bp
+    # Production social accounts API (YouTube OAuth, accounts list).
+    from social_routes import social_bp
 
     mini_app = Flask(__name__)
     mini_app.register_blueprint(tasks_bp)
     mini_app.register_blueprint(withdrawal_bp)
     mini_app.register_blueprint(deposit_bp)
+    mini_app.register_blueprint(social_bp)
     miniapp_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "miniapp"
     )
