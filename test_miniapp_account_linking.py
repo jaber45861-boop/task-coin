@@ -146,20 +146,21 @@ process.stdout.write(JSON.stringify(sections));
 """
 
 # Section order when the flag is off: the linking slot is simply absent.
+# (The daily-registration section is itself hidden behind
+# SHOW_DAILY_REGISTRATION — default false — so it is absent here too.)
 _ORDER_OFF = [
     "home-welcome",
     "home-balance",
-    "home-checkin",
     "home-guide",
     "home-add-task",
     "home-hot-tasks",
 ]
 
-# Section order when the flag is on: original 7-section layout.
+# Section order when the flag is on: original layout with the linking
+# section back between «إضافة مهمة» and «المهام الساخنة».
 _ORDER_ON = [
     "home-welcome",
     "home-balance",
-    "home-checkin",
     "home-guide",
     "home-add-task",
     "home-account-linking",

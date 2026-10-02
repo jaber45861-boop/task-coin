@@ -15,6 +15,16 @@ const Home = (() => {
     // to restore the section exactly as it is today.
     const SHOW_ACCOUNT_LINKING = false;
 
+    // ── Feature flag: Daily Registration section ─────────────────
+    // SHOW_DAILY_REGISTRATION controls whether the «التسجيل اليومي»
+    // section (📅 daily check-in card) is rendered on Home.  The
+    // section builder (_buildDailyCheckinSection), its markup and
+    // its CSS are fully intact — this flag only decides visibility.
+    // When false the section element is never created, so no empty
+    // gap, placeholder or container is left behind.  Set it to
+    // `true` to restore the section exactly as it is today.
+    const SHOW_DAILY_REGISTRATION = false;
+
     /**
      * Build and return the full Home page DOM element.
      */
@@ -25,7 +35,9 @@ const Home = (() => {
 
         page.appendChild(_buildWelcomeSection());
         page.appendChild(_buildBalanceSection());
-        page.appendChild(_buildDailyCheckinSection());
+        if (SHOW_DAILY_REGISTRATION) {
+            page.appendChild(_buildDailyCheckinSection());
+        }
         page.appendChild(_buildOfficialGuideSection());
         page.appendChild(_buildAddTaskSection());
         if (SHOW_ACCOUNT_LINKING) {
