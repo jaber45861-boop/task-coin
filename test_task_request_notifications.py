@@ -39,6 +39,7 @@ import serve_miniapp
 import task_request_notifications as trn
 import task_request_rate_limit as rate_limit
 import task_request_store
+import wallet
 from admin_notification_store import AdminNotificationStore
 from task_request_admin import parse_callback
 from task_taxonomy import ACTION_LABELS, PROVIDER_LABELS
@@ -101,13 +102,18 @@ def _broken_scheduler(coro):
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    """Isolated DB + registered user + clean notification bridge."""
+    """Isolated DB + funded user + clean notification bridge.
+
+    The user holds 1,000 USDT so the MT-TRANS-01 creation-time balance
+    guard admits the request and the notify path is reached.
+    """
     trn.unbind()
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN)
     db_path = str(tmp_path / "task_request_notify.db")
     monkeypatch.setattr(db, "DB_PATH", db_path)
     db.init_db(db_path)
     db.register_user(USER_A, "alice", "Alice")
+    wallet.credit_units(USER_A, 1_000 * wallet.USDT_SCALE)
     rate_limit.reset()
     yield db_path
     trn.unbind()

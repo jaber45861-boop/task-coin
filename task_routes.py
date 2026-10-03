@@ -66,8 +66,12 @@ Security rules enforced here:
 - errors are distinguished with stable machine codes and concise
   Arabic user-facing messages; internal exception details and stack
   traces never reach the client
-- no reward, wallet, ledger or balance behaviour exists in this module:
-  ``tasks.reward`` remains display metadata only
+- no reward, wallet, ledger or balance MUTATION exists in this module:
+  ``tasks.reward`` remains display metadata only, and the ONE balance
+  interaction here is the MT-TRANS-01 creation-time guard — a read-only
+  comparison of the requested reward against ``wallets.available_units``
+  that rejects (HTTP 400) before any request/pending/notification state
+  is created
 """
 
 import json
@@ -106,10 +110,12 @@ import task_request_notifications
 import task_request_rate_limit
 import task_request_store
 from task_catalog import TaskCatalog
+from task_creation import parse_reward_units
 from task_lifecycle import TaskLifecycle
 from task_start import StartGateError
 from task_submission import FORBIDDEN_FIELDS
 from task_submission_store import TaskSubmissionStore
+from wallet import units_to_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -952,6 +958,47 @@ def create_task_request():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+
+    # ── Server-side balance guard (MT-TRANS-01) ──
+    # Before anything is persisted, prove the verified caller can
+    # actually cover the requested reward.  The reward is parsed from
+    # the raw payload with the ONE canonical exact parser (the very
+    # ``parse_reward_units`` call the store's ``validate_payload``
+    # makes), then compared against the source of truth —
+    # ``wallets.available_units`` (SQLite INTEGER, 1 USDT =
+    # 100_000_000 atomic units) — as an exact Decimal, BEFORE the
+    # INSERT, before any pending state and before any admin
+    # notification.  A malformed reward is left to
+    # ``validate_payload`` below (it rejects it with the usual
+    # ``invalid_payload``).  No new column, no new wallet/ledger
+    # operation, no schema change: a pure read + comparison — the
+    # balance itself never changes on this path.
+    try:
+        required_units = parse_reward_units(
+            body.get("reward"), field="المكافعة"
+        )
+    except (TypeError, ValueError):
+        required_units = None
+    available_units = 0
+    if required_units is not None:
+        with db.get_connection() as conn:
+            wallet_row = conn.execute(
+                "SELECT available_units FROM wallets WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if wallet_row is not None:
+            available_units = int(wallet_row["available_units"])
+    if required_units is not None and available_units < required_units:
+        available = units_to_decimal(available_units)
+        required = units_to_decimal(required_units)
+        return _error(
+            "balance_insufficient",
+            f"رصيدك غير كافٍ لطلب هذه المهمة. الرصيد المتاح: "
+            f"{available:.8f} USDT، والمبلغ المطلوب: {required:.8f} USDT.",
+            400,
+            available_balance=float(available),
+            required_reward=float(required),
+        )
 
     try:
         created = task_request_store.create_request(user_id, body)

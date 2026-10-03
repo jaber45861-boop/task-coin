@@ -49,6 +49,7 @@ import db
 import serve_miniapp
 import task_request_rate_limit as rate_limit
 import task_request_store
+import wallet
 
 from test_miniapp_auth import _TEST_BOT_TOKEN, _make_init_data
 
@@ -72,13 +73,20 @@ VALID_PAYLOAD = {
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    """Environment + isolated database + two registered users."""
+    """Environment + isolated database + two funded users.
+
+    Both users hold 1,000 USDT — the MT-TRANS-01 creation-time balance
+    guard requires a requester to afford the proposed reward before
+    any request row is written.
+    """
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN)
     db_path = str(tmp_path / "task_requests_test.db")
     monkeypatch.setattr(db, "DB_PATH", db_path)
     db.init_db(db_path)
     db.register_user(USER_A, "alice", "Alice")
     db.register_user(USER_B, "bob", "Bob")
+    wallet.credit_units(USER_A, 1_000 * wallet.USDT_SCALE)
+    wallet.credit_units(USER_B, 1_000 * wallet.USDT_SCALE)
     yield db_path
 
 
