@@ -194,10 +194,24 @@ const Home = (() => {
                     <span class="section-title">الدليل الرسمي</span>
                 </div>
                 <div class="guide-body">
-                    <span class="guide-status">قريباً</span>
+                    <button type="button" class="guide-open"
+                            data-testid="guide-open">📖 افتح الدليل</button>
                 </div>
             </div>
         `;
+
+        // Pressing the section (card or its button) opens the full
+        // official guide in the existing overlay-dialog pattern —
+        // guide.js owns the content, Home stays presentational.
+        const guideCard = section.querySelector('.guide-card');
+        if (guideCard) {
+            guideCard.addEventListener('click', () => {
+                if (typeof Guide !== 'undefined' && Guide &&
+                    typeof Guide.open === 'function') {
+                    Guide.open();
+                }
+            });
+        }
         return section;
     }
 

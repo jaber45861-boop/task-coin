@@ -697,9 +697,13 @@ class TestScopePolicy(WalletTestBase):
         submission workflow («إضافة مهمة ➕») adds its own surface:
         ``miniapp/js/task-request.js`` (new), plus the script tag in
         ``miniapp/index.html`` and the ``.taskreq-*`` styles in
-        ``miniapp/css/app.css`` — no wallet behaviour.  Every other
-        Mini App file — wallet.js, wallet-data.js, the rest — must
-        stay byte-identical.
+        ``miniapp/css/app.css`` — no wallet behaviour.  The official
+        guide («الدليل الرسمي 📖») adds its surface the same way:
+        ``miniapp/js/guide.js`` (new, presentational only), plus its
+        script tag in ``miniapp/index.html`` and the ``.guide-*``
+        styles in ``miniapp/css/app.css`` — no wallet behaviour.
+        Every other Mini App file — wallet.js, wallet-data.js, the
+        rest — must stay byte-identical.
         """
         repo_root = os.path.dirname(os.path.abspath(__file__))
         try:
@@ -715,8 +719,9 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/js/tasks.js",      # MT-ADMIN-14 exception
             "miniapp/js/home.js",       # account-linking flag (visibility only)
             "miniapp/js/task-request.js",   # «إضافة مهمة ➕» submission UI
-            "miniapp/index.html",       # task-request.js script tag
-            "miniapp/css/app.css",      # .taskreq-* styles for the overlay
+            "miniapp/js/guide.js",      # «الدليل الرسمي 📖» guide overlay (new)
+            "miniapp/index.html",       # task-request.js / guide.js script tags
+            "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
         }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse

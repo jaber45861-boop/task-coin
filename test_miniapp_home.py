@@ -364,11 +364,21 @@ class TestStructuralStates:
         assert "قريباً" in nearby, \
             "Level should show 'قريباً' as placeholder"
 
-    def test_guide_coming_soon(self):
+    def test_guide_opens_official_guide(self):
+        """The guide is live now: pressing the section opens the full
+        official guide dialog (miniapp/js/guide.js), so the old
+        «قريباً» placeholder no longer appears in the section."""
         content = _home_js()
         guide_idx = content.find("home-guide")
-        nearby = content[guide_idx:guide_idx + 700]
-        assert "قريباً" in nearby
+        assert guide_idx != -1
+        end = content.find("_buildAddTaskSection", guide_idx)
+        block = content[guide_idx:end if end != -1 else guide_idx + 1500]
+        assert 'data-testid="guide-open"' in block, \
+            "guide section should offer an open button"
+        assert "Guide.open()" in block, \
+            "guide section must open the official guide"
+        assert "قريباً" not in block, \
+            "the guide placeholder must be gone"
 
     def test_account_linking_coming_soon(self):
         content = _home_js()

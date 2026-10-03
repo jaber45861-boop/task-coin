@@ -1975,3 +1975,173 @@ a.review-proof {
 .taskreq-secondary[hidden] {
     display: none;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   Official Guide («الدليل الرسمي 📖»)
+   Pressable Home card + full-screen guide dialog.
+   Same overlay mechanics as the task-request dialog; the document
+   inherits dir="rtl" from index.html.
+   ════════════════════════════════════════════════════════════ */
+
+.guide-card {
+    cursor: pointer;
+    transition: transform 0.12s ease;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.guide-card:active {
+    transform: scale(0.99);
+}
+
+.guide-open {
+    width: 100%;
+    min-height: 46px;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: none;
+    border-radius: 12px;
+    background-color: var(--accent-color);
+    color: var(--bg-color);
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.guide-open:active {
+    opacity: 0.85;
+}
+
+.guide-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background-color: rgba(0, 0, 0, 0.55);
+}
+
+.guide-dialog {
+    width: 100%;
+    max-width: 420px;
+    max-height: 86vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 18px 16px 22px;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background-color: var(--card-color);
+    color: var(--text-color);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+}
+
+.guide-dialog-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.guide-dialog-title {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.guide-close {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 18px;
+    line-height: 1;
+    padding: 6px 8px;
+    cursor: pointer;
+    border-radius: 8px;
+}
+
+.guide-close:hover,
+.guide-close:focus-visible {
+    color: var(--text-color);
+    background-color: var(--bg-secondary);
+}
+
+.guide-doc {
+    font-size: 15px;
+    line-height: 1.9;
+    color: var(--text-color);
+    overflow-wrap: break-word;
+}
+
+.guide-intro {
+    margin: 0 0 16px;
+    padding: 12px;
+    border: 1px solid rgba(56, 189, 248, 0.30);
+    border-radius: 10px;
+    background-color: rgba(56, 189, 248, 0.07);
+}
+
+.guide-block {
+    margin-bottom: 18px;
+}
+
+.guide-block:last-child {
+    margin-bottom: 0;
+}
+
+.guide-h {
+    margin: 0 0 8px;
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--accent-color);
+}
+
+.guide-block p {
+    margin: 0 0 8px;
+}
+
+.guide-block p:last-child {
+    margin-bottom: 0;
+}
+
+.guide-list {
+    margin: 0 0 8px;
+    padding-inline-start: 20px;
+    list-style: disc;
+}
+
+.guide-list li {
+    margin-bottom: 6px;
+}
+
+.guide-list li:last-child {
+    margin-bottom: 0;
+}
+
+.guide-note {
+    padding: 10px 12px;
+    border-inline-start: 3px solid var(--accent-color);
+    border-radius: 8px;
+    background-color: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+.guide-cta-line {
+    display: inline-block;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: var(--accent-color);
+    color: var(--bg-color);
+    font-weight: 700;
+}
