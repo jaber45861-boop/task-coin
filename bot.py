@@ -50,6 +50,7 @@ import rate_admin
 import support_service
 import task_creation
 import task_request_admin
+import task_request_notifications
 import task_taxonomy
 import withdrawal_admin
 import withdrawal_notifications
@@ -1717,6 +1718,12 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
     # loop scheduler (ADMINS private chats only) — bound only while
     # this bot loop runs.
     withdrawal_notifications.bind(_admin_notifier, _schedule_notification)
+    # Task requests created from the Mini App («إضافة مهمة ➕») share
+    # the SAME AdminNotifier and loop scheduler — ADMINS private chats
+    # only, bound only while this bot loop runs.
+    task_request_notifications.bind(
+        _admin_notifier, _schedule_notification
+    )
 
     def _error_callback(exc: TelegramError) -> None:
         application.create_task(application.process_error(error=exc, update=None))
@@ -1754,6 +1761,7 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         support_service.unbind()
         manual_proof_inbox.unbind()
         withdrawal_notifications.unbind()
+        task_request_notifications.unbind()
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:

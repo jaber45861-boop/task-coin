@@ -102,6 +102,7 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
+import task_request_notifications
 import task_request_rate_limit
 import task_request_store
 from task_catalog import TaskCatalog
@@ -962,6 +963,12 @@ def create_task_request():
         )
         return _server_error()
 
+    # Admin push (fail-soft): schedule the ADMINS notification for the
+    # fresh pending request via AdminNotifier + the bot-loop scheduler.
+    # It NEVER raises and never changes this response — a failed or
+    # unbound notification only logs (with the request id).
+    task_request_notifications.notify_pending(created)
+
     return jsonify(
         {
             "ok": True,
@@ -1054,6 +1061,11 @@ def resubmit_task_request(request_id: int):
             user_id, request_id,
         )
         return _server_error()
+
+    # Admin push (fail-soft) — only reached when the request actually
+    # went back to ``pending`` (the store enforces the transition), so
+    # a fresh review cycle is notified exactly once (dedup by cycle).
+    task_request_notifications.notify_pending(updated)
 
     return jsonify(
         {
