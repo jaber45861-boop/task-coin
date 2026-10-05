@@ -702,6 +702,10 @@ class TestScopePolicy(WalletTestBase):
         ``miniapp/js/guide.js`` (new, presentational only), plus its
         script tag in ``miniapp/index.html`` and the ``.guide-*``
         styles in ``miniapp/css/app.css`` — no wallet behaviour.
+        The Home stats cards («المتاح» / «المكافآت») add theirs the
+        same way: ``miniapp/js/task-stats.js`` (new, read-only display
+        data for the two cards — no wallet behaviour), plus its script
+        tag in ``miniapp/index.html``.
         Every other Mini App file — wallet.js, wallet-data.js, the
         rest — must stay byte-identical.
         """
@@ -720,7 +724,8 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/js/home.js",       # account-linking flag (visibility only)
             "miniapp/js/task-request.js",   # «إضافة مهمة ➕» submission UI
             "miniapp/js/guide.js",      # «الدليل الرسمي 📖» guide overlay (new)
-            "miniapp/index.html",       # task-request.js / guide.js script tags
+            "miniapp/js/task-stats.js",  # Home «المتاح»/«المكافآت» data (new)
+            "miniapp/index.html",       # task-request.js / guide.js / task-stats.js tags
             "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
         }
         changed = {

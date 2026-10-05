@@ -1,7 +1,10 @@
 /**
  * Home Page Component
  * Renders the الرئيسية dashboard with structural UI sections.
- * All sections use neutral/placeholder states — no fake data.
+ * Sections use neutral/placeholder states or real backend data —
+ * never mock data, never an invented number.  The balance cards
+ * («المتاح» / «المكافآت») are filled from the SAME /api/tasks read
+ * the Tasks page uses, through the task-stats.js module.
  */
 const Home = (() => {
 
@@ -142,6 +145,9 @@ const Home = (() => {
         section.className = 'home-section home-balance';
         section.setAttribute('data-testid', 'home-balance');
 
+        // The markup ships with the neutral «—» placeholder: that is
+        // what stays visible until (and unless) the backend read
+        // answers, so an unknown value is never rendered as a number.
         section.innerHTML = `
             <div class="balance-card">
                 <div class="balance-row">
@@ -156,7 +162,49 @@ const Home = (() => {
                 </div>
             </div>
         `;
+
+        // The two values come from the SAME backend response the
+        // Tasks page renders (GET /api/tasks, owned by task-stats.js):
+        // «المتاح» = the tasks the backend reports with status
+        // "available", «المكافآت» = the exact sum of those same tasks'
+        // rewards.  Home itself stays fetch-free; a failed or
+        // unauthenticated read simply leaves the placeholders.
+        if (typeof TaskStats !== 'undefined' && TaskStats &&
+            typeof TaskStats.load === 'function') {
+            TaskStats.load().then((stats) => {
+                if (stats) {
+                    _fillBalanceValues(section, stats);
+                }
+            });
+        }
         return section;
+    }
+
+    /**
+     * Fill the two balance cards from fetched stats.  Only backend-
+     * confirmed values are written; anything unknown keeps the
+     * original «—» placeholder and the balance-empty styling.
+     */
+    function _fillBalanceValues(section, stats) {
+        const availableNode = section.querySelector(
+            '[data-testid="balance-available"] .balance-value'
+        );
+        if (availableNode) {
+            availableNode.textContent = String(stats.availableCount);
+            availableNode.classList.remove('balance-empty');
+        }
+
+        const rewardNode = section.querySelector(
+            '[data-testid="balance-reward"] .balance-value'
+        );
+        const rewardText = (typeof TaskStats !== 'undefined' && TaskStats &&
+            typeof TaskStats.formatRewards === 'function')
+            ? TaskStats.formatRewards(stats.rewardUnits)
+            : null;
+        if (rewardNode && rewardText) {
+            rewardNode.textContent = rewardText;
+            rewardNode.classList.remove('balance-empty');
+        }
     }
 
     /* ── Daily Check-in ───────────────────────────────────────── */
