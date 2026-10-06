@@ -13,21 +13,30 @@ Workflow (all in the admin's private chat)::
     /paymethods                 → panel
       [ ➕ إضافة وسيلة ]        → format help (pm:help)
       [ 📋 عرض الوسائل ]        → bounded oldest-first list (pm:list)
-    /addpm <form>               → validate + persist a new method
+    /addpm                      → INTERACTIVE WIZARD (buttons + text steps)
+    /addpm <form>               → legacy pipe form, byte-for-byte unchanged
+    /editpm <id>                → interactive field-edit menu
+    /editpm <id> | <form>       → legacy pipe form, unchanged
     list buttons per method:
       [ ✏️ تعديل ]              → full current values + /editpm template
       [ 🟢 تفعيل | 🔴 تعطيل ]  → idempotent active toggle
       [ 🗑️ حذف ]               → confirmation card → pm:delyes:<id>
 
-Input is a single pipe-delimited command — the same stateless
-convention as ``/addchannel slug|@user|title`` — so NO conversation
-state (memory or persisted) exists anywhere in this flow.
+The wizard stages its form in ONE short-lived in-memory slot per
+admin (keyed by the trusted Telegram actor id, TTL-expired, popped
+on confirm/save/cancel — the admin_control pending-input
+precedent).  Nothing touches SQLite before the review page's
+explicit "تأكيد وإضافة"; the legacy pipe form stays available
+byte-for-byte for existing scripts.
 
 Security:
 
 - every command and callback re-checks private chat + ``is_admin``;
 - callback payloads carry only ``pm:<op>[:<positive id>]`` — a lookup
   pointer; the row, its fields and the actor are re-read server-side;
+- wizard identity/ownership comes ONLY from the Telegram actor — no
+  user id ever travels inside callback data or message text, so a
+  second admin can never drive or complete another admin's wizard;
 - destinations are shown masked in lists (full only inside the admin's
   own edit template); they are NEVER logged;
 - no private keys are ever requested or stored (the store rejects the
@@ -39,6 +48,7 @@ Security:
 from __future__ import annotations
 
 import logging
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -65,10 +75,42 @@ OP_DEPON = "depon"
 OP_DEPOFF = "depoff"
 OP_DEL = "del"
 OP_DEL_YES = "delyes"
+
+# ── Interactive wizard ops (same pm: family, same strict grammar) ────
+# Wizard callbacks stay bounded lookup pointers: the staged state is
+# keyed by the Telegram actor and NEVER by anything in the payload.
+OP_WCAT = "wcat"          # pm:wcat:<1 crypto | 2 cash>
+OP_WASSET = "wasset"      # pm:wasset:<1-based suggestion index>
+OP_WNET = "wnet"          # pm:wnet:<1-based suggestion index>
+OP_WNONE = "wnone"        # network = not applicable
+OP_WMANUAL = "wmanual"    # switch the current step to free text
+OP_WSKIP = "wskip"        # optional notes: skip
+OP_WFIELD = "wfield"      # pm:wfield:<1-based menu field index>
+OP_WMENU = "wmenu"        # review → field menu
+OP_WREVIEW = "wreview"    # field menu → review
+OP_WCONFIRM = "wconfirm"  # review → create (single-use)
+OP_WSAVE = "wsave"        # edit menu → persist (single-use)
+OP_WCANCEL = "wcancel"    # abandon + drop the staged state
+
+_WIZARD_OPS_NO_ID = frozenset(
+    {
+        OP_WNONE,
+        OP_WMANUAL,
+        OP_WSKIP,
+        OP_WMENU,
+        OP_WREVIEW,
+        OP_WCONFIRM,
+        OP_WSAVE,
+        OP_WCANCEL,
+    }
+)
+_WIZARD_OPS_WITH_ID = frozenset({OP_WCAT, OP_WASSET, OP_WNET, OP_WFIELD})
+_WIZARD_OPS = _WIZARD_OPS_NO_ID | _WIZARD_OPS_WITH_ID
+
 _OPS_WITH_ID = frozenset(
     {OP_PAGE, OP_EDIT, OP_ON, OP_OFF, OP_DEPON, OP_DEPOFF, OP_DEL, OP_DEL_YES}
-)
-_OPS_NO_ID = frozenset({OP_HELP, OP_LIST})
+) | _WIZARD_OPS_WITH_ID
+_OPS_NO_ID = frozenset({OP_HELP, OP_LIST}) | _WIZARD_OPS_NO_ID
 _ALL_OPS = _OPS_WITH_ID | _OPS_NO_ID
 
 # ── Bounds ────────────────────────────────────────────────────────────
@@ -107,7 +149,8 @@ DEST_LABEL = {"crypto": "العنوان", "cash": "الحساب"}
 HELP_TEXT = (
     "➕ إضافة وسيلة دفع\n"
     "━━━━━━━━━━━━━━━━━━━\n\n"
-    "أرسل الأمر بهذه الصيغة:\n\n"
+    "💡 الأسهل: أرسل /addpm بدون وسيط لبدء الـ Wizard التفاعلي بالأزرار.\n\n"
+    "أو أرسل الأمر بهذه الصيغة:\n\n"
     "/addpm <الفئة> | <الاسم> | <العملة> | <الشبكة> | "
     "<المزود> | <العنوان> | <الملاحظات>\n\n"
     "• الفئة: crypto (عملات رقمية) أو cash (محفظة إلكترونية)\n"
@@ -132,6 +175,55 @@ MSG_USAGE_EDIT = (
     "/editpm <رقم> | <الفئة> | <الاسم> | <العملة> | <الشبكة> | "
     "<المزود> | <العنوان> | <الملاحظات>"
 )
+
+# ── Interactive wizard strings (Arabic, button-driven) ────────────────
+
+WZ_RULE = "━━━━━━━━━━━━━━━━━━━"
+WZ_ADD_TITLE = "➕ إضافة وسيلة دفع"
+WZ_SELECT_ASSET = "💰 اختر العملة:"
+WZ_SELECT_NETWORK = "🌐 اختر الشبكة:"
+WZ_PROMPT_ASSET = "💰 اكتب العملة:\n\nأرسل رمز العملة كرسالة."
+WZ_PROMPT_ASSET_MANUAL = "💰 أرسل رمز العملة كرسالة:"
+WZ_PROMPT_NETWORK = "🌐 اكتب الشبكة:\n\nأرسل اسم الشبكة كرسالة."
+WZ_PROMPT_NETWORK_MANUAL = "🌐 أرسل اسم الشبكة كرسالة:"
+WZ_PROMPT_NAME = "✏️ اكتب اسم وسيلة الدفع:"
+WZ_PROMPT_PROVIDER = "🏦 اكتب اسم المزود:"
+WZ_PROMPT_DESTINATION = (
+    "📍 أرسل عنوان الاستقبال العام:\n\n"
+    "⚠️ أرسل العنوان العام فقط.\n"
+    "❌ لا ترسل Private Key.\n"
+    "❌ لا ترسل Seed Phrase."
+)
+WZ_PROMPT_INSTRUCTIONS = "📝 أرسل ملاحظات أو اضغط \"تخطي\":"
+WZ_PROMPT_CATEGORY = (
+    f"{WZ_ADD_TITLE}\n{WZ_RULE}\n\n"
+    "اختر الفئة:\n\n"
+    "💡 يمكنك أيضًا استخدام الصيغة القديمة:\n"
+    "/addpm <الفئة> | <الاسم> | <العملة> | ..."
+)
+
+BTN_WZ_CRYPTO = "💰 Crypto"
+BTN_WZ_CASH = "💵 Cash"
+BTN_WZ_CANCEL = "❌ إلغاء"
+BTN_WZ_MANUAL = "✏️ إدخال يدوي"
+BTN_WZ_NO_NETWORK = "🚫 بدون شبكة"
+BTN_WZ_SKIP = "⏭️ تخطي"
+BTN_WZ_CONFIRM = "✅ تأكيد وإضافة"
+BTN_WZ_EDIT_FIELDS = "✏️ تعديل"
+BTN_WZ_REVIEW = "🔎 مراجعة"
+BTN_WZ_SAVE = "💾 حفظ"
+
+MSG_WIZARD_STALE = (
+    "⌛ انتهت جلسة المساعدة أو لم تكن هناك جلسة نشطة.\n"
+    "أرسل /addpm للإضافة أو /editpm <رقم> للتعديل."
+)
+MSG_WIZARD_CANCELED = "❌ تم الإلغاء. لم يُحفظ أي شيء."
+MSG_WIZARD_INVALID_OPTION = (
+    "❌ البيانات غير صحيحة.\n"
+    "اختر من الأزرار الموجودة أسفل الرسالة."
+)
+MSG_WIZARD_MISSING_PREFIX = "❌ بيانات ناقصة: "
+MSG_WIZARD_RETRY = "\n\nاكتب القيمة مرة أخرى أو اضغط ❌ إلغاء."
 
 
 # ── Parsing helpers (pure, unit-tested) ───────────────────────────────
@@ -451,6 +543,461 @@ def _command_body(message) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
+# ── Interactive wizard state (in-memory, per-admin, TTL) ──────────────
+#
+# ``/addpm`` without arguments opens a step-by-step button wizard and
+# ``/editpm <id>`` (without the pipe form) opens the field-edit menu.
+# Following the established admin_control pending-input precedent the
+# bridge is a SHORT-LIVED in-memory dict: ONE slot per admin, keyed by
+# the trusted Telegram actor id — never by anything carried in
+# callback data or message text.  The slot holds only the staged form
+# fields and the current step: no secrets, no tokens, and it is never
+# logged (``destination`` lives here transiently and nowhere else).
+# A slot is replaced wholesale when a wizard restarts (never merged,
+# so two wizards can never mix), popped on confirm/save/cancel and
+# expired after WIZARD_TTL_SECONDS of inactivity.  Selection buttons
+# (asset/network) are DERIVED from the ``payment_methods`` table —
+# what the system actually holds — because MT-ADMIN-08 forbids
+# hard-coding any provider/network/asset literal in this module.
+
+WIZARD_TTL_SECONDS = 600
+_WIZARD_STATES: dict[int, dict] = {}
+
+# ``pm:wfield:<index>`` → staged dict key (fixed server-side order;
+# the callback carries only the bounded positive index).
+_MENU_FIELDS: tuple[str, ...] = (
+    "category",
+    "display_name",
+    "asset",
+    "network",
+    "provider",
+    "destination",
+    "instructions",
+)
+
+_FIELD_LABELS = {
+    "category": "الفئة",
+    "display_name": "الاسم",
+    "asset": "العملة",
+    "network": "الشبكة",
+    "provider": "المزود",
+    "destination": "العنوان",
+    "instructions": "الملاحظات",
+}
+
+_MENU_BUTTON_LABELS = {
+    "category": "🏷️ الفئة",
+    "display_name": "✏️ الاسم",
+    "asset": "💰 العملة",
+    "network": "🌐 الشبكة",
+    "provider": "🏦 المزود",
+    "destination": "📍 العنوان",
+    "instructions": "📝 الملاحظات",
+}
+
+# Text steps consumed by ``wizard_text_input`` (category/review/menu
+# wait for buttons instead).
+_TEXT_STEPS = frozenset(
+    {"asset", "network", "display_name", "provider", "destination", "instructions"}
+)
+
+# Existing store validators — the wizard invents NO rules of its own.
+_FIELD_VALIDATORS = {
+    "asset": store.validate_asset,
+    "network": store.validate_network,
+    "display_name": store.validate_display_name,
+    "provider": store.validate_provider,
+    "destination": store.validate_destination,
+    "instructions": store.validate_instructions,
+}
+
+_REQUIRED_FIELDS = ("category", "display_name", "asset", "provider", "destination")
+
+# Suggestion buttons are bounded (Telegram keyboards stay readable).
+_MAX_OPTIONS = 6
+
+
+def _new_wizard_state(mode: str) -> dict:
+    """A fresh staged form; ``mode`` is ``"add"`` or ``"edit"``."""
+    return {
+        "mode": mode,
+        "step": "category" if mode == "add" else "menu",
+        "method_id": None,
+        "category": None,
+        "display_name": None,
+        "asset": None,
+        "network": None,
+        "provider": None,
+        "destination": None,
+        "instructions": None,
+        "manual": False,
+        "editing": False,
+        "asset_options": (),
+        "updated_at": time.monotonic(),
+    }
+
+
+def _wizard_state(actor: int) -> tuple[dict | None, bool]:
+    """Live state for *actor* + whether an EXPIRED one was collected.
+
+    Every successful read refreshes the inactivity TTL.  An expired
+    slot is popped here, so a stale button press can never complete
+    an old operation.
+    """
+    state = _WIZARD_STATES.get(actor)
+    if state is None:
+        return None, False
+    try:
+        updated_at = float(state.get("updated_at", 0.0))
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    if time.monotonic() - updated_at > WIZARD_TTL_SECONDS:
+        _WIZARD_STATES.pop(actor, None)
+        return None, True
+    state["updated_at"] = time.monotonic()
+    return state, False
+
+
+# ── Wizard rendering (pure; option lists come from the store) ────────
+
+
+def build_category_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CRYPTO,
+                    callback_data=f"{CB_PREFIX}:{OP_WCAT}:1",
+                ),
+                InlineKeyboardButton(
+                    BTN_WZ_CASH,
+                    callback_data=f"{CB_PREFIX}:{OP_WCAT}:2",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                )
+            ],
+        ]
+    )
+
+
+def _cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                )
+            ]
+        ]
+    )
+
+
+def _options_keyboard(step: str, options: tuple[str, ...]) -> InlineKeyboardMarkup:
+    op = OP_WASSET if step == "asset" else OP_WNET
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                value, callback_data=f"{CB_PREFIX}:{op}:{index}"
+            )
+        ]
+        for index, value in enumerate(options, start=1)
+    ]
+    extra: list[InlineKeyboardButton] = []
+    if step == "network":
+        extra.append(
+            InlineKeyboardButton(
+                BTN_WZ_NO_NETWORK, callback_data=f"{CB_PREFIX}:{OP_WNONE}"
+            )
+        )
+    extra.append(
+        InlineKeyboardButton(
+            BTN_WZ_MANUAL, callback_data=f"{CB_PREFIX}:{OP_WMANUAL}"
+        )
+    )
+    rows.append(extra)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _network_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_NO_NETWORK, callback_data=f"{CB_PREFIX}:{OP_WNONE}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                )
+            ],
+        ]
+    )
+
+
+def _instructions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_SKIP, callback_data=f"{CB_PREFIX}:{OP_WSKIP}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                )
+            ],
+        ]
+    )
+
+
+def build_review_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CONFIRM,
+                    callback_data=f"{CB_PREFIX}:{OP_WCONFIRM}",
+                ),
+                InlineKeyboardButton(
+                    BTN_WZ_EDIT_FIELDS,
+                    callback_data=f"{CB_PREFIX}:{OP_WMENU}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                )
+            ],
+        ]
+    )
+
+
+def _menu_keyboard(mode: str) -> InlineKeyboardMarkup:
+    pairs = list(enumerate(_MENU_FIELDS, start=1))
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                _MENU_BUTTON_LABELS[field],
+                callback_data=f"{CB_PREFIX}:{OP_WFIELD}:{index}",
+            )
+            for index, field in pairs[offset : offset + 2]
+        ]
+        for offset in range(0, len(pairs), 2)
+    ]
+    if mode == "add":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_REVIEW, callback_data=f"{CB_PREFIX}:{OP_WREVIEW}"
+                ),
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                ),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    BTN_WZ_SAVE, callback_data=f"{CB_PREFIX}:{OP_WSAVE}"
+                ),
+                InlineKeyboardButton(
+                    BTN_WZ_CANCEL, callback_data=f"{CB_PREFIX}:{OP_WCANCEL}"
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_wizard_summary(state: dict) -> str:
+    """The seven staged values — full destination, admin's own chat
+    only (the same exposure as the existing edit template)."""
+    category = state.get("category")
+    dest_label = DEST_LABEL.get(category or "", "العنوان")
+    return (
+        f"الفئة: {category or EMPTY_FIELD}\n"
+        f"الاسم: {state.get('display_name') or EMPTY_FIELD}\n"
+        f"العملة: {state.get('asset') or EMPTY_FIELD}\n"
+        f"الشبكة: {state.get('network') or EMPTY_FIELD}\n"
+        f"المزود: {state.get('provider') or EMPTY_FIELD}\n"
+        f"{dest_label}: {state.get('destination') or EMPTY_FIELD}\n"
+        f"الملاحظات: {state.get('instructions') or EMPTY_FIELD}"
+    )
+
+
+def build_review_text(state: dict) -> str:
+    return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
+
+
+def build_menu_text(state: dict) -> str:
+    if state.get("mode") == "edit":
+        header = f"✏️ تعديل وسيلة الدفع #{state.get('method_id')}"
+    else:
+        header = "✏️ تعديل البيانات قبل الحفظ"
+    return (
+        f"{header}\n{WZ_RULE}\n\n{build_wizard_summary(state)}\n\n"
+        "اختر الحقل الذي تريد تعديله:"
+    )
+
+
+def _missing_required(state: dict) -> list[str]:
+    return [
+        _FIELD_LABELS[field]
+        for field in _REQUIRED_FIELDS
+        if not state.get(field)
+    ]
+
+
+def _distinct_options(state: dict, step: str) -> tuple[str, ...]:
+    """Values already held by the system (bounded, deduplicated).
+
+    Empty on any read failure — the step then falls back to free
+    text, so a transient database error never strands the wizard.
+    """
+    try:
+        methods = store.list_payment_methods()
+    except Exception:
+        logger.debug("Payment-method wizard options read failed", exc_info=True)
+        return ()
+    category = state.get("category")
+    seen: list[str] = []
+    for method in methods:
+        if category and method.category != category:
+            continue
+        value = method.network if step == "network" else method.asset
+        if value and value not in seen:
+            seen.append(value)
+    return tuple(seen[:_MAX_OPTIONS])
+
+
+def _render_step(state: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Prompt + keyboard for the state's CURRENT step (refreshes the
+    option snapshot the selection callbacks validate against)."""
+    step = state.get("step")
+    if step == "category":
+        return WZ_PROMPT_CATEGORY, build_category_keyboard()
+    if step == "asset":
+        options = _distinct_options(state, "asset")
+        state["asset_options"] = options
+        if options:
+            state["manual"] = False
+            return WZ_SELECT_ASSET, _options_keyboard("asset", options)
+        state["manual"] = True
+        return WZ_PROMPT_ASSET, _cancel_keyboard()
+    if step == "network":
+        options = _distinct_options(state, "network")
+        state["asset_options"] = options
+        if options:
+            state["manual"] = False
+            return WZ_SELECT_NETWORK, _options_keyboard("network", options)
+        state["manual"] = True
+        return WZ_PROMPT_NETWORK, _network_prompt_keyboard()
+    if step == "display_name":
+        return WZ_PROMPT_NAME, _cancel_keyboard()
+    if step == "provider":
+        return WZ_PROMPT_PROVIDER, _cancel_keyboard()
+    if step == "destination":
+        return WZ_PROMPT_DESTINATION, _cancel_keyboard()
+    if step == "instructions":
+        return WZ_PROMPT_INSTRUCTIONS, _instructions_keyboard()
+    if step == "review":
+        return build_review_text(state), build_review_keyboard()
+    if step == "menu":
+        return build_menu_text(state), _menu_keyboard(state.get("mode", "add"))
+    raise ValueError(f"unknown wizard step: {step!r}")
+
+
+def _next_step_after(state: dict, field: str) -> str:
+    if state.get("mode") == "edit":
+        return "menu"
+    if state.get("editing"):
+        return "review"
+    if field == "category":
+        return "asset"
+    if field == "asset":
+        # Network applies to crypto; cash methods stage network=None
+        # (the store maps that to NULL exactly like the "-" sentinel).
+        return (
+            "network"
+            if state.get("category") == store.CATEGORY_CRYPTO
+            else "display_name"
+        )
+    if field == "network":
+        return "display_name"
+    if field == "display_name":
+        return "provider"
+    if field == "provider":
+        return "destination"
+    if field == "destination":
+        return "instructions"
+    return "review"  # instructions — optional, reached last
+
+
+def _commit_field(state: dict, field: str, value) -> None:
+    state[field] = value
+    state["manual"] = False
+    state["asset_options"] = ()
+    next_step = _next_step_after(state, field)
+    if next_step in ("review", "menu"):
+        state["editing"] = False
+    state["step"] = next_step
+
+
+# ── Wizard starters ───────────────────────────────────────────────────
+
+
+async def _start_add_wizard(actor: int, message) -> None:
+    _WIZARD_STATES[actor] = _new_wizard_state("add")
+    logger.info("Payment method wizard started: admin=%d mode=add", actor)
+    text, markup = _render_step(_WIZARD_STATES[actor])
+    await message.reply_text(text, reply_markup=markup)
+
+
+async def _start_edit_wizard(actor: int, method_id: int, message) -> None:
+    try:
+        method = store.get_payment_method(method_id)
+    except Exception:
+        logger.exception(
+            "Payment method wizard edit load failed: id=%s admin=%d",
+            method_id,
+            actor,
+        )
+        await message.reply_text(MSG_ERROR)
+        return
+    if method is None:
+        await message.reply_text(MSG_NOT_FOUND)
+        return
+    state = _new_wizard_state("edit")
+    state["method_id"] = method.id
+    state["category"] = method.category
+    state["display_name"] = method.display_name
+    state["asset"] = method.asset
+    state["network"] = method.network
+    state["provider"] = method.provider
+    state["destination"] = method.destination
+    state["instructions"] = method.instructions
+    _WIZARD_STATES[actor] = state
+    logger.info(
+        "Payment method wizard started: admin=%d mode=edit id=%d",
+        actor,
+        method.id,
+    )
+    text, markup = _render_step(state)
+    await message.reply_text(text, reply_markup=markup)
+
+
 # ── PTB handlers ──────────────────────────────────────────────────────
 
 
@@ -483,7 +1030,11 @@ async def paymethods_command(update, context) -> None:
 
 
 async def add_pm_command(update, context) -> None:
-    """``/addpm <form>`` — validate + persist a new payment method."""
+    """``/addpm`` → interactive wizard; ``/addpm <form>`` → legacy pipe.
+
+    Authorization runs BEFORE either path, so a non-admin never
+    reaches the wizard state machine.
+    """
     if _non_private_chat(update):
         return
     message = getattr(update, "message", None)
@@ -498,7 +1049,9 @@ async def add_pm_command(update, context) -> None:
 
     body = _command_body(message)
     if not body:
-        await message.reply_text(HELP_TEXT)
+        # The interactive wizard (requested UX).  The pipe form below
+        # stays byte-for-byte compatible for existing scripts.
+        await _start_add_wizard(actor, message)
         return
     form = parse_add_form(body)
     if form is None:
@@ -529,7 +1082,9 @@ async def add_pm_command(update, context) -> None:
 
 
 async def edit_pm_command(update, context) -> None:
-    """``/editpm <id> | <form>`` — full replace; the id stays stable."""
+    """``/editpm <id>`` → interactive field menu; ``<id> | <form>`` →
+    legacy full replace (unchanged); the id stays stable either way.
+    """
     if _non_private_chat(update):
         return
     message = getattr(update, "message", None)
@@ -543,6 +1098,11 @@ async def edit_pm_command(update, context) -> None:
         return
 
     body = _command_body(message)
+    if body.isascii() and body.isdigit() and int(body) > 0:
+        # /editpm <id> → interactive edit menu (the pipe form below
+        # stays unchanged for existing scripts).
+        await _start_edit_wizard(actor, int(body), message)
+        return
     parsed = parse_edit_form(body)
     if parsed is None:
         await message.reply_text(MSG_USAGE_EDIT)
@@ -580,6 +1140,300 @@ async def edit_pm_command(update, context) -> None:
     )
 
 
+async def wizard_text_input(update, context) -> None:
+    """Free-text answers for the payment-method wizard.
+
+    Registered in its OWN handler group (group 10 in bot.py) and
+    completely SELF-GATED: silent unless THIS private chat's admin
+    holds a live wizard state on a text-input step, so ordinary chat
+    and every other text flow are untouched.  Identity comes from
+    ``effective_user`` only (never from message text), authorization
+    is re-checked before validation, and validation delegates to the
+    EXISTING store validators — their Arabic errors reach the admin
+    verbatim.  A validation failure keeps the state so the admin can
+    simply retry.
+    """
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    if _non_private_chat(update):
+        return
+    actor = _actor_id(getattr(getattr(update, "effective_user", None), "id", None))
+    if actor is None:
+        return
+    state, expired = _wizard_state(actor)
+    if state is None:
+        if expired:
+            await message.reply_text(MSG_WIZARD_STALE)
+        return  # not our state — stay silent like the other catch-alls
+    if not is_admin(actor):
+        # Authorization can be revoked mid-flow: drop the staged form
+        # and never validate or arm anything without auth.
+        _WIZARD_STATES.pop(actor, None)
+        await message.reply_text(MSG_ADMIN_ONLY)
+        return
+    step = state.get("step")
+    if step not in _TEXT_STEPS or (
+        step in ("asset", "network") and not state.get("manual")
+    ):
+        # Category/review/menu and suggestion steps expect buttons —
+        # answer with the guidance line instead of swallowing the text.
+        await message.reply_text(MSG_WIZARD_INVALID_OPTION)
+        return
+    validator = _FIELD_VALIDATORS.get(step)
+    if validator is None:
+        return
+    try:
+        value = validator(getattr(message, "text", None))
+    except PaymentMethodValidationError as exc:
+        await message.reply_text(f"❌ {exc}{MSG_WIZARD_RETRY}")
+        return
+    _commit_field(state, step, value)
+    try:
+        text, markup = _render_step(state)
+    except Exception:
+        logger.exception("Payment method wizard render failed: admin=%d", actor)
+        _WIZARD_STATES.pop(actor, None)
+        await message.reply_text(MSG_ERROR)
+        return
+    await message.reply_text(text, reply_markup=markup)
+
+
+async def _wizard_step_edit(query, state: dict) -> None:
+    text, markup = _render_step(state)
+    await _safe_edit(query, text, markup)
+
+
+async def _wizard_callback(query, actor: int, op: str, ref: int | None) -> None:
+    """``pm:<wizard op>`` — the staged state is located by the
+    TELEGRAM ACTOR (``query.from_user``), never by the payload.
+    Another admin therefore has no handle on this wizard at all, and
+    a stale/expired/unknown button answers with a clear Arabic
+    message while mutating nothing.
+    """
+    state, _expired = _wizard_state(actor)
+    if state is None:
+        await _safe_answer(query, MSG_WIZARD_STALE)
+        return
+    if not is_admin(actor):
+        _WIZARD_STATES.pop(actor, None)
+        await _safe_answer(query, MSG_ADMIN_ONLY)
+        return
+    try:
+        if op == OP_WCANCEL:
+            _WIZARD_STATES.pop(actor, None)
+            await _safe_answer(query, None)
+            await _safe_edit(query, MSG_WIZARD_CANCELED, None)
+            return
+
+        if op == OP_WCAT:
+            if state.get("step") != "category" or ref not in (1, 2):
+                await _safe_answer(query, MSG_WIZARD_INVALID_OPTION)
+                return
+            _commit_field(
+                state,
+                "category",
+                store.CATEGORY_CRYPTO if ref == 1 else store.CATEGORY_CASH,
+            )
+            await _wizard_step_edit(query, state)
+            return
+
+        if op in (OP_WASSET, OP_WNET):
+            step = "asset" if op == OP_WASSET else "network"
+            if state.get("step") != step:
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            options = state.get("asset_options") or ()
+            if ref is None or ref < 1 or ref > len(options):
+                # Crafted/out-of-range index: state kept, nothing set.
+                await _safe_answer(query, MSG_WIZARD_INVALID_OPTION)
+                return
+            _commit_field(state, step, options[ref - 1])
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WNONE:
+            if state.get("step") != "network":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            _commit_field(state, "network", None)
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WMANUAL:
+            if state.get("step") not in ("asset", "network"):
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            state["manual"] = True
+            if state.get("step") == "asset":
+                prompt = WZ_PROMPT_ASSET_MANUAL
+            else:
+                prompt = WZ_PROMPT_NETWORK_MANUAL
+            await _safe_edit(query, prompt, _cancel_keyboard())
+            return
+
+        if op == OP_WSKIP:
+            if state.get("step") != "instructions":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            _commit_field(state, "instructions", None)
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WFIELD:
+            if state.get("step") != "menu":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            if ref is None or ref < 1 or ref > len(_MENU_FIELDS):
+                await _safe_answer(query, MSG_WIZARD_INVALID_OPTION)
+                return
+            field = _MENU_FIELDS[ref - 1]
+            state["manual"] = False
+            state["asset_options"] = ()
+            if state.get("mode") == "add":
+                state["editing"] = True
+            state["step"] = field
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WMENU:
+            if state.get("mode") != "add" or state.get("step") != "review":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            state["step"] = "menu"
+            state["editing"] = False
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WREVIEW:
+            if state.get("mode") != "add" or state.get("step") != "menu":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            missing = _missing_required(state)
+            if missing:
+                await _safe_answer(
+                    query, MSG_WIZARD_MISSING_PREFIX + "، ".join(missing)
+                )
+                return
+            state["step"] = "review"
+            await _wizard_step_edit(query, state)
+            return
+
+        if op == OP_WCONFIRM:
+            if state.get("mode") != "add" or state.get("step") != "review":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            missing = _missing_required(state)
+            if missing:
+                await _safe_answer(
+                    query, MSG_WIZARD_MISSING_PREFIX + "، ".join(missing)
+                )
+                return
+            try:
+                store.validate_form(
+                    state.get("category"),
+                    state.get("display_name"),
+                    state.get("asset"),
+                    state.get("network"),
+                    state.get("provider"),
+                    state.get("destination"),
+                    state.get("instructions"),
+                )
+            except PaymentMethodValidationError as exc:
+                # State kept — the admin can fix it from the menu.
+                await _safe_answer(query, f"❌ {exc}")
+                return
+            # SINGLE-USE: pop BEFORE the write so a double press can
+            # never create a second row.  The local ``state`` dict
+            # still holds the validated values for the insert below.
+            if _WIZARD_STATES.pop(actor, None) is None:
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            try:
+                created = store.create_payment_method(
+                    category=state.get("category"),
+                    display_name=state.get("display_name"),
+                    asset=state.get("asset"),
+                    network=state.get("network"),
+                    provider=state.get("provider"),
+                    destination=state.get("destination"),
+                    instructions=state.get("instructions"),
+                    created_by=actor,
+                )
+            except PaymentMethodValidationError as exc:
+                await _safe_edit(query, f"❌ {exc}", None)
+                return
+            except Exception:
+                # The slot is already popped and the store writes
+                # transactionally → no half-written row, no stale
+                # state: everything stays consistent.
+                logger.exception(
+                    "Payment method wizard create failed: admin=%d", actor
+                )
+                await _safe_edit(query, MSG_ERROR, None)
+                return
+            await _safe_answer(query, None)
+            await _safe_edit(query, build_created_text(created), _list_again_button())
+            return
+
+        if op == OP_WSAVE:
+            if state.get("mode") != "edit" or state.get("step") != "menu":
+                await _safe_answer(query, MSG_WIZARD_STALE)
+                return
+            missing = _missing_required(state)
+            if missing:
+                await _safe_answer(
+                    query, MSG_WIZARD_MISSING_PREFIX + "، ".join(missing)
+                )
+                return
+            method_id = state.get("method_id")
+            try:
+                updated = store.update_payment_method(
+                    method_id,
+                    category=state.get("category"),
+                    display_name=state.get("display_name"),
+                    asset=state.get("asset"),
+                    network=state.get("network"),
+                    provider=state.get("provider"),
+                    destination=state.get("destination"),
+                    instructions=state.get("instructions"),
+                    updated_by=actor,
+                )
+            except PaymentMethodValidationError as exc:
+                # State kept — fix the field and save again.
+                await _safe_answer(query, f"❌ {exc}")
+                return
+            except Exception:
+                # Transactional store → the row is unchanged and the
+                # staged state is still valid, so retry is safe.
+                logger.exception(
+                    "Payment method wizard save failed: id=%s admin=%d",
+                    method_id,
+                    actor,
+                )
+                await _safe_answer(query, MSG_ERROR)
+                return
+            _WIZARD_STATES.pop(actor, None)
+            if updated is None:
+                await _safe_edit(query, MSG_NOT_FOUND, _list_again_button())
+                return
+            await _safe_answer(query, None)
+            await _safe_edit(
+                query,
+                f"✅ تم تعديل الوسيلة #{updated.id}",
+                _list_again_button(),
+            )
+            return
+
+        # Defensive: parse_callback only admits the grammar above.
+        await _safe_answer(query, MSG_INVALID)
+    except Exception:
+        logger.exception(
+            "Payment method wizard callback failed: op=%s admin=%d", op, actor
+        )
+        await _safe_answer(query, MSG_ERROR)
+
+
 async def payment_method_callback(update, context) -> None:
     """``pm:`` callbacks — private admin chat ONLY, server re-reads all.
 
@@ -603,6 +1457,13 @@ async def payment_method_callback(update, context) -> None:
     op, ref = parsed
 
     try:
+        # Wizard buttons: same pm: family, dispatched before the
+        # method-id ops (their "ref" is an option/field index, never
+        # a payment-method id).
+        if op in _WIZARD_OPS:
+            await _wizard_callback(query, actor, op, ref)
+            return
+
         if op == OP_HELP:
             await _safe_answer(query, None)
             await _safe_edit(query, HELP_TEXT, None)

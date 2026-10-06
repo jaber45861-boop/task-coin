@@ -2016,7 +2016,8 @@ def main() -> None:
         "withdraw", withdrawal_user.withdraw_command,
     ), group=0)
     # MT-ADMIN-08: payment-method management — private admin chat ONLY.
-    #    /paymethods panel; /addpm + /editpm use the stateless
+    #    /paymethods panel; bare /addpm opens the interactive wizard,
+    #    /addpm <form> + /editpm <id> | <form> keep the stateless
     #    pipe-form convention (same as /addchannel).  Authorization is
     #    enforced inside every handler; group/channel invocations stay
     #    silent (MT-ADMIN-02 isolation).
@@ -2137,6 +2138,17 @@ def main() -> None:
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         task_request_admin.task_request_text_input,
     ), group=9)
+
+    # MT-ADMIN-08: payment-method wizard free-text answers (manual
+    #    asset/network entry, name, provider, destination, notes).
+    #    Registered STATICALLY in its OWN group (same rationale as
+    #    groups 2/3/6/7/8/9) and self-gated — silent unless the sender
+    #    is an admin holding a live /addpm or /editpm wizard state on
+    #    a text-input step, so every earlier text handler is unaffected.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        payment_method_admin.wizard_text_input,
+    ), group=10)
 
     # 6. Verify callback (re-checks all channels, unlocks if subscribed).
     app.add_handler(CallbackQueryHandler(
