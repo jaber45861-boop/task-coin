@@ -58,6 +58,7 @@ import payment_method_store as store
 
 # ── Identities ────────────────────────────────────────────────────────
 ADMIN_A = 111111
+ADMIN_B = 222222
 STRANGER = 999999
 
 
@@ -160,6 +161,11 @@ class PaymentMethodTestBase(unittest.TestCase):
         self._orig_admins = list(config.ADMINS)
         config.ADMINS[:] = [ADMIN_A]
         self.addCleanup(self._restore_admins)
+
+        # The interactive wizard stages its form in a module-level
+        # per-admin slot — isolate every test from any leftover state.
+        admin._WIZARD_STATES.clear()
+        self.addCleanup(admin._WIZARD_STATES.clear)
 
     def _restore_db(self) -> None:
         db.DB_PATH = self._orig_db_path
@@ -549,10 +555,20 @@ class TestValidation(PaymentMethodTestBase):
                 self.assertIn("❌", _reply(update))
         self.assertEqual(self._rows(), [])
 
-        # Bare /addpm shows the help text instead of failing.
+        # Bare /addpm now starts the interactive wizard (the pipe
+        # form above keeps working unchanged).
         update = _update(ADMIN_A, "/addpm")
         _run(admin.add_pm_command(update, MagicMock()))
-        self.assertEqual(_reply(update), admin.HELP_TEXT)
+        reply = _reply(update)
+        self.assertIn(admin.WZ_ADD_TITLE, reply)
+        markup = update.message.reply_text.call_args[1]["reply_markup"]
+        callbacks = [
+            b.callback_data
+            for row in markup.inline_keyboard
+            for b in row
+        ]
+        self.assertEqual(callbacks, ["pm:wcat:1", "pm:wcat:2", "pm:wcancel"])
+        self.assertIn(ADMIN_A, admin._WIZARD_STATES)
 
     def test_bounds_and_control_chars_rejected(self) -> None:
         """12b. Over-long and control-character input is rejected."""
@@ -603,8 +619,30 @@ class TestValidation(PaymentMethodTestBase):
     def test_edit_form_structure_validated(self) -> None:
         update = self._edit("notanid | cash | n | EGP | - | p | d | -")
         self.assertEqual(_reply(update), admin.MSG_USAGE_EDIT)
+        # Bare /editpm <id> no longer shows usage: unknown ids report
+        # NOT_FOUND (no state armed)…
         update = self._edit("1")
-        self.assertEqual(_reply(update), admin.MSG_USAGE_EDIT)
+        self.assertEqual(_reply(update), admin.MSG_NOT_FOUND)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        # …and a real id opens the interactive field menu.
+        mid = self._create()
+        update = self._edit(str(mid))
+        reply = _reply(update)
+        self.assertIn(f"#{mid}", reply)
+        markup = update.message.reply_text.call_args[1]["reply_markup"]
+        callbacks = [
+            b.callback_data
+            for row in markup.inline_keyboard
+            for b in row
+        ]
+        self.assertIn("pm:wsave", callbacks)
+        self.assertIn("pm:wcancel", callbacks)
+        self.assertIn("pm:wfield:5", callbacks)  # provider
+        # Cancel drops the staged state and mutates nothing.
+        cancel = _callback(ADMIN_A, "pm:wcancel")
+        _run(admin.payment_method_callback(cancel, MagicMock()))
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        self.assertEqual(len(self._rows()), 1)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -930,6 +968,508 @@ class TestSecurityGuards(PaymentMethodTestBase):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# INTERACTIVE WIZARD — bare /addpm and /editpm <id>
+# ══════════════════════════════════════════════════════════════════
+
+
+class WizardTestBase(PaymentMethodTestBase):
+    """Shared drivers for the button/text wizard flows."""
+
+    def _start(
+        self,
+        *,
+        admin_id: int = ADMIN_A,
+        text: str = "/addpm",
+        chat_type: str = "private",
+    ) -> MagicMock:
+        update = _update(admin_id, text, chat_type=chat_type)
+        _run(admin.add_pm_command(update, MagicMock()))
+        return update
+
+    def _press_w(
+        self, data: str, *, admin_id: int = ADMIN_A, chat_type: str = "private"
+    ) -> MagicMock:
+        update = _callback(admin_id, data, chat_type=chat_type)
+        _run(admin.payment_method_callback(update, MagicMock()))
+        return update
+
+    def _type(self, text: str, *, admin_id: int = ADMIN_A) -> MagicMock:
+        update = _update(admin_id, text)
+        _run(admin.wizard_text_input(update, MagicMock()))
+        return update
+
+    @staticmethod
+    def _reply_markup_of(message_update: MagicMock) -> InlineKeyboardMarkup:
+        return message_update.message.reply_text.call_args[1]["reply_markup"]
+
+    @staticmethod
+    def _buttons(markup: InlineKeyboardMarkup | None) -> list[str]:
+        if markup is None:
+            return []
+        return [
+            b.callback_data for row in markup.inline_keyboard for b in row
+        ]
+
+    @staticmethod
+    def _labels(markup: InlineKeyboardMarkup | None) -> list[str]:
+        if markup is None:
+            return []
+        return [b.text for row in markup.inline_keyboard for b in row]
+
+    def _drive_to_review(
+        self,
+        *,
+        asset: str = "WZASSET",
+        network: str = "WZNET",
+        name: str = "وسيلة الاختبار",
+        provider: str = "مزود الاختبار",
+        destination: str = "WZDEST123456",
+    ) -> MagicMock:
+        """Bare /addpm → review page on a fresh database (no suggestions)."""
+        start = self._start()
+        self.assertIn(admin.WZ_ADD_TITLE, _reply(start))
+        stage2 = self._press_w("pm:wcat:1")
+        asset_prompt = _edited(stage2.callback_query)
+        if asset_prompt == admin.WZ_SELECT_ASSET:
+            # This database already holds suggestions → use manual
+            # entry so the flow stays value-driven.
+            self._press_w("pm:wmanual")
+        else:
+            self.assertIn(admin.WZ_PROMPT_ASSET, asset_prompt)
+        stage3 = self._type(asset)
+        network_prompt = _reply(stage3)
+        if network_prompt == admin.WZ_SELECT_NETWORK:
+            self._press_w("pm:wmanual")
+        else:
+            self.assertEqual(network_prompt, admin.WZ_PROMPT_NETWORK)
+        stage4 = self._type(network)
+        self.assertEqual(_reply(stage4), admin.WZ_PROMPT_NAME)
+        stage5 = self._type(name)
+        self.assertEqual(_reply(stage5), admin.WZ_PROMPT_PROVIDER)
+        stage6 = self._type(provider)
+        dest_prompt = _reply(stage6)
+        self.assertIn("Private Key", dest_prompt)
+        self.assertIn("Seed Phrase", dest_prompt)
+        stage7 = self._type(destination)
+        self.assertEqual(_reply(stage7), admin.WZ_PROMPT_INSTRUCTIONS)
+        return self._press_w("pm:wskip")
+
+
+class TestAddWizard(WizardTestBase):
+    """The requested scenarios for the /addpm wizard."""
+
+    def test_addpm_starts_wizard(self) -> None:
+        """1. Bare /addpm opens the wizard; nothing is persisted."""
+        # Group invocation stays silent first (MT-ADMIN-02 isolation).
+        group_update = _update(
+            ADMIN_A, "/addpm", chat_type="supergroup", chat_id=-1007
+        )
+        _run(admin.add_pm_command(group_update, MagicMock()))
+        group_update.message.reply_text.assert_not_called()
+
+        update = self._start()
+        reply = _reply(update)
+        self.assertIn(admin.WZ_ADD_TITLE, reply)
+        self.assertIn("/addpm", reply)  # legacy form still discoverable
+        self.assertEqual(
+            self._buttons(self._reply_markup_of(update)),
+            ["pm:wcat:1", "pm:wcat:2", "pm:wcancel"],
+        )
+        self.assertIn(ADMIN_A, admin._WIZARD_STATES)
+        self.assertEqual(self._rows(), [])
+
+    def test_non_admin_cannot_start_wizard(self) -> None:
+        """2. Non-admin: no wizard, no buttons, zero rows."""
+        update = _update(STRANGER, "/addpm")
+        _run(admin.add_pm_command(update, MagicMock()))
+        self.assertEqual(_reply(update), admin.MSG_ADMIN_ONLY)
+        self.assertNotIn(STRANGER, admin._WIZARD_STATES)
+        self.assertEqual(self._rows(), [])
+        # …and a non-admin pressing a wizard button is refused too.
+        press = self._press_w("pm:wconfirm", admin_id=STRANGER)
+        self.assertEqual(
+            _answered(press.callback_query), admin.MSG_ADMIN_ONLY
+        )
+        self.assertEqual(self._rows(), [])
+
+    def test_full_crypto_flow_creates_once(self) -> None:
+        """3 + 9 + 11 + 12 + 14. Crypto → address → skip notes →
+        correct review → exactly one row on confirm."""
+        review = self._drive_to_review()
+        text = _edited(review.callback_query)
+        self.assertIn("🔎 مراجعة وسيلة الدفع", text)
+        self.assertIn("الفئة: crypto", text)
+        self.assertIn("الاسم: وسيلة الاختبار", text)
+        self.assertIn("العملة: WZASSET", text)
+        self.assertIn("الشبكة: WZNET", text)
+        self.assertIn("المزود: مزود الاختبار", text)
+        self.assertIn("العنوان: WZDEST123456", text)
+        self.assertIn("الملاحظات: -", text)
+        self.assertEqual(
+            self._buttons(_markup_of_edit(review.callback_query)),
+            ["pm:wconfirm", "pm:wmenu", "pm:wcancel"],
+        )
+        # The review page wrote NOTHING before confirmation.
+        self.assertEqual(self._rows(), [])
+
+        done = self._press_w("pm:wconfirm")
+        self.assertIn("تمت إضافة الوسيلة #1", _edited(done.callback_query))
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["category"], "crypto")
+        self.assertEqual(row["asset"], "WZASSET")
+        self.assertEqual(row["network"], "WZNET")
+        self.assertEqual(row["display_name"], "وسيلة الاختبار")
+        self.assertEqual(row["provider"], "مزود الاختبار")
+        self.assertEqual(row["destination"], "WZDEST123456")
+        self.assertIsNone(row["instructions"])  # skipped
+        self.assertEqual(row["created_by"], ADMIN_A)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+
+    def test_cash_flow_skips_network(self) -> None:
+        """4. Cash is offered and completes without a network step."""
+        self._start()
+        stage = self._press_w("pm:wcat:2")
+        self.assertIn(admin.WZ_PROMPT_ASSET, _edited(stage.callback_query))
+        stage = self._type("EGP")
+        self.assertEqual(_reply(stage), admin.WZ_PROMPT_NAME)  # no network
+        self._type("كاش الاختبار")
+        self._type("مزود الكاش")
+        stage = self._type("WZCASHDEST")
+        self.assertEqual(_reply(stage), admin.WZ_PROMPT_INSTRUCTIONS)
+        review = self._press_w("pm:wskip")
+        text = _edited(review.callback_query)
+        self.assertIn("الفئة: cash", text)
+        self.assertIn("الشبكة: -", text)
+        self._press_w("pm:wconfirm")
+        row = self._rows()[0]
+        self.assertEqual(row["category"], "cash")
+        self.assertIsNone(row["network"])
+
+    def test_asset_and_network_suggestions_from_system(self) -> None:
+        """5 + 7. Buttons show what the system ALREADY holds;
+        crafted indexes are rejected without touching the state."""
+        self._create()  # crypto / USDT / TESTNET already in the system
+        self._start()
+        pick = self._press_w("pm:wcat:1")
+        asset_markup = _markup_of_edit(pick.callback_query)
+        self.assertIn("pm:wasset:1", self._buttons(asset_markup))
+        self.assertIn("USDT", self._labels(asset_markup))
+
+        bad = self._press_w("pm:wasset:99")
+        self.assertEqual(
+            _answered(bad.callback_query), admin.MSG_WIZARD_INVALID_OPTION
+        )
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "asset"
+        )
+        self.assertEqual(self._rows()[0]["asset"], "USDT")  # seed intact
+
+        net = self._press_w("pm:wasset:1")
+        net_markup = _markup_of_edit(net.callback_query)
+        self.assertIn("pm:wnet:1", self._buttons(net_markup))
+        self.assertIn("TESTNET", self._labels(net_markup))
+        self.assertIn("pm:wnone", self._buttons(net_markup))
+
+        bad = self._press_w("pm:wnet:42")
+        self.assertEqual(
+            _answered(bad.callback_query), admin.MSG_WIZARD_INVALID_OPTION
+        )
+        stage = self._press_w("pm:wnet:1")
+        self.assertEqual(_edited(stage.callback_query), admin.WZ_PROMPT_NAME)
+
+    def test_manual_asset_entry_validated_by_store(self) -> None:
+        """6. Typing while buttons are pending gets guidance; the
+        manual path refuses empty values via the EXISTING validator."""
+        self._create()
+        self._start()
+        self._press_w("pm:wcat:1")
+        # Free text while suggestion buttons are pending → guidance,
+        # state unchanged.
+        hint = self._type("WHATEVER")
+        self.assertEqual(_reply(hint), admin.MSG_WIZARD_INVALID_OPTION)
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "asset"
+        )
+        # Manual entry…
+        manual = self._press_w("pm:wmanual")
+        self.assertEqual(
+            _edited(manual.callback_query), admin.WZ_PROMPT_ASSET_MANUAL
+        )
+        for bad in ("", "   "):
+            resp = self._type(bad)
+            reply = _reply(resp)
+            self.assertIn("❌", reply)
+            self.assertIn("العملة", reply)
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "asset"
+        )
+        ok = self._type("WZNEWASSET")
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "network"
+        )
+        self.assertIn(admin.WZ_SELECT_NETWORK, _reply(ok))
+
+    def test_empty_and_secret_destination_rejected(self) -> None:
+        """10. Empty addresses never persist; the private-key marker
+        rule applies on the wizard path too."""
+        self._start()
+        self._press_w("pm:wcat:1")
+        self._type("WZASSET")
+        self._type("WZNET")
+        self._type("الاسم")
+        self._type("المزود")
+        for bad in ("", "   ", "\t"):
+            resp = self._type(bad)
+            reply = _reply(resp)
+            self.assertIn("❌", reply)
+            self.assertIn("العنوان", reply)
+        resp = self._type("my private key material")
+        self.assertIn("مفتاح خاص", _reply(resp))
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "destination"
+        )
+        self.assertEqual(self._rows(), [])
+        # A valid public address advances to the optional notes.
+        resp = self._type("WZDEST-OK")
+        self.assertEqual(_reply(resp), admin.WZ_PROMPT_INSTRUCTIONS)
+
+    def test_cancel_creates_nothing(self) -> None:
+        """13. Cancel drops the state; later presses are inert."""
+        self._drive_to_review()
+        cancel = self._press_w("pm:wcancel")
+        self.assertEqual(
+            _edited(cancel.callback_query), admin.MSG_WIZARD_CANCELED
+        )
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        self.assertEqual(self._rows(), [])
+        again = self._press_w("pm:wconfirm")
+        self.assertEqual(
+            _answered(again.callback_query), admin.MSG_WIZARD_STALE
+        )
+        self.assertEqual(self._rows(), [])
+
+    def test_double_confirm_creates_once(self) -> None:
+        """15. A double press on confirmation yields exactly one row."""
+        self._drive_to_review()
+        first = self._press_w("pm:wconfirm")
+        self.assertIn("تمت إضافة", _edited(first.callback_query))
+        second = self._press_w("pm:wconfirm")
+        self.assertEqual(
+            _answered(second.callback_query), admin.MSG_WIZARD_STALE
+        )
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_other_admin_cannot_drive_wizard(self) -> None:
+        """16. The wizard belongs to the actor who started it — another
+        admin (and any non-admin) has no handle on it."""
+        config.ADMINS[:] = [ADMIN_A, ADMIN_B]
+        self._drive_to_review()
+        hijack = self._press_w("pm:wconfirm", admin_id=ADMIN_B)
+        self.assertEqual(
+            _answered(hijack.callback_query), admin.MSG_WIZARD_STALE
+        )
+        self.assertEqual(self._rows(), [])
+        stranger = self._press_w("pm:wconfirm", admin_id=STRANGER)
+        self.assertEqual(
+            _answered(stranger.callback_query), admin.MSG_ADMIN_ONLY
+        )
+        self.assertEqual(self._rows(), [])
+        # The original admin can still finish it.
+        done = self._press_w("pm:wconfirm")
+        self.assertIn("تمت إضافة", _edited(done.callback_query))
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(self._rows()[0]["created_by"], ADMIN_A)
+
+    def test_expired_state_cannot_confirm(self) -> None:
+        """17. After the TTL the staged data can no longer complete
+        an operation — and the stale notice is sent exactly once."""
+        self._drive_to_review()
+        admin._WIZARD_STATES[ADMIN_A][
+            "updated_at"
+        ] -= admin.WIZARD_TTL_SECONDS + 1
+        # First contact after the TTL collects the slot with ONE stale
+        # notice (free-text path)…
+        resp = self._type("أي نص")
+        self.assertEqual(_reply(resp), admin.MSG_WIZARD_STALE)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        resp = self._type("نص ثانٍ")
+        resp.message.reply_text.assert_not_called()
+        # …and a later confirm press mutates nothing either.
+        press = self._press_w("pm:wconfirm")
+        self.assertEqual(
+            _answered(press.callback_query), admin.MSG_WIZARD_STALE
+        )
+        self.assertEqual(self._rows(), [])
+
+    def test_db_failure_leaves_consistent_state(self) -> None:
+        """18. A failing insert reports the error, writes nothing and
+        leaves no half-open wizard behind."""
+        self._drive_to_review()
+        with patch.object(
+            admin.store,
+            "create_payment_method",
+            side_effect=RuntimeError("db down"),
+        ):
+            press = self._press_w("pm:wconfirm")
+        self.assertEqual(_edited(press.callback_query), admin.MSG_ERROR)
+        self.assertEqual(self._rows(), [])
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+
+    def test_deposit_flow_sees_wizard_method(self) -> None:
+        """19. A wizard-created method reaches the deposit surface via
+        the exact selection filter of list_deposit_methods."""
+        self._drive_to_review()
+        self._press_w("pm:wconfirm")
+        mid = self._rows()[0]["id"]
+        store.set_payment_method_deposits_enabled(
+            mid, True, updated_by=ADMIN_A
+        )
+        visible = [
+            pm.id
+            for pm in store.list_payment_methods(active_only=True)
+            if pm.deposits_enabled
+        ]
+        self.assertEqual(visible, [mid])
+
+    def test_existing_methods_still_work(self) -> None:
+        """20 + 22. Pre-existing rows and the legacy pipe form keep
+        working unchanged alongside the wizard."""
+        legacy_id = self._create()
+        before = self._rows()[0]
+        self._drive_to_review()
+        self._press_w("pm:wconfirm")
+        rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["destination"], before["destination"])
+        self.assertEqual(rows[0]["is_active"], 1)
+        # List still renders both with destination masking intact.
+        listing = self._press_w("pm:list")
+        text = _edited(listing.callback_query)
+        self.assertNotIn("TXtest1234567890", text)
+        self.assertIn("وسيلة الاختبار", text)
+        # The existing activation button still toggles the old row.
+        self._press_w(f"pm:off:{legacy_id}")
+        self.assertEqual(self._rows()[0]["is_active"], 0)
+        # Legacy one-liner creates exactly as before…
+        update = self._add(self.CASH_FORM)
+        self.assertIn("تمت إضافة الوسيلة #3", _reply(update))
+        # …and a malformed pipe line still yields the usage message.
+        update = self._add("crypto | only | three")
+        self.assertEqual(_reply(update), admin.MSG_USAGE_ADD)
+
+    def test_no_destination_in_wizard_logs(self) -> None:
+        """21. Audit lines carry wizard/operation ids — never the
+        staged destination."""
+        secret_dest = "WZSECRETDESTVALUE987"
+        with self.assertLogs("payment_method_admin", level="INFO") as cm_a:
+            with self.assertLogs("payment_method_store", level="INFO") as cm_s:
+                self._drive_to_review(destination=secret_dest)
+                self._press_w("pm:wconfirm")
+        joined = "\n".join(cm_a.output + cm_s.output)
+        self.assertNotIn(secret_dest, joined)
+        self.assertIn("Payment method wizard started", joined)
+        self.assertIn("Payment method created", joined)
+
+
+class TestEditWizard(WizardTestBase):
+    """Interactive /editpm <id> field menu."""
+
+    def _open(self, method_id: int, *, admin_id: int = ADMIN_A) -> MagicMock:
+        update = _update(admin_id, f"/editpm {method_id}")
+        _run(admin.edit_pm_command(update, MagicMock()))
+        return update
+
+    def test_edit_menu_updates_one_field_and_saves(self) -> None:
+        mid = self._create()
+        opening = self._open(mid)
+        text = _reply(opening)
+        self.assertIn(f"✏️ تعديل وسيلة الدفع #{mid}", text)
+        self.assertIn("العملة: USDT", text)
+        self.assertIn("المزود: مزود الاختبار", text)
+        buttons = self._buttons(self._reply_markup_of(opening))
+        for expected in (
+            "pm:wfield:1",  # category
+            "pm:wfield:5",  # provider
+            "pm:wfield:7",  # notes
+            "pm:wsave",
+            "pm:wcancel",
+        ):
+            self.assertIn(expected, buttons)
+
+        prompt = self._press_w("pm:wfield:5")
+        self.assertEqual(
+            _edited(prompt.callback_query), admin.WZ_PROMPT_PROVIDER
+        )
+        bad = self._type("")
+        self.assertIn("المزود", _reply(bad))
+        self.assertEqual(
+            admin._WIZARD_STATES[ADMIN_A]["step"], "provider"
+        )
+        ok = self._type("مزود جديد")
+        menu_reply = _reply(ok)
+        self.assertIn("المزود: مزود جديد", menu_reply)
+        self.assertIn("العملة: USDT", menu_reply)  # untouched fields kept
+
+        saved = self._press_w("pm:wsave")
+        self.assertIn(
+            f"تم تعديل الوسيلة #{mid}", _edited(saved.callback_query)
+        )
+        row = self._rows()[0]
+        self.assertEqual(row["provider"], "مزود جديد")
+        self.assertEqual(row["asset"], "USDT")
+        self.assertEqual(row["display_name"], "محفظة الاختبار")
+        self.assertEqual(row["updated_by"], ADMIN_A)
+        self.assertEqual(row["created_by"], ADMIN_A)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        # Single-use: a second save press is stale and writes nothing.
+        again = self._press_w("pm:wsave")
+        self.assertEqual(
+            _answered(again.callback_query), admin.MSG_WIZARD_STALE
+        )
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_edit_menu_category_and_network_buttons(self) -> None:
+        mid = self._create()
+        self._open(mid)
+        cat = self._press_w("pm:wfield:1")
+        self.assertEqual(
+            _edited(cat.callback_query), admin.WZ_PROMPT_CATEGORY
+        )
+        picked = self._press_w("pm:wcat:2")
+        self.assertIn("الفئة: cash", _edited(picked.callback_query))
+        net = self._press_w("pm:wfield:4")
+        net_markup = _markup_of_edit(net.callback_query)
+        self.assertIn("pm:wnone", self._buttons(net_markup))
+        none_btn = self._press_w("pm:wnone")
+        self.assertIn("الشبكة: -", _edited(none_btn.callback_query))
+        self._press_w("pm:wsave")
+        row = self._rows()[0]
+        self.assertEqual(row["category"], "cash")
+        self.assertIsNone(row["network"])
+
+    def test_edit_wizard_missing_id_reports_not_found(self) -> None:
+        update = self._open(999)
+        self.assertEqual(_reply(update), admin.MSG_NOT_FOUND)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+
+    def test_edit_wizard_denied_for_non_admin_and_silent_in_groups(
+        self,
+    ) -> None:
+        update = _update(STRANGER, "/editpm 1")
+        _run(admin.edit_pm_command(update, MagicMock()))
+        self.assertEqual(_reply(update), admin.MSG_ADMIN_ONLY)
+        self.assertNotIn(STRANGER, admin._WIZARD_STATES)
+        update = _update(
+            STRANGER, "/editpm 1", chat_type="supergroup", chat_id=-1009
+        )
+        _run(admin.edit_pm_command(update, MagicMock()))
+        update.message.reply_text.assert_not_called()
+        self.assertEqual(self._rows(), [])
+
+
 # CALLBACK PARSERS (untrusted payloads)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -946,6 +1486,23 @@ class TestCallbackParsing(unittest.TestCase):
         self.assertEqual(
             admin.parse_callback("pm:delyes:4"), ("delyes", 4)
         )
+        # Interactive wizard ops share the same strict grammar.
+        self.assertEqual(admin.parse_callback("pm:wcat:1"), ("wcat", 1))
+        self.assertEqual(admin.parse_callback("pm:wasset:6"), ("wasset", 6))
+        self.assertEqual(admin.parse_callback("pm:wnet:2"), ("wnet", 2))
+        self.assertEqual(admin.parse_callback("pm:wfield:7"), ("wfield", 7))
+        for op in (
+            "wmanual",
+            "wskip",
+            "wnone",
+            "wmenu",
+            "wreview",
+            "wconfirm",
+            "wsave",
+            "wcancel",
+        ):
+            with self.subTest(op=op):
+                self.assertEqual(admin.parse_callback(f"pm:{op}"), (op, None))
 
     def test_invalid_payloads(self) -> None:
         for bad in (
@@ -963,6 +1520,11 @@ class TestCallbackParsing(unittest.TestCase):
             "pm:page:abc",
             "pm:edit:",
             "pm:edit:1:2",
+            "pm:wasset:0",      # suggestion index must be positive
+            "pm:wcat:-1",
+            "pm:wfield:abc",
+            "pm:wconfirm:1",    # no-id wizard op with an id
+            "pm:wcancel:2",
             "sup:list",
         ):
             with self.subTest(bad=bad):
@@ -1078,6 +1640,29 @@ class TestBotRegistrations(unittest.TestCase):
             self.assertEqual(len(matches), 1, name)
             self.assertIs(matches[0][0].callback, callback)
             self.assertEqual(matches[0][1], 0)
+
+    def test_wizard_text_handler_registered_in_own_group(self) -> None:
+        """The wizard free-text catch-all must live in its OWN group
+        so neither it nor the task-wizard catch-all can shadow the
+        other (first-match-wins within a group)."""
+        from telegram.ext import MessageHandler
+
+        captured = self._capture_main_handlers()
+        mine = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and h.callback is admin.wizard_text_input
+        ]
+        self.assertEqual(len(mine), 1)
+        theirs = [
+            (h, g)
+            for h, g in captured
+            if isinstance(h, MessageHandler)
+            and h.callback is bot_mod.admin_task_wizard.wizard_text_input
+        ]
+        self.assertEqual(len(theirs), 1)
+        self.assertNotEqual(mine[0][1], theirs[0][1])
 
 
 if __name__ == "__main__":
