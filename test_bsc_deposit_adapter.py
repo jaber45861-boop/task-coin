@@ -83,7 +83,7 @@ from deposit_verification import (
     DepositNotFoundError,
     ExternalTxIdAlreadyUsedError,
 )
-from test_deposit import ADMIN_ID, _make_pm, _seed_minimum
+from test_deposit import ADMIN_ID, _make_pm
 from test_miniapp_auth import _TEST_BOT_TOKEN
 
 # ── Test constants (obviously fake — no production values) ───────────
@@ -259,12 +259,12 @@ def env(config_env, monkeypatch, tmp_path):
     db.init_db(db_path)
     db.register_user(USER_A, "alice", "Alice")
     monkeypatch.setattr(config, "ADMINS", [ADMIN_ID])
-    _seed_minimum(db_path, 1)
     yield db_path
 
 
 def _request(db_path: str, *, amount: str = AMOUNT, **pm_overrides):
     """One PENDING deposit intent through the production creator."""
+    pm_overrides.setdefault("min_units", 1)
     pm = _make_pm(db_path, **pm_overrides)
     return deposit_store.create_deposit_request(
         user_id=USER_A,

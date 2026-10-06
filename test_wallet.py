@@ -706,6 +706,11 @@ class TestScopePolicy(WalletTestBase):
         same way: ``miniapp/js/task-stats.js`` (new, read-only display
         data for the two cards — no wallet behaviour), plus its script
         tag in ``miniapp/index.html``.
+        The per-method minimum-deposit work adds one display-only
+        exception: ``miniapp/js/deposit.js`` renders the deposit
+        receipt amount in the request's OWN asset (replacing the
+        hardcoded USDT suffix) — presentation only, no wallet
+        behaviour, no amount parsing client-side.
         Every other Mini App file — wallet.js, wallet-data.js, the
         rest — must stay byte-identical.
         """
@@ -727,6 +732,7 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/js/task-stats.js",  # Home «المتاح»/«المكافآت» data (new)
             "miniapp/index.html",       # task-request.js / guide.js / task-stats.js tags
             "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
+            "miniapp/js/deposit.js",    # receipt amount in the request's asset
         }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse

@@ -401,11 +401,11 @@ BROADCAST_CONFIRM_OP = "broadcast:confirm"
 BROADCAST_CANCEL_OP = "broadcast:cancel"
 
 # MT-ADMIN-39: the in-place settings module owns its own closed
-# sub-grammar under the SAME ctl: namespace — the FOUR registered
+# sub-grammar under the SAME ctl: namespace — the THREE registered
 # platform-settings keys as fixed literal tokens only, never JSON,
 # never free text, never a value/amount, and never a key outside
 # the registered registry (even if such a row existed in the DB):
-#   ctl:settings                    settings panel (4 registered keys)
+#   ctl:settings                    settings panel (3 registered keys)
 #   ctl:settings:edit:<key>         arm ONE pending value input
 #   ctl:settings:confirm:<key>      single-use confirm → fresh
 #                                   re-read + re-validation →
@@ -418,7 +418,6 @@ OP_SETTINGS = "settings"
 SETTINGS_BACK_OP = "settings:back"
 _SETTINGS_KEYS: tuple[str, ...] = (
     "minimum_withdrawal_units",
-    "minimum_deposit_units",
     "withdrawal_fee_units",
     "advertiser_commission",
 )
@@ -2974,7 +2973,6 @@ _SETTINGS_PENDING_KEY = "admin_settings_pending"
 # Display labels — UI copy only; the keys stay the registered four.
 _SETTINGS_LABELS: dict[str, str] = {
     "minimum_withdrawal_units": "💸 الحد الأدنى للسحب",
-    "minimum_deposit_units": "💵 الحد الأدنى للإيداع",
     "withdrawal_fee_units": "💳 رسوم السحب",
     "advertiser_commission": "🎁 عمولة المعلن",
 }
@@ -3021,7 +3019,7 @@ def _setting_display(key: str, value: object) -> str:
 
 
 def collect_settings() -> dict:
-    """Read-only snapshot of the FOUR registered settings.
+    """Read-only snapshot of the THREE registered settings.
 
     Fresh ``ps.get_setting`` reads (the ungated
     contract) — no cache, no second source, no invented key.  A
@@ -3048,7 +3046,7 @@ def collect_settings() -> dict:
 
 
 def build_settings_text(snapshot: dict) -> str:
-    """Arabic panel — exactly the four registered settings, aggregate
+    """Arabic panel — exactly the three registered settings, aggregate
     values only: no secret, no path, no updated_by, no SQL detail."""
     lines = [SETTINGS_PANEL_HEADER, ""]
     lines += [

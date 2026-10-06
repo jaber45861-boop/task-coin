@@ -87,9 +87,9 @@ import pytest
 
 import db
 import config
+import deposit_proof_admin
 import deposit_store
 import payment_method_store
-import platform_settings
 import serve_miniapp
 import wallet
 from config import CHANNELS
@@ -159,6 +159,7 @@ def _auth(user_id: int = USER_A) -> dict:
 
 
 def _make_pm(db_path: str, *, enabled: bool = True, active: bool = True,
+             min_units: int | None = MIN_UNITS,
              **overrides) -> payment_method_store.PaymentMethod:
     kwargs = dict(
         category="crypto",
@@ -168,6 +169,7 @@ def _make_pm(db_path: str, *, enabled: bool = True, active: bool = True,
         provider="TEST-PROVIDER",
         destination=PM_DESTINATION,
         instructions="Send exactly the requested amount",
+        min_deposit_units=min_units,
         created_by=ADMIN_ID,
         db_path=db_path,
     )
@@ -182,22 +184,6 @@ def _make_pm(db_path: str, *, enabled: bool = True, active: bool = True,
             method.id, False, updated_by=ADMIN_ID, db_path=db_path
         )
     return payment_method_store.get_payment_method(method.id, db_path)
-
-
-def _seed_minimum(db_path: str, units: int = MIN_UNITS) -> None:
-    """Configure minimum_deposit_units through the production contract."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        platform_settings.set_setting(
-            platform_settings.MINIMUM_DEPOSIT_UNITS,
-            units,
-            admin_user_id=ADMIN_ID,
-            conn=conn,
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _get_methods(client, headers: dict | None = None):
@@ -378,7 +364,6 @@ class TestMethodDiscovery:
         """7. Identity comes only from verified initData — a body
         user_id is ignored and never becomes the requester."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(
             client, _payload(pm.id, user_id=IMPERSONATED, user=IMPERSONATED)
@@ -408,7 +393,6 @@ class TestDepositRequest:
     def test_08_valid_request_persists(self, client, env):
         """8. A valid request creates exactly one persisted row."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(client, _payload(pm.id))
         assert response.status_code == 200
@@ -436,7 +420,6 @@ class TestDepositRequest:
         user_destination concept: no column, no requirement, and a
         client-supplied value is ignored."""
         pm = _make_pm(env)
-        _seed_minimum(env)
         assert "user_destination" not in _deposit_columns(env)
 
         # Works without any user_destination in the body…
@@ -457,7 +440,6 @@ class TestDepositRequest:
     def test_10_selected_method_must_be_active(self, client, env):
         """10. An inactive method can never back a deposit request."""
         pm = _make_pm(env, active=False)
-        _seed_minimum(env)
 
         response = _post(client, _payload(pm.id))
         assert response.status_code == 409
@@ -466,7 +448,6 @@ class TestDepositRequest:
 
     def test_11_invalid_method_rejected(self, client, env):
         """11. Unknown/malformed method ids are rejected safely."""
-        _seed_minimum(env)
 
         response = _post(client, _payload(999_999))
         assert response.status_code == 404
@@ -494,7 +475,6 @@ class TestDepositRequest:
         """12. The user-relevant method facts are copied into the
         request at creation time."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(client, _payload(pm.id))
         row = _deposit_rows(env)[0]
@@ -513,7 +493,6 @@ class TestDepositRequest:
         """13. The PLATFORM deposit destination is snapshotted for
         later audit (it is where the user must send funds)."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         _post(client, _payload(pm.id))
         row = _deposit_rows(env)[0]
@@ -526,7 +505,6 @@ class TestDepositRequest:
         """14. Deactivating/renaming the method afterwards leaves the
         historical request byte-for-byte unchanged."""
         pm = _make_pm(env)
-        _seed_minimum(env)
         _post(client, _payload(pm.id))
         before = dict(_deposit_rows(env)[0])
 
@@ -554,7 +532,6 @@ class TestDepositRequest:
         """15. Creating a request NEVER produces a credited/completed
         status — pending/unverified is the only possible outcome."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(client, _payload(pm.id))
         data = response.get_json()
@@ -577,10 +554,9 @@ class TestDepositRequest:
 class TestAmounts:
 
     def test_16_exact_integer_units(self, client, env):
-        """16. The amount persists as exact integer USDT atomic
-        units."""
-        pm = _make_pm(env)
-        _seed_minimum(env, 1)   # minimum 1 unit — precision focus
+        """16. The amount persists as exact integer atomic units of
+        the method's asset (USDT: 8 dp)."""
+        pm = _make_pm(env, min_units=1)   # floor of 1 unit — precision
 
         response = _post(client, _payload(pm.id, "1.5"))
         assert response.status_code == 200
@@ -603,7 +579,6 @@ class TestAmounts:
     def test_17_malformed_amount_rejected(self, client, env):
         """17. Malformed amounts fail deterministically with no row."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         for bad in ("abc", "1.2.3", "", "0x10", "1,5", None,
                     [1], {}):
@@ -619,7 +594,6 @@ class TestAmounts:
     def test_18_zero_and_negative_rejected(self, client, env):
         """18. Zero and negative amounts are rejected."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         for bad in ("0", "0.00000000", "-1", "-0.5", 0):
             response = _post(
@@ -633,7 +607,6 @@ class TestAmounts:
         """19. Amounts beyond the signed SQLite INTEGER bound are
         rejected — never wrapped, never truncated."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         huge = str(2 ** 63)          # 9_223_372_036_854_775_808
         for bad in (huge, "99999999999999999999",
@@ -646,11 +619,10 @@ class TestAmounts:
         assert _deposit_rows(env) == []
 
     def test_20_minimum_deposit_enforced(self, client, env):
-        """20. minimum_deposit_units is enforced in exact integer
-        units; a missing setting follows the platform-settings
-        contract (no invented fallback)."""
-        pm = _make_pm(env)
-        _seed_minimum(env, MIN_UNITS)
+        """20. The PER-METHOD minimum (min_deposit_units, atomic
+        units of the method's own asset) is enforced exactly; a
+        missing value never falls back to any default."""
+        pm = _make_pm(env)   # min_deposit_units = MIN_UNITS (USDT)
 
         response = _post(client, _payload(pm.id, "0.5"))
         assert response.status_code == 400
@@ -665,9 +637,28 @@ class TestAmounts:
     def test_20b_missing_minimum_setting_is_not_invented(
         self, client, env
     ):
-        """20b. With the setting never configured, creation fails
-        through the existing platform-settings contract."""
-        pm = _make_pm(env)   # deliberately NO _seed_minimum
+        """20b. A method whose minimum is not configured stays
+        fail-closed: 503 deposit_settings_missing, no default is
+        invented.  Production-reachable path: changing the asset
+        clears the stored minimum while the method stays published
+        (old units would belong to the old asset's scale)."""
+        pm = _make_pm(env)
+        payment_method_store.update_payment_method(
+            pm.id,
+            category=pm.category,
+            display_name=pm.display_name,
+            asset="EGP",
+            network=pm.network,
+            provider=pm.provider,
+            destination=pm.destination,
+            instructions=pm.instructions,
+            updated_by=ADMIN_ID,
+            db_path=env,
+        )
+        updated = payment_method_store.get_payment_method(pm.id, env)
+        assert updated.min_deposit_units is None   # cleared, not kept
+        assert updated.deposits_enabled is True    # still published
+
         response = _post(client, _payload(pm.id, "10"))
         assert response.status_code == 503
         assert response.get_json()["error"] == "deposit_settings_missing"
@@ -677,7 +668,6 @@ class TestAmounts:
         """21. JSON float amounts are rejected at the transport edge;
         stored values are exact ints — no float ever reaches storage."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(
             client,
@@ -710,7 +700,6 @@ class TestWalletSafety:
         """22. No wallet credit — balances are byte-for-byte
         unchanged, and no wallet row is even created."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         # A funded user's balance stays identical…
         wallet.ensure_wallet(USER_A)
@@ -727,7 +716,6 @@ class TestWalletSafety:
         """23. No ledger row of any kind is written for a deposit
         intent (nothing references the request)."""
         pm = _make_pm(env)
-        _seed_minimum(env)
         before = _ledger_count(env)
 
         response = _post(client, _payload(pm.id))
@@ -745,7 +733,6 @@ class TestWalletSafety:
         """24. No transaction id is fabricated: external_tx_id stays
         NULL and no tx-shaped field is invented."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(client, _payload(pm.id))
         row = _deposit_rows(env)[0]
@@ -766,7 +753,6 @@ class TestWalletSafety:
         flow — crediting a non-USDT asset later requires an explicit
         future mapping rule."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         columns = _deposit_columns(env)
         assert not any("rate" in name for name in columns)
@@ -793,7 +779,6 @@ class TestIdempotency:
         two independent PENDING intents with distinct ids (a deposit
         intent reserves nothing, so repeats are allowed by design)."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         first = _post(client, _payload(pm.id, "2"))
         second = _post(client, _payload(pm.id, "2"))
@@ -811,7 +796,6 @@ class TestIdempotency:
     def test_27_request_ids_unique(self, client, env):
         """27. Request ids are unique across every request (PK)."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         ids = set()
         for _ in range(5):
@@ -844,7 +828,6 @@ class TestIdempotency:
         guarantees one external transaction maps to at most one
         request — the precondition for an idempotent credit."""
         pm = _make_pm(env)
-        _seed_minimum(env)
         _post(client, _payload(pm.id))
 
         index = _raw(
@@ -895,7 +878,6 @@ class TestSecurity:
         stored deposit destination — it always comes from the server's
         configured method row."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(
             client,
@@ -916,7 +898,6 @@ class TestSecurity:
         """30. asset/network/provider resolve server-side from the
         payment method — client values are ignored entirely."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = _post(
             client,
@@ -943,7 +924,6 @@ class TestSecurity:
         """31. Neither endpoint ever emits admin/audit columns or
         availability internals."""
         _make_pm(env)
-        _seed_minimum(env)
 
         methods = _get_methods(client).get_json()
         created = _post(
@@ -965,7 +945,6 @@ class TestSecurity:
         both yield concise Arabic errors — never a traceback or
         internal detail."""
         pm = _make_pm(env)
-        _seed_minimum(env)
 
         response = client.post(
             "/api/deposit",
@@ -1105,6 +1084,155 @@ class TestUI:
         with open("miniapp/index.html", encoding="utf-8") as handle:
             html = handle.read()
         assert 'js/withdrawal.js' in html
+
+
+# ══════════════════════════════════════════════════════════════════
+# H. PER-ASSET MINIMUM / SCALE (39–47)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestPerAssetMinimums:
+    """HTTP-level proof that minimums and amounts follow the method's
+    OWN asset scale (EGP 2 dp vs USDT 8 dp) — one global scale or a
+    cross-currency comparison is impossible by construction."""
+
+    @staticmethod
+    def _make_egp_pm(db_path: str, min_units: int = 5000):
+        return _make_pm(
+            db_path,
+            category="cash",
+            asset="EGP",
+            network=None,
+            display_name="TEST EGP",
+            min_units=min_units,
+        )
+
+    def test_39_egp_below_minimum_rejected(self, client, env):
+        """39. EGP 49.99 < 50 EGP → below_minimum, no row."""
+        pm = self._make_egp_pm(env)
+        response = _post(client, _payload(pm.id, "49.99"))
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "below_minimum"
+        assert _deposit_rows(env) == []
+
+    def test_40_egp_50_accepted_with_exact_egp_units(self, client, env):
+        """40. EGP 50 → accepted, stored as 5000 EGP cents — NEVER
+        the old 8-dp USDT interpretation (5_000_000_000)."""
+        pm = self._make_egp_pm(env)
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 200
+        request = response.get_json()["request"]
+        assert request["amount_units"] == 5000
+        assert request["amount_units"] != 5_000_000_000
+        assert request["amount"] == "50.00"        # 2-dp EGP display
+        assert request["asset"] == "EGP"
+        assert _deposit_rows(env)[0]["amount_units"] == 5000
+
+    def test_41_egp_over_precision_invalid(self, client, env):
+        """41. EGP 0.001 (3 dp) is invalid_amount — precision follows
+        the asset scale and is rejected, never rounded."""
+        pm = self._make_egp_pm(env)
+        response = _post(client, _payload(pm.id, "0.001"))
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "invalid_amount"
+        assert _deposit_rows(env) == []
+
+    def test_42_usdt_below_and_at_minimum(self, client, env):
+        """42. USDT 0.99 < 1 USDT → rejected; USDT 1 → accepted as
+        exactly 100_000_000 units."""
+        pm = _make_pm(env)          # min_deposit_units = 1 USDT
+        response = _post(client, _payload(pm.id, "0.99"))
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "below_minimum"
+        assert _deposit_rows(env) == []
+
+        response = _post(client, _payload(pm.id, "1"))
+        assert response.status_code == 200
+        assert response.get_json()["request"]["amount_units"] == 100_000_000
+
+    def test_43_usdt_precision_not_limited_by_egp_scale(self, client, env):
+        """43. USDT keeps full 8-dp precision (0.001 and 1.00000001
+        are valid) — the EGP 2-dp scale never leaks into it."""
+        pm = _make_pm(env, min_units=1)
+        for text, units in (
+            ("0.001", 100_000),
+            ("1.00000001", 100_000_001),
+        ):
+            response = _post(client, _payload(pm.id, text))
+            assert response.status_code == 200, text
+            assert response.get_json()["request"]["amount_units"] == units
+
+    def test_44_same_text_parses_per_own_asset(self, client, env):
+        """44. The identical text \"1\" becomes 100 units for EGP and
+        100_000_000 for USDT — scale is per-method, never global."""
+        egp = self._make_egp_pm(env, min_units=100)
+        usdt = _make_pm(env)
+        egp_units = _post(
+            client, _payload(egp.id, "1")
+        ).get_json()["request"]["amount_units"]
+        usdt_units = _post(
+            client, _payload(usdt.id, "1")
+        ).get_json()["request"]["amount_units"]
+        assert egp_units == 100
+        assert usdt_units == 100_000_000
+
+    def test_45_unknown_asset_fails_closed(self, client, env):
+        """45. A published method whose asset has no registered scale
+        can never create a request: 503, no default scale, no row."""
+        pm = _make_pm(env)
+        payment_method_store.update_payment_method(
+            pm.id,
+            category=pm.category,
+            display_name=pm.display_name,
+            asset="TESTCOIN",
+            network=pm.network,
+            provider=pm.provider,
+            destination=pm.destination,
+            instructions=pm.instructions,
+            updated_by=ADMIN_ID,
+            db_path=env,
+        )
+        response = _post(client, _payload(pm.id, "10"))
+        assert response.status_code == 503
+        assert response.get_json()["error"] == "deposit_settings_missing"
+        assert _deposit_rows(env) == []
+
+    def test_46_receipt_and_admin_display_use_asset_scale(
+        self, client, env
+    ):
+        """46. The Mini App receipt renders the request's own asset
+        (no hardcoded unit) and the admin proof display renders at
+        the asset's registered scale."""
+        deposit = _read_js("deposit.js")
+        assert (
+            "${_esc(request.amount)} ${_esc(request.asset)}" in deposit
+        )
+        assert ") USDT" not in deposit    # the old hardcoded unit
+
+        egp = self._make_egp_pm(env)
+        egp_request_id = _post(
+            client, _payload(egp.id, "50")
+        ).get_json()["request"]["request_id"]
+        egp_row = deposit_store.get_deposit_request(
+            egp_request_id, db_path=env
+        )
+        assert deposit_proof_admin._amount_text(egp_row) == "50.00 EGP"
+
+    def test_47_existing_usdt_request_still_readable(
+        self, client, env
+    ):
+        """47. USDT requests keep their exact historical rendering:
+        payload amount at 8 dp and the proof-admin display intact."""
+        pm = _make_pm(env)
+        response = _post(client, _payload(pm.id, "1.5"))
+        assert response.get_json()["request"]["amount"] == "1.50000000"
+        request_id = response.get_json()["request"]["request_id"]
+        request = deposit_store.get_deposit_request(request_id, db_path=env)
+        row = _deposit_rows(env)[0]
+        assert row["amount_units"] == 150_000_000
+        assert deposit_proof_admin._amount_text(request) == (
+            "1.50000000 USDT"
+        )
 
 
 if __name__ == "__main__":

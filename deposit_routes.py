@@ -28,8 +28,9 @@ Architecture boundary (critical):
     Telegram Mini App initData auth (existing miniapp_auth)
     → transport validation ONLY (shapes/types — no invented policy)
     → deposit_store.create_deposit_request (ONE db.transaction:
-      active deposit method → minimum_deposit_units (exact integer
-      units) → INSERT snapshot)
+      active deposit method → registered asset scale + the method's
+      min_deposit_units (exact integer atomic units of that asset) →
+      INSERT snapshot)
 
 The HTTP layer opens NO transaction and NEVER touches wallet/ledger.
 There is no authoritative deposit verification source in this
@@ -59,16 +60,16 @@ import uuid
 
 from flask import Blueprint, jsonify, request
 
+import asset_units
 import db
 import deposit_proof_storage
 import deposit_proof_store
 import deposit_store
 import miniapp_auth
 import payment_method_store
-import platform_settings
-import wallet
 from deposit_store import (
     DepositBelowMinimumError,
+    DepositConfigurationError,
     DepositMethodUnavailableError,
     DepositValidationError,
 )
@@ -211,12 +212,25 @@ def _request_payload(row: deposit_store.DepositRequest) -> dict:
     anything client-controlled.  ``status`` is always ``pending`` from
     this flow — no response ever claims funds were received.
     """
+    # Rendered at the request asset's OWN registered scale (EGP
+    # cents -> "50.00", USDT atomic -> "1.00000000"); a legacy row
+    # whose asset lost/regressed its registry entry falls back to the
+    # raw integer units — display never breaks and never invents
+    # precision.
+    try:
+        amount_text = _decimal_text(
+            asset_units.units_to_asset_decimal(
+                row.amount_units, row.pm_asset
+            )
+        )
+    except asset_units.AssetUnitsError:
+        amount_text = str(int(row.amount_units))
     return {
         "request_id": row.request_id,
         "status": row.status,
         "payment_method_id": row.payment_method_id,
         "amount_units": int(row.amount_units),
-        "amount": _decimal_text(wallet.units_to_decimal(row.amount_units)),
+        "amount": amount_text,
         "display_name": row.pm_display_name,
         "asset": row.pm_asset,
         "network": row.pm_network,
@@ -251,7 +265,11 @@ def _create_error(exc: Exception):
         return _error("invalid_amount", _MSG_INVALID_AMOUNT, 400)
     if isinstance(exc, payment_method_store.PaymentMethodValidationError):
         return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
-    if isinstance(exc, platform_settings.SettingNotFoundError):
+    if isinstance(
+        exc, (DepositConfigurationError, asset_units.UnknownAssetScaleError)
+    ):
+        # Missing per-method minimum, or an asset with no registered
+        # scale — both are "settings incomplete", fail-closed.
         return _error(
             "deposit_settings_missing", _MSG_SETTINGS_MISSING, 503
         )

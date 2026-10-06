@@ -58,6 +58,7 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 
 import db
+import asset_units
 import deposit_manual_review
 import deposit_proof_storage
 import deposit_proof_store
@@ -105,6 +106,10 @@ MSG_ADMIN_ONLY = "⛔ هذا الأمر للمشرفين فقط."
 MSG_INVALID = "⛔ طلب غير صالح."
 MSG_NOT_FOUND = "⛔ إثبات الدفع غير موجود."
 MSG_STATE_CHANGED = "⛔ تغيرت حالة الإثبات — لم يتم تنفيذ أي عملية."
+MSG_ASSET_NOT_CREDITABLE = (
+    "⛔ ائتمان إيداع بهذه العملة غير مدعوم حاليًا — لم يتم تنفيذ أي "
+    "عملية مالية."
+)
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 
 LIST_HEADER = "🧾 إثباتات الإيداع المعلقة"
@@ -217,11 +222,23 @@ def _fmt_when(value: object) -> str:
 
 
 def _amount_text(deposit) -> str:
-    """Exact persisted amount — read-only display, never computed."""
+    """Exact persisted amount — read-only display, never computed.
+
+    Rendered at the deposit asset's OWN registered scale (EGP cents
+    -> "50.00 EGP", USDT atomic -> "1.00000000 USDT"); a legacy row
+    whose asset has no registered scale falls back to the raw
+    integer units so the admin display never breaks and never
+    invents precision.
+    """
     if deposit is None:
         return "—"
-    amount = wallet.units_to_decimal(deposit.amount_units)
     asset = deposit.pm_asset or "USDT"
+    try:
+        amount: object = asset_units.units_to_asset_decimal(
+            deposit.amount_units, asset
+        )
+    except asset_units.AssetUnitsError:
+        amount = deposit.amount_units
     return f"{amount} {asset}"
 
 
@@ -694,6 +711,17 @@ async def proof_callback(update, context) -> None:
                 proof_id, actor,
             )
             await _safe_answer(query, MSG_STATE_CHANGED)
+            return
+        except deposit_verification.DepositAssetNotCreditableError:
+            # Fail-closed credit boundary: the request's asset is not
+            # the wallet's credit currency — zero financial mutation,
+            # reported as a clear business refusal (not a crash).
+            logger.info(
+                "Deposit proof approval: proof=%s admin=%d "
+                "result=asset_not_creditable",
+                proof_id, actor,
+            )
+            await _safe_answer(query, MSG_ASSET_NOT_CREDITABLE)
             return
         except deposit_verification.DepositConflictError:
             logger.info(

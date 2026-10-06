@@ -1409,6 +1409,11 @@ def init_db(db_path: str | None = None) -> None:
                     CHECK (is_active IN (0, 1)),
                 deposits_enabled INTEGER NOT NULL DEFAULT 0
                     CHECK (deposits_enabled IN (0, 1)),
+                min_deposit_units INTEGER
+                    CHECK (
+                        min_deposit_units IS NULL
+                        OR min_deposit_units > 0
+                    ),
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_by INTEGER,
                 updated_by INTEGER,
@@ -1431,6 +1436,22 @@ def init_db(db_path: str | None = None) -> None:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+        # ── Per-method deposit minimum (additive migration) ────────
+        # Atomic units of the method's OWN asset (the asset_units
+        # registry is the only scale source: USDT 8 dp, EGP 2 dp).
+        # NULL = not configured = deposits fail closed (no default,
+        # no backfill — an admin sets it through the official admin
+        # flow).  Same idempotent ALTER pattern as deposits_enabled;
+        # re-running init_db is a harmless no-op.
+        try:
+            conn.execute(
+                "ALTER TABLE payment_methods ADD COLUMN "
+                "min_deposit_units INTEGER "
+                "CHECK (min_deposit_units IS NULL "
+                "OR min_deposit_units > 0)"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Deterministic display order (sort_order ASC, id ASC).
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_payment_methods_order
@@ -1441,8 +1462,12 @@ def init_db(db_path: str | None = None) -> None:
         # Additive migration only: a brand-new table — no existing
         # table, column or row is touched.  This is the deposit
         # REQUEST/instruction record only: creating a row never moves
-        # money.  amount_units is integer USDT atomic units (never
-        # REAL, never 2-decimal accounting).  status starts at
+        # money.  amount_units is integer ATOMIC UNITS OF pm_asset at
+        # that asset's registered scale (the asset_units registry is
+        # the only scale source — USDT 8 dp, EGP 2 dp): an EGP-method
+        # request stores EGP cents (50 EGP -> 5000), a USDT request
+        # USDT atomic units.  Never REAL, never 2-decimal accounting;
+        # the column itself and its CHECK are unchanged.  status starts at
         # 'pending' (unverified) from the user flow and may only
         # become 'credited'/'rejected' through a future authoritative
         # verification event — no such source exists yet.  The pm_*

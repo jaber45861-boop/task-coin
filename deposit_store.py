@@ -22,9 +22,11 @@ Creating a row:
   partial UNIQUE index so one verified external transaction can never
   be credited twice (idempotency-ready).
 - NEVER invents a rate or asset conversion: the amount is stored as
-  exact integer USDT atomic units exactly as requested; crediting a
-  non-USDT asset later requires an explicit configured mapping — none
-  exists yet and none is invented here.
+  exact integer ATOMIC UNITS OF ``pm_asset`` at that asset's
+  registered scale (the ``asset_units`` registry — USDT 8 dp, EGP
+  2 dp); no exchange rate is ever read and crediting a non-USDT
+  asset later requires an explicit configured mapping — none exists
+  yet and none is invented here.
 
 Architecture notes:
 
@@ -38,16 +40,18 @@ Architecture notes:
   instructions.  The withdrawal-side ``user_destination`` concept does
   not exist for deposits and is never asked for or stored.
 - Amount validation is exact integer math only: ``float``/``bool`` are
-  rejected, precision is bounded (8 dp), zero/negative are rejected,
-  and values beyond the signed SQLite INTEGER bound are rejected.  The
-  authoritative ``minimum_deposit_units`` platform setting is enforced
-  with exact integer units; a missing setting follows the existing
-  platform-settings contract (``SettingNotFoundError`` — no invented
-  fallback).
+  rejected, precision is bounded by the ASSET's registered scale (8 dp
+  for USDT, 2 dp for EGP), zero/negative are rejected, and values
+  beyond the signed SQLite INTEGER bound are rejected.  The
+  authoritative minimum is the PER-METHOD
+  ``payment_methods.min_deposit_units`` — exact integer atomic units
+  of the same asset's scale; ``NULL`` (not configured) or an asset
+  with no registered scale raises ``DepositConfigurationError``
+  (fail-closed — no invented default, no fallback scale).
 
 Conventions: the single INSERT runs inside one ``db.transaction()``
-(BEGIN IMMEDIATE); amount parsing happens before it (pure); the method
-resolution + minimum read borrow that SAME connection, so there is no
+(BEGIN IMMEDIATE); the method resolution, scale/minimum read and the
+amount parse (pure) all borrow that SAME connection, so there is no
 hidden second transaction.  Logs carry ids/operation/actor only —
 never the destination.
 """
@@ -59,12 +63,10 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 
+import asset_units
 import db
 import payment_method_store
-import platform_settings
-import wallet
 from payment_method_store import PaymentMethodValidationError
 
 logger = logging.getLogger(__name__)
@@ -96,16 +98,30 @@ class DepositMethodUnavailableError(DepositError):
     user deposit method (``deposits_enabled = 0``)."""
 
 
-class DepositBelowMinimumError(DepositError):
-    """Requested units are below the configured ``minimum_deposit_units``.
+class DepositConfigurationError(DepositError):
+    """Required per-method deposit configuration is missing.
 
-    Carries the exact integer facts — never a float, never a fallback.
+    Raised when ``min_deposit_units`` was never configured (NULL) or
+    the method's asset has no registered decimal scale — both are
+    fail-closed ``settings incomplete`` states: no default minimum
+    and no fallback scale are ever invented.  Mapped by the HTTP
+    layer to the stable ``deposit_settings_missing`` response.
+    """
+
+
+class DepositBelowMinimumError(DepositError):
+    """Requested units are below the method's configured minimum.
+
+    Carries the exact integer facts — never a float, never a
+    fallback.  Both values are atomic units of the SAME method
+    asset, so a cross-currency comparison is impossible by
+    construction.
     """
 
     def __init__(self, amount_units: int, minimum_units: int) -> None:
         super().__init__(
             f"amount {amount_units} is below the configured minimum "
-            f"{minimum_units} atomic USDT units"
+            f"{minimum_units} atomic units"
         )
         self.amount_units = amount_units
         self.minimum_units = minimum_units
@@ -165,58 +181,40 @@ def _row_to_request(row) -> DepositRequest:
 # ── Exact amount parsing (integer-only; no float anywhere) ───────────
 
 
-def parse_amount_units(value: object, *, field: str = "amount") -> int:
-    """Raw client amount (str/int/Decimal) → exact positive USDT units.
+def parse_amount_units(
+    value: object, asset: object, *, field: str = "amount"
+) -> int:
+    """Raw client amount (str/int/Decimal) → exact positive atomic
+    units of *asset* at that asset's registered scale.
+
+    The scale comes ONLY from the ``asset_units`` registry (USDT 8 dp,
+    EGP 2 dp) — this function never assumes a global scale and
+    performs no division, no rounding and no float arithmetic.
 
     Rejects (deterministically, ``DepositValidationError``):
-    ``float``/``bool`` (float math is forbidden), malformed or
-    non-finite text, more than 8 decimal places, zero, negative, and
-    anything beyond the signed SQLite INTEGER bound.  Conversion itself
-    goes through the existing exact ``wallet.decimal_to_units`` — this
-    module performs no division, no rounding and no float arithmetic.
+    ``float``/``bool`` (float math is forbidden), malformed text, more
+    fractional digits than the asset's scale (rejected — never
+    rounded), zero, negative, and anything beyond the signed SQLite
+    INTEGER bound.
+
+    Raises:
+        DepositValidationError: the value is not an exact in-range
+            amount for this asset.
+        UnknownAssetScaleError: the asset has no registered scale —
+            fail-closed; the caller maps it to incomplete deposit
+            settings (no fallback scale is invented).
     """
     if isinstance(value, bool) or isinstance(value, float):
         raise DepositValidationError(
             f"{field}: float/bool are forbidden in financial math; "
             "pass Decimal, int or str"
         )
-    if isinstance(value, Decimal):
-        dec = value
-    elif isinstance(value, int):
-        dec = Decimal(value)
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise DepositValidationError(f"{field}: not a valid decimal")
-        try:
-            dec = Decimal(text)
-        except InvalidOperation as exc:
-            raise DepositValidationError(
-                f"{field}: not a valid decimal: {value!r}"
-            ) from exc
-    else:
-        raise DepositValidationError(
-            f"{field}: unsupported type {type(value).__name__}; "
-            "pass Decimal, int or str"
-        )
-    if not dec.is_finite():
-        raise DepositValidationError(
-            f"{field}: must be a finite decimal, got {value!r}"
-        )
-
     try:
-        units = wallet.decimal_to_units(dec, field=field)
-    except wallet.InvalidWalletAmountError as exc:
-        # Negative / over-precision — same rejection family.
+        return asset_units.parse_units(value, asset, field=field)
+    except asset_units.UnknownAssetScaleError:
+        raise
+    except asset_units.AssetAmountError as exc:
         raise DepositValidationError(str(exc)) from exc
-
-    if units <= 0:
-        raise DepositValidationError(f"{field}: must be positive")
-    if units > _SQLITE_INT64_MAX:
-        raise DepositValidationError(
-            f"{field}: exceeds the supported maximum"
-        )
-    return units
 
 
 def _timestamp_text(value: datetime) -> str:
@@ -245,7 +243,9 @@ def create_deposit_request(
 
     Inside ONE ``db.transaction()``: resolve the method as ACTIVE on
     that exact connection → require the explicit deposit opt-in →
-    enforce the configured minimum in exact integer units → INSERT the
+    resolve the asset's registered scale (fail-closed) → require the
+    configured PER-METHOD minimum (fail-closed) → parse the amount at
+    that SAME asset's scale → compare in the same units → INSERT the
     snapshot row.  No wallet call, no ledger call, no rate read, no
     external transaction id — ever.
 
@@ -253,10 +253,17 @@ def create_deposit_request(
         PaymentMethodNotFoundError / PaymentMethodInactiveError /
         PaymentMethodValidationError: the id is not an ACTIVE method.
         DepositMethodUnavailableError: active, but not a deposit method.
-        DepositValidationError: malformed/zero/negative/overflow amount.
-        DepositBelowMinimumError: below ``minimum_deposit_units``.
-        platform_settings.SettingNotFoundError: the minimum setting was
-            never configured (existing contract — no fallback invented).
+        DepositConfigurationError: ``min_deposit_units`` was never
+            configured (NULL) for the method — fail-closed, no
+            invented default (mapped by the HTTP layer to
+            ``deposit_settings_missing``).
+        asset_units.UnknownAssetScaleError: the method's asset has no
+            registered decimal scale — fail-closed, no fallback
+            scale (mapped the same way).
+        DepositValidationError: malformed/zero/negative/over-precision
+            amount for the asset's scale.
+        DepositBelowMinimumError: below the method's configured
+            minimum (both sides in the SAME asset's atomic units).
         db-level errors propagate unchanged (nothing is partially
             written: the transaction rolls back).
     """
@@ -266,9 +273,6 @@ def create_deposit_request(
         or user_id <= 0
     ):
         raise DepositValidationError("user_id: معرف موجب مطلوب")
-
-    # Pure exact parsing — BEFORE any transaction.
-    amount_units = parse_amount_units(amount)
 
     at = _utc_now() if now is None else now
     at_text = _timestamp_text(at)
@@ -285,14 +289,33 @@ def create_deposit_request(
                 f"وسيلة الدفع #{pm.id} غير متاحة للإيداع"
             )
 
-        # Authoritative minimum — exact integer units, existing
-        # platform-settings contract (missing setting raises; it is
-        # never defaulted or guessed).
-        minimum_units = platform_settings.get_required_setting(
-            platform_settings.MINIMUM_DEPOSIT_UNITS, conn=conn
-        )
-        if amount_units < minimum_units:
-            raise DepositBelowMinimumError(amount_units, minimum_units)
+        # 1) Asset scale — the ONE registry; unknown asset fails
+        #    closed (no default scale is ever invented).
+        try:
+            asset_units.decimals_for(pm.asset)
+        except asset_units.UnknownAssetScaleError as exc:
+            raise DepositConfigurationError(
+                f"no registered decimal scale for method #{pm.id} "
+                "deposit asset"
+            ) from exc
+
+        # 2) Per-method minimum — NULL = not configured = fail
+        #    closed (no global fallback, no invented default).
+        if pm.min_deposit_units is None:
+            raise DepositConfigurationError(
+                f"min_deposit_units not configured for method #{pm.id}"
+            )
+
+        # 3) Exact parse at the method's OWN asset scale (EGP cents vs
+        #    USDT atomic units — never one global scale).
+        amount_units = parse_amount_units(amount, pm.asset)
+
+        # 4) Compare in the SAME asset's atomic units — a
+        #    cross-currency comparison is impossible by construction.
+        if amount_units < pm.min_deposit_units:
+            raise DepositBelowMinimumError(
+                amount_units, pm.min_deposit_units
+            )
 
         conn.execute(
             "INSERT INTO deposit_requests "

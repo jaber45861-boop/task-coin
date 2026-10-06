@@ -405,7 +405,7 @@ const DepositUI = (() => {
                     <div><dt>وسيلة الإيداع</dt><dd
                         >${_esc(request.display_name)}</dd></div>
                     <div><dt>المبلغ</dt><dd dir="ltr"
-                        >${_esc(request.amount)} USDT</dd></div>
+                        >${_esc(request.amount)} ${_esc(request.asset)}</dd></div>
                     <div><dt>تاريخ الإنشاء</dt><dd dir="ltr"
                         data-testid="deposit-created-at"
                         >${_esc(request.created_at)}</dd></div>

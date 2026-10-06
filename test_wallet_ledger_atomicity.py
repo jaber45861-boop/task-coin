@@ -71,7 +71,7 @@ import wallet
 from ledger import LedgerEntry, LedgerService
 
 # Reuse the established MT-ADMIN-28/29 test helpers (repo convention).
-from test_deposit import ADMIN_ID, _make_pm, _seed_minimum
+from test_deposit import ADMIN_ID, _make_pm
 from test_miniapp_auth import _TEST_BOT_TOKEN
 
 USER = 8801
@@ -95,13 +95,12 @@ def env(monkeypatch, tmp_path):
     db.init_db(db_path)
     db.register_user(USER, "carol", "Carol")
     monkeypatch.setattr(config, "ADMINS", [ADMIN_ID])
-    _seed_minimum(db_path, 1)
     yield db_path
 
 
 def _request(db_path: str) -> str:
     """One PENDING deposit intent through the production creator."""
-    pm = _make_pm(db_path)
+    pm = _make_pm(db_path, min_units=1)
     request = deposit_store.create_deposit_request(
         user_id=USER,
         payment_method_id=pm.id,

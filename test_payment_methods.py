@@ -1025,8 +1025,13 @@ class WizardTestBase(PaymentMethodTestBase):
         name: str = "وسيلة الاختبار",
         provider: str = "مزود الاختبار",
         destination: str = "WZDEST123456",
+        min_text: str = "0",
     ) -> MagicMock:
-        """Bare /addpm → review page on a fresh database (no suggestions)."""
+        """Bare /addpm → review page on a fresh database (no suggestions).
+
+        ``min_text`` is typed on the minimum-deposit step that now
+        follows the destination (``"0"`` = leave it unconfigured).
+        """
         start = self._start()
         self.assertIn(admin.WZ_ADD_TITLE, _reply(start))
         stage2 = self._press_w("pm:wcat:1")
@@ -1052,7 +1057,10 @@ class WizardTestBase(PaymentMethodTestBase):
         self.assertIn("Private Key", dest_prompt)
         self.assertIn("Seed Phrase", dest_prompt)
         stage7 = self._type(destination)
-        self.assertEqual(_reply(stage7), admin.WZ_PROMPT_INSTRUCTIONS)
+        min_prompt = _reply(stage7)
+        self.assertIn(admin.WZ_PROMPT_MIN_DEPOSIT, min_prompt)
+        stage8 = self._type(min_text)
+        self.assertEqual(_reply(stage8), admin.WZ_PROMPT_INSTRUCTIONS)
         return self._press_w("pm:wskip")
 
 
@@ -1138,6 +1146,8 @@ class TestAddWizard(WizardTestBase):
         self._type("كاش الاختبار")
         self._type("مزود الكاش")
         stage = self._type("WZCASHDEST")
+        self.assertIn(admin.WZ_PROMPT_MIN_DEPOSIT, _reply(stage))
+        stage = self._type("0")
         self.assertEqual(_reply(stage), admin.WZ_PROMPT_INSTRUCTIONS)
         review = self._press_w("pm:wskip")
         text = _edited(review.callback_query)
@@ -1232,8 +1242,11 @@ class TestAddWizard(WizardTestBase):
             admin._WIZARD_STATES[ADMIN_A]["step"], "destination"
         )
         self.assertEqual(self._rows(), [])
-        # A valid public address advances to the optional notes.
+        # A valid public address advances to the minimum-deposit step.
         resp = self._type("WZDEST-OK")
+        self.assertIn(admin.WZ_PROMPT_MIN_DEPOSIT, _reply(resp))
+        # …and clearing the minimum reaches the optional notes.
+        resp = self._type("0")
         self.assertEqual(_reply(resp), admin.WZ_PROMPT_INSTRUCTIONS)
 
     def test_cancel_creates_nothing(self) -> None:
@@ -1320,8 +1333,10 @@ class TestAddWizard(WizardTestBase):
 
     def test_deposit_flow_sees_wizard_method(self) -> None:
         """19. A wizard-created method reaches the deposit surface via
-        the exact selection filter of list_deposit_methods."""
-        self._drive_to_review()
+        the exact selection filter of list_deposit_methods.  The
+        minimum is staged in the wizard (EGP 50 → 5000 units) because
+        enabling deposits without it is refused (decision 10)."""
+        self._drive_to_review(asset="EGP", min_text="50")
         self._press_w("pm:wconfirm")
         mid = self._rows()[0]["id"]
         store.set_payment_method_deposits_enabled(
@@ -1468,6 +1483,159 @@ class TestEditWizard(WizardTestBase):
         _run(admin.edit_pm_command(update, MagicMock()))
         update.message.reply_text.assert_not_called()
         self.assertEqual(self._rows(), [])
+
+
+# ════════════════════════════════════════════════════════════════════
+# PER-METHOD MINIMUM DEPOSITS (per-asset atomic units; fail-closed)
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestMinimumDepositUnits(WizardTestBase):
+    """Decision 22: wizard create/edit of the minimum, the
+    deposits-enable gate, and the asset-change clearing rule."""
+
+    def _method(self, method_id: int):
+        return store.get_payment_method(method_id)
+
+    def _open(self, method_id: int, *, admin_id: int = ADMIN_A) -> MagicMock:
+        update = _update(admin_id, f"/editpm {method_id}")
+        _run(admin.edit_pm_command(update, MagicMock()))
+        return update
+
+    def _update_row(self, method_id: int, **overrides):
+        """Full-field store update from the stored row — only the
+        overrides this test cares about are spelled out."""
+        row = dict(
+            self._raw(
+                "SELECT * FROM payment_methods WHERE id = ?",
+                (method_id,),
+            )[0]
+        )
+        fields = dict(
+            category=row["category"],
+            display_name=row["display_name"],
+            asset=row["asset"],
+            network=row["network"],
+            provider=row["provider"],
+            destination=row["destination"],
+            instructions=row["instructions"],
+            updated_by=ADMIN_A,
+        )
+        fields.update(overrides)
+        return store.update_payment_method(method_id, **fields)
+
+    def test_wizard_creates_min_in_asset_units(self) -> None:
+        """The wizard stores the typed minimum at the staged asset's
+        scale (EGP 50 → 5000 atomic units) and the review page
+        renders it in that same asset's unit."""
+        review = self._drive_to_review(asset="EGP", min_text="50")
+        text = _edited(review.callback_query)
+        self.assertIn("الحد الأدنى للإيداع: 50.00", text)
+        self._press_w("pm:wconfirm")
+        method = self._method(self._rows()[0]["id"])
+        self.assertEqual(method.min_deposit_units, 5000)
+
+    def test_wizard_edit_loads_and_saves_min(self) -> None:
+        """Edit mode loads the stored minimum (unset → not-configured)
+        and saves a new value at the method asset's own scale
+        (USDT 1.5 → 150000000 atomic units)."""
+        mid = self._create()  # USDT, minimum not configured
+        opening = self._open(mid)
+        self.assertIn("الحد الأدنى للإيداع: غير مضبوط", _reply(opening))
+        self.assertIn(
+            "pm:wfield:8", self._buttons(self._reply_markup_of(opening))
+        )
+        prompt = self._press_w("pm:wfield:8")
+        self.assertIn(
+            admin.WZ_PROMPT_MIN_DEPOSIT, _edited(prompt.callback_query)
+        )
+        resp = self._type("1.5")
+        self.assertIn("الحد الأدنى للإيداع: 1.50000000", _reply(resp))
+        saved = self._press_w("pm:wsave")
+        self.assertIn(f"تم تعديل الوسيلة #{mid}", _edited(saved.callback_query))
+        self.assertEqual(self._method(mid).min_deposit_units, 150000000)
+
+    def test_wizard_asset_change_clears_staged_min(self) -> None:
+        """Changing the asset inside the edit wizard drops the
+        old-asset units immediately (menu shows not-configured) and
+        the saved row keeps them cleared."""
+        mid = self._create()  # USDT
+        self._update_row(mid, min_deposit_units=1000)
+        self._open(mid)
+        self._press_w("pm:wfield:3")  # asset — suggestions pending
+        self._press_w("pm:wmanual")
+        resp = self._type("WZNEWASSET")
+        menu = _reply(resp)
+        self.assertIn("العملة: WZNEWASSET", menu)
+        self.assertIn("الحد الأدنى للإيداع: غير مضبوط", menu)
+        self._press_w("pm:wsave")
+        method = self._method(mid)
+        self.assertEqual(method.asset, "WZNEWASSET")
+        self.assertIsNone(method.min_deposit_units)
+
+    def test_enabling_deposits_requires_min(self) -> None:
+        """Decision 10: with no minimum the enable flag is refused at
+        the store AND on the pm:depon callback — the row stays
+        deposits-disabled."""
+        mid = self._create()  # minimum never configured
+        with self.assertRaises(store.PaymentMethodValidationError):
+            store.set_payment_method_deposits_enabled(
+                mid, True, updated_by=ADMIN_A
+            )
+        self.assertFalse(self._method(mid).deposits_enabled)
+        press = self._press(f"pm:depon:{mid}")
+        answer = _answered(press.callback_query)
+        self.assertIsNotNone(answer)
+        self.assertIn("❌", answer)
+        self.assertIn("الحد الأدنى", answer)
+        self.assertFalse(self._method(mid).deposits_enabled)
+
+    def test_enabling_deposits_requires_supported_asset(self) -> None:
+        """Even with units stored, an asset with no registered scale
+        can never be published for deposits (fail-closed)."""
+        self._add(
+            "crypto | وسيلة الاختبار | WZASSET | WZNET | مزود الاختبار | "
+            "WZDEST123456 | -"
+        )
+        mid = self._rows()[0]["id"]
+        # An int is already-canonical atomic units, so the minimum
+        # itself is storable even though the asset has no scale.
+        self._update_row(mid, min_deposit_units=1)
+        with self.assertRaises(store.PaymentMethodValidationError):
+            store.set_payment_method_deposits_enabled(
+                mid, True, updated_by=ADMIN_A
+            )
+        self.assertFalse(self._method(mid).deposits_enabled)
+
+    def test_asset_change_clears_min_and_blocks_reenable(self) -> None:
+        """Decision 9 at the store: the units belong to the OLD
+        asset — after a change they are cleared and deposits must be
+        re-configured against the new asset before re-enabling."""
+        mid = self._create()  # USDT
+        self._update_row(mid, min_deposit_units=1000)
+        on = store.set_payment_method_deposits_enabled(
+            mid, True, updated_by=ADMIN_A
+        )
+        self.assertTrue(on.deposits_enabled)
+        # Change the asset WITHOUT supplying a minimum → cleared.
+        updated = self._update_row(mid, asset="EGP")
+        self.assertEqual(updated.asset, "EGP")
+        self.assertIsNone(updated.min_deposit_units)
+        # Re-enabling after the change is refused…
+        store.set_payment_method_deposits_enabled(
+            mid, False, updated_by=ADMIN_A
+        )
+        with self.assertRaises(store.PaymentMethodValidationError):
+            store.set_payment_method_deposits_enabled(
+                mid, True, updated_by=ADMIN_A
+            )
+        # …until the minimum is re-set at the NEW asset's scale.
+        self._update_row(mid, min_deposit_units="50")
+        enabled = store.set_payment_method_deposits_enabled(
+            mid, True, updated_by=ADMIN_A
+        )
+        self.assertTrue(enabled.deposits_enabled)
+        self.assertEqual(enabled.min_deposit_units, 5000)  # EGP, 2 dp
 
 
 # CALLBACK PARSERS (untrusted payloads)

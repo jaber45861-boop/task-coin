@@ -37,16 +37,23 @@ Audited defaults (MT-ADMIN-15 audit of the current contract):
 
 * ``advertiser_commission`` → ``COMMISSION_DEFAULT`` = 3000 bp (30 %),
   the currently agreed initial value.
-* ``minimum_withdrawal_units`` / ``minimum_deposit_units`` /
-  ``withdrawal_fee_units`` → registered but **unseeded**.  The only
+* ``minimum_withdrawal_units`` / ``withdrawal_fee_units`` →
+  registered but **unseeded**.  The only
   pre-existing constants are ``withdrawal_rules.MIN_WITHDRAW_EGP``
   (10 EGP) and ``withdrawal_rules.WITHDRAW_FEE_EGP`` (1 EGP): both are
   EGP-denominated while these settings are USDT atomic units, so they
   do not define a USDT default and no exchange rate may be invented
-  here; no deposit minimum exists anywhere in the codebase.  Production
-  defaults are therefore NOT invented — an admin sets them, and
-  :func:`get_required_setting` raises :class:`SettingNotFoundError`
-  until then.
+  here.  Production defaults are therefore NOT invented — an admin
+  sets them, and :func:`get_required_setting` raises
+  :class:`SettingNotFoundError` until then.
+
+* ``minimum_deposit_units`` was REMOVED from this registry: the
+  deposit minimum is per payment method and asset-denominated
+  (``payment_methods.min_deposit_units`` in that method's own atomic
+  units), so a single global USDT-denominated key could never serve
+  two currencies.  One source of truth — any old row for the key
+  stays in the table untouched and is ignored by
+  :func:`list_settings` (registered keys only); nothing is deleted.
 
 Authorization: mutation is admin-only and reuses the ONE existing model
 (``config.is_admin``) — this module never re-implements authorization.
@@ -105,7 +112,6 @@ _SQLITE_INT64_MAX = 9_223_372_036_854_775_807
 # ── Stable setting keys ────────────────────────────────────────────────
 
 MINIMUM_WITHDRAWAL_UNITS = "minimum_withdrawal_units"
-MINIMUM_DEPOSIT_UNITS = "minimum_deposit_units"
 WITHDRAWAL_FEE_UNITS = "withdrawal_fee_units"
 ADVERTISER_COMMISSION = "advertiser_commission"
 
@@ -133,12 +139,6 @@ SETTINGS: dict[str, SettingSpec] = {
         **_USDT_SPEC,
         default=None,
         description="حد أدنى للسحب بوحدات USDT الذرية",
-    ),
-    MINIMUM_DEPOSIT_UNITS: SettingSpec(
-        key=MINIMUM_DEPOSIT_UNITS,
-        **_USDT_SPEC,
-        default=None,
-        description="حد أدنى للإيداع بوحدات USDT الذرية",
     ),
     WITHDRAWAL_FEE_UNITS: SettingSpec(
         key=WITHDRAWAL_FEE_UNITS,
