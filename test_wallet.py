@@ -705,17 +705,23 @@ class TestScopePolicy(WalletTestBase):
         The Home stats cards («المتاح» / «المكافآت») add theirs the
         same way: ``miniapp/js/task-stats.js`` (new, read-only display
         data for the two cards — no wallet behaviour), plus its script
-        tag in ``miniapp/index.html``.          The Account reviewer entry
-        (reviewer surface, MT-TASK-18) adds its visibility gate there
-        too: ``miniapp/js/review.js`` (the server-authority probe) and
-        ``miniapp/js/app.js`` (reveal the entry on the Account page
-        only when that probe says ok) — again no wallet behaviour.
+        tag in ``miniapp/index.html``.
+        The Account reviewer entry (reviewer surface, MT-TASK-18)
+        adds its visibility gate there too: ``miniapp/js/review.js``
+        (the server-authority probe) and ``miniapp/js/app.js``
+        (reveal the entry on the Account page only when that probe
+        says ok) — again no wallet behaviour.
         The Account page identity («حسابي») adds its renderer the
         same way: ``miniapp/js/profile.js`` (new, presentational
         only — the caller's own Telegram identity from
         TelegramApp.getUser(), no wallet behaviour), plus its script
         tag in ``miniapp/index.html`` and the ``.profile-*`` styles
         in ``miniapp/css/app.css``.
+        The per-method minimum-deposit work adds one display-only
+        exception: ``miniapp/js/deposit.js`` renders the deposit
+        receipt amount in the request's OWN asset (replacing the
+        hardcoded USDT suffix) — presentation only, no wallet
+        behaviour, no amount parsing client-side.
         Every other Mini App file — wallet.js, wallet-data.js, the
         rest — must stay byte-identical.
         """
@@ -740,6 +746,7 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/js/profile.js",    # «حسابي» identity renderer (new)
             "miniapp/index.html",       # task-request.js / guide.js / task-stats.js tags
             "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
+            "miniapp/js/deposit.js",    # receipt amount in the request's asset
         }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse

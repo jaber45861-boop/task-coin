@@ -268,14 +268,25 @@ class ControlTestBase(_Base):
 
     def _seed_deposit_proof(self, user_id: int = 501):
         self.add_user(user_id)
+        # Per-method minimum in the method's OWN asset units must be
+        # configured BEFORE deposits can be enabled (store gate);
+        # the old global minimum_deposit_units setting no longer
+        # exists (decision: one source of truth per method).
+        payment_method_store.update_payment_method(
+            self.pm.id,
+            category=self.pm.category,
+            display_name=self.pm.display_name,
+            asset=self.pm.asset,
+            network=self.pm.network,
+            provider=self.pm.provider,
+            destination=self.pm.destination,
+            instructions=self.pm.instructions,
+            min_deposit_units=1000,
+            updated_by=ADMIN_ID,
+            db_path=self.db_path,
+        )
         payment_method_store.set_payment_method_deposits_enabled(
             self.pm.id, True, updated_by=ADMIN_ID, db_path=self.db_path
-        )
-        platform_settings.set_setting(
-            platform_settings.MINIMUM_DEPOSIT_UNITS,
-            1000,
-            admin_user_id=ADMIN_ID,
-            db_path=self.db_path,
         )
         deposit = deposit_store.create_deposit_request(
             user_id=user_id,
@@ -448,6 +459,21 @@ class TestMetrics(ControlTestBase):
     def test_09_payment_method_counts_from_store(self) -> None:
         """9. Counts come from payment_method_store.list_payment_methods."""
         second = self.create_method(display_name="M2")
+        # A deposit method needs its per-method minimum configured
+        # before the deposits flag can be enabled (store gate).
+        payment_method_store.update_payment_method(
+            self.pm.id,
+            category=self.pm.category,
+            display_name=self.pm.display_name,
+            asset=self.pm.asset,
+            network=self.pm.network,
+            provider=self.pm.provider,
+            destination=self.pm.destination,
+            instructions=self.pm.instructions,
+            min_deposit_units=1000,
+            updated_by=ADMIN_ID,
+            db_path=self.db_path,
+        )
         payment_method_store.set_payment_method_deposits_enabled(
             self.pm.id, True, updated_by=ADMIN_ID, db_path=self.db_path
         )

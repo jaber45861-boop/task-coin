@@ -52,6 +52,7 @@ import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+import asset_units
 import payment_method_store as store
 from config import is_admin
 from payment_method_store import (
@@ -195,6 +196,14 @@ WZ_PROMPT_DESTINATION = (
     "❌ لا ترسل Seed Phrase."
 )
 WZ_PROMPT_INSTRUCTIONS = "📝 أرسل ملاحظات أو اضغط \"تخطي\":"
+WZ_PROMPT_MIN_DEPOSIT = (
+    "💵 أرسل الحد الأدنى للإيداع بوحدة العملة الحالية (مثال: 50):\n\n"
+    "اكتب 0 لمسح الحد الأدنى (يُرفض الإيداع حتى تضبطه من جديد)."
+)
+WZ_PROMPT_MIN_DEPOSIT_NO_ASSET = (
+    "💵 حدّد العملة أولًا — لا يمكن ضبط الحد الأدنى قبل معرفة "
+    "وحدة العملة."
+)
 WZ_PROMPT_CATEGORY = (
     f"{WZ_ADD_TITLE}\n{WZ_RULE}\n\n"
     "اختر الفئة:\n\n"
@@ -573,6 +582,9 @@ _MENU_FIELDS: tuple[str, ...] = (
     "provider",
     "destination",
     "instructions",
+    # Appended LAST so the existing field indices (1-7) stay stable
+    # for live menus and tests; needs the staged asset's scale.
+    "min_deposit_units",
 )
 
 _FIELD_LABELS = {
@@ -583,6 +595,7 @@ _FIELD_LABELS = {
     "provider": "المزود",
     "destination": "العنوان",
     "instructions": "الملاحظات",
+    "min_deposit_units": "💵 الحد الأدنى للإيداع",
 }
 
 _MENU_BUTTON_LABELS = {
@@ -593,12 +606,14 @@ _MENU_BUTTON_LABELS = {
     "provider": "🏦 المزود",
     "destination": "📍 العنوان",
     "instructions": "📝 الملاحظات",
+    "min_deposit_units": "💵 الحد الأدنى",
 }
 
 # Text steps consumed by ``wizard_text_input`` (category/review/menu
 # wait for buttons instead).
 _TEXT_STEPS = frozenset(
-    {"asset", "network", "display_name", "provider", "destination", "instructions"}
+    {"asset", "network", "display_name", "provider", "destination",
+     "instructions", "min_deposit_units"}
 )
 
 # Existing store validators — the wizard invents NO rules of its own.
@@ -630,6 +645,7 @@ def _new_wizard_state(mode: str) -> dict:
         "provider": None,
         "destination": None,
         "instructions": None,
+        "min_deposit_units": None,
         "manual": False,
         "editing": False,
         "asset_options": (),
@@ -822,7 +838,7 @@ def _menu_keyboard(mode: str) -> InlineKeyboardMarkup:
 
 
 def build_wizard_summary(state: dict) -> str:
-    """The seven staged values — full destination, admin's own chat
+    """The staged values — full destination, admin's own chat
     only (the same exposure as the existing edit template)."""
     category = state.get("category")
     dest_label = DEST_LABEL.get(category or "", "العنوان")
@@ -833,8 +849,28 @@ def build_wizard_summary(state: dict) -> str:
         f"الشبكة: {state.get('network') or EMPTY_FIELD}\n"
         f"المزود: {state.get('provider') or EMPTY_FIELD}\n"
         f"{dest_label}: {state.get('destination') or EMPTY_FIELD}\n"
-        f"الملاحظات: {state.get('instructions') or EMPTY_FIELD}"
+        f"الملاحظات: {state.get('instructions') or EMPTY_FIELD}\n"
+        f"الحد الأدنى للإيداع: {_min_deposit_display(state)}"
     )
+
+
+def _min_deposit_display(state: dict) -> str:
+    """Staged minimum in the staged asset's unit — never invented.
+
+    ``None`` renders as not-configured; an unregistered asset falls
+    back to the raw integer units so the review text never breaks.
+    """
+    units = state.get("min_deposit_units")
+    if units is None:
+        return "غير مضبوط"
+    try:
+        return str(
+            asset_units.units_to_asset_decimal(
+                units, state.get("asset")
+            )
+        )
+    except asset_units.AssetUnitsError:
+        return str(units)
 
 
 def build_review_text(state: dict) -> str:
@@ -910,6 +946,14 @@ def _render_step(state: dict) -> tuple[str, InlineKeyboardMarkup | None]:
         return WZ_PROMPT_PROVIDER, _cancel_keyboard()
     if step == "destination":
         return WZ_PROMPT_DESTINATION, _cancel_keyboard()
+    if step == "min_deposit_units":
+        if not state.get("asset"):
+            return WZ_PROMPT_MIN_DEPOSIT_NO_ASSET, _cancel_keyboard()
+        return (
+            f"{WZ_PROMPT_MIN_DEPOSIT}\n\n"
+            f"العملة الحالية: {state.get('asset')}",
+            _cancel_keyboard(),
+        )
     if step == "instructions":
         return WZ_PROMPT_INSTRUCTIONS, _instructions_keyboard()
     if step == "review":
@@ -941,6 +985,8 @@ def _next_step_after(state: dict, field: str) -> str:
     if field == "provider":
         return "destination"
     if field == "destination":
+        return "min_deposit_units"
+    if field == "min_deposit_units":
         return "instructions"
     return "review"  # instructions — optional, reached last
 
@@ -949,6 +995,11 @@ def _commit_field(state: dict, field: str, value) -> None:
     state[field] = value
     state["manual"] = False
     state["asset_options"] = ()
+    if field == "asset":
+        # The staged minimum belongs to the OLD asset's scale:
+        # clearing it forces a fresh entry against the new asset
+        # (the store re-enforces the same rule at save time).
+        state["min_deposit_units"] = None
     next_step = _next_step_after(state, field)
     if next_step in ("review", "menu"):
         state["editing"] = False
@@ -988,6 +1039,7 @@ async def _start_edit_wizard(actor: int, method_id: int, message) -> None:
     state["provider"] = method.provider
     state["destination"] = method.destination
     state["instructions"] = method.instructions
+    state["min_deposit_units"] = method.min_deposit_units
     _WIZARD_STATES[actor] = state
     logger.info(
         "Payment method wizard started: admin=%d mode=edit id=%d",
@@ -1181,10 +1233,18 @@ async def wizard_text_input(update, context) -> None:
         await message.reply_text(MSG_WIZARD_INVALID_OPTION)
         return
     validator = _FIELD_VALIDATORS.get(step)
-    if validator is None:
-        return
     try:
-        value = validator(getattr(message, "text", None))
+        if step == "min_deposit_units":
+            # Needs the STAGED asset for its scale — validated by the
+            # store; the asset_units registry is the only scale
+            # source (no literal, no default scale here).
+            value = store.validate_min_deposit_units(
+                getattr(message, "text", None), state.get("asset")
+            )
+        elif validator is not None:
+            value = validator(getattr(message, "text", None))
+        else:
+            return
     except PaymentMethodValidationError as exc:
         await message.reply_text(f"❌ {exc}{MSG_WIZARD_RETRY}")
         return
@@ -1358,6 +1418,7 @@ async def _wizard_callback(query, actor: int, op: str, ref: int | None) -> None:
                     provider=state.get("provider"),
                     destination=state.get("destination"),
                     instructions=state.get("instructions"),
+                    min_deposit_units=state.get("min_deposit_units"),
                     created_by=actor,
                 )
             except PaymentMethodValidationError as exc:
@@ -1397,6 +1458,7 @@ async def _wizard_callback(query, actor: int, op: str, ref: int | None) -> None:
                     provider=state.get("provider"),
                     destination=state.get("destination"),
                     instructions=state.get("instructions"),
+                    min_deposit_units=state.get("min_deposit_units"),
                     updated_by=actor,
                 )
             except PaymentMethodValidationError as exc:
@@ -1418,9 +1480,17 @@ async def _wizard_callback(query, actor: int, op: str, ref: int | None) -> None:
                 await _safe_edit(query, MSG_NOT_FOUND, _list_again_button())
                 return
             await _safe_answer(query, None)
+            save_text = f"✅ تم تعديل الوسيلة #{updated.id}"
+            if updated.min_deposit_units is None:
+                # Fail-closed reminder: deposits stay refused until
+                # the minimum is configured again.
+                save_text += (
+                    "\n⚠️ الحد الأدنى للإيداع غير مضبوط — الإيداع "
+                    "مرفوض حتى تضبطه."
+                )
             await _safe_edit(
                 query,
-                f"✅ تم تعديل الوسيلة #{updated.id}",
+                save_text,
                 _list_again_button(),
             )
             return
@@ -1508,9 +1578,15 @@ async def payment_method_callback(update, context) -> None:
         # MT-ADMIN-28: explicit deposit availability — the ONLY way a
         # method becomes a user deposit destination.
         if op in (OP_DEPON, OP_DEPOFF):
-            updated = store.set_payment_method_deposits_enabled(
-                method.id, op == OP_DEPON, updated_by=actor
-            )
+            try:
+                updated = store.set_payment_method_deposits_enabled(
+                    method.id, op == OP_DEPON, updated_by=actor
+                )
+            except PaymentMethodValidationError as exc:
+                # Gate refusal (no configured minimum / unregistered
+                # asset) — a clear business error, not a crash.
+                await _safe_answer(query, f"❌ {exc}")
+                return
             if updated is None:
                 await _safe_answer(query, MSG_NOT_FOUND)
                 return

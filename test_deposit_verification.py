@@ -73,6 +73,7 @@ import wallet
 from deposit_verification import (
     DepositAlreadyCreditedError,
     DepositAmountMismatchError,
+    DepositAssetNotCreditableError,
     DepositConflictError,
     DepositNotFoundError,
     DepositNotPendingError,
@@ -84,7 +85,7 @@ from deposit_verification import (
 )
 
 # Reuse the MT-ADMIN-28 helpers (independently implemented).
-from test_deposit import ADMIN_ID, _make_pm, _seed_minimum
+from test_deposit import ADMIN_ID, _make_pm
 from test_miniapp_auth import _TEST_BOT_TOKEN
 
 USER_A = 4401
@@ -100,19 +101,22 @@ FACTS = {"source": "unit-test-verifier"}
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    """Isolated database + registered user + configured minimum."""
+    """Isolated database + registered user (the minimum is
+    per-method and configured by the request helper below)."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN)
     db_path = str(tmp_path / "deposit_verify.db")
     monkeypatch.setattr(db, "DB_PATH", db_path)
     db.init_db(db_path)
     db.register_user(USER_A, "alice", "Alice")
     monkeypatch.setattr(config, "ADMINS", [ADMIN_ID])
-    _seed_minimum(db_path, 1)        # 1 unit — precision focus
     yield db_path
 
 
 def _request(db_path: str, *, amount: str = AMOUNT, **pm_overrides):
     """One PENDING deposit intent through the production creator."""
+    # Floor of 1 atomic unit — the precision focus these tests had
+    # with the old global minimum, now per-method (min_deposit_units).
+    pm_overrides.setdefault("min_units", 1)
     pm = _make_pm(db_path, **pm_overrides)
     return deposit_store.create_deposit_request(
         user_id=USER_A,
@@ -586,6 +590,7 @@ class TestFactsAndSecurity:
             DepositNotFoundError: "deposit_not_found",
             DepositNotPendingError: "deposit_not_pending",
             DepositAmountMismatchError: "deposit_amount_mismatch",
+            DepositAssetNotCreditableError: "deposit_asset_not_creditable",
             InvalidExternalTxIdError: "invalid_external_tx_id",
             ExternalTxIdAlreadyUsedError: "external_tx_id_already_used",
             DepositAlreadyCreditedError: "deposit_already_credited",
@@ -597,3 +602,66 @@ class TestFactsAndSecurity:
             assert issubclass(cls, DepositVerificationError)
         # already-credited IS a domain conflict
         assert issubclass(DepositAlreadyCreditedError, DepositConflictError)
+
+
+class TestAssetCreditGate:
+    """The internal wallet is USDT-only (decision): a request whose
+    asset is not the wallet credit currency is rejected BEFORE any
+    wallet/ledger write — no credit, no ledger row, no partial
+    credit, no implicit conversion — while request CREATION keeps
+    working and USDT credit stays untouched."""
+
+    @staticmethod
+    def _egp_request(db_path: str):
+        pm = _make_pm(
+            db_path,
+            category="cash",
+            asset="EGP",
+            network=None,
+            min_units=5000,            # 50.00 EGP at the 2-dp scale
+        )
+        return deposit_store.create_deposit_request(
+            user_id=USER_A,
+            payment_method_id=pm.id,
+            amount="50",
+            db_path=db_path,
+        )
+
+    def test_egp_request_creation_still_works(self, env):
+        """EGP deposits can be REQUESTED — only crediting is gated."""
+        request = self._egp_request(env)
+        assert request.pm_asset == "EGP"
+        assert request.amount_units == 5000      # EGP cents, exact
+        assert request.status == "pending"
+
+    def test_egp_credit_rejected_with_zero_financial_mutation(
+        self, env
+    ):
+        _fund()
+        request = self._egp_request(env)
+
+        with pytest.raises(DepositAssetNotCreditableError) as excinfo:
+            _verify(request.request_id, units=5000)
+        assert excinfo.value.code == "deposit_asset_not_creditable"
+
+        # ZERO mutation: wallet unchanged, no ledger row, still
+        # pending — the whole transaction rolled back.
+        assert _wallet_units(env) == (FUND, 0)
+        assert _deposit_ledger(env, request.request_id) == []
+        row = _row(env, request.request_id)
+        assert row["status"] == "pending"
+        assert row["external_tx_id"] is None
+
+    def test_egp_credit_rejected_without_creating_wallet_row(
+        self, env
+    ):
+        """An unfunded user's wallet row is never even created by a
+        rejected EGP credit attempt."""
+        request = self._egp_request(env)
+
+        with pytest.raises(DepositAssetNotCreditableError):
+            _verify(request.request_id, units=5000)
+
+        assert _wallet_units(env) is None
+        assert _deposit_ledger(env, request.request_id) == []
+        assert _row(env, request.request_id)["status"] == "pending"

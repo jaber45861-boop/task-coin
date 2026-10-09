@@ -51,6 +51,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 
+import asset_units
 import db
 from task_taxonomy import has_unsafe_control_chars
 
@@ -143,6 +144,12 @@ class PaymentMethod:
     # Deliberately NOT expressed through `category` (crypto/cash is
     # the payment concept, not deposit/withdrawal availability).
     deposits_enabled: bool = False
+    # Per-method deposit minimum: exact atomic units of this
+    # method's OWN asset at that asset's registered scale (the
+    # ``asset_units`` registry is the ONLY scale source).  NULL =
+    # not configured = the deposit path rejects fail-closed; no
+    # default value is ever invented here or elsewhere.
+    min_deposit_units: int | None = None
 
 
 # ── Generic validation (no network/provider knowledge) ────────────────
@@ -287,6 +294,63 @@ def validate_instructions(value: object) -> str | None:
     return text
 
 
+# Mirrors db._SQLITE_INT64_MAX — the signed SQLite INTEGER bound a
+# stored atomic-unit value must fit (copied so this module depends
+# only on public surface).
+_SQLITE_INT64_MAX = 9_223_372_036_854_775_807
+
+# Sentinel: the argument was NOT supplied — distinct from an explicit
+# ``None``, which CLEARS a previously configured value.
+_UNSET = object()
+
+
+def validate_min_deposit_units(value: object, asset: object) -> int | None:
+    """Admin minimum-deposit input → exact atomic units of *asset*.
+
+    ``None`` / empty text / ``"0"`` / ``"-"`` → ``None`` (not
+    configured — the deposit path then fails closed; this module
+    never invents a minimum).  ``int`` → already-canonical atomic
+    units (strictly positive).  ``str`` → exact decimal text in the
+    asset's OWN unit, converted at the ``asset_units`` registry
+    scale — this module holds no asset symbol and no scale of its
+    own, so EGP and USDT can never share one number.
+
+    Raises:
+        PaymentMethodValidationError: bad shape/value, or an asset
+            with no registered scale (fail closed — no fallback).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise PaymentMethodValidationError(
+            "الحد الأدنى للإيداع: قيمة غير صالحة"
+        )
+    if isinstance(value, int):
+        if value <= 0 or value > _SQLITE_INT64_MAX:
+            raise PaymentMethodValidationError(
+                "الحد الأدنى للإيداع: قيمة موجبة محصورة مطلوبة"
+            )
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in ("0", "-"):
+            return None
+        try:
+            return asset_units.parse_units(
+                text, asset, field="الحد الأدنى للإيداع"
+            )
+        except asset_units.UnknownAssetScaleError as exc:
+            raise PaymentMethodValidationError(
+                "لا يمكن تحديد الحد الأدنى: لا يوجد مقاس مسجل "
+                "لهذه العملة — حدّد العملة أولًا"
+            ) from exc
+        except asset_units.AssetAmountError as exc:
+            raise PaymentMethodValidationError(str(exc)) from exc
+    raise PaymentMethodValidationError(
+        "الحد الأدنى للإيداع: قيمة غير صالحة"
+    )
+
+
 @dataclass(frozen=True)
 class PaymentMethodForm:
     """Fully validated create/edit payload."""
@@ -325,7 +389,8 @@ def validate_form(
 
 _COLUMNS = (
     "id, category, display_name, asset, network, provider, destination, "
-    "instructions, is_active, deposits_enabled, sort_order, created_by, "
+    "instructions, is_active, deposits_enabled, min_deposit_units, "
+    "sort_order, created_by, "
     "updated_by, created_at, updated_at"
 )
 
@@ -342,6 +407,11 @@ def _row_to_method(row) -> PaymentMethod:
         instructions=row["instructions"],
         is_active=bool(row["is_active"]),
         deposits_enabled=bool(row["deposits_enabled"]),
+        min_deposit_units=(
+            row["min_deposit_units"]
+            if row["min_deposit_units"] is None
+            else int(row["min_deposit_units"])
+        ),
         sort_order=row["sort_order"],
         created_by=row["created_by"],
         updated_by=row["updated_by"],
@@ -376,6 +446,7 @@ def create_payment_method(
     provider: object,
     destination: object,
     instructions: object = None,
+    min_deposit_units: object = None,
     created_by: object = None,
     sort_order: object = None,
     db_path: str | None = None,
@@ -384,12 +455,16 @@ def create_payment_method(
 
     Returns the stored row with its stable integer id.  ``sort_order``
     defaults to "after everything existing" so display order follows
-    insertion order deterministically.
+    insertion order deterministically.  ``min_deposit_units`` is the
+    optional per-method deposit minimum in atomic units of the
+    method's own asset (``None`` = not configured = deposits fail
+    closed until an admin sets it).
     """
     form = validate_form(
         category, display_name, asset, network,
         provider, destination, instructions,
     )
+    min_units = validate_min_deposit_units(min_deposit_units, form.asset)
     actor = _require_admin_id(created_by, "created_by")
 
     if sort_order is None:
@@ -415,9 +490,10 @@ def create_payment_method(
         cursor = conn.execute(
             "INSERT INTO payment_methods "
             "(category, display_name, asset, network, provider, "
-            " destination, instructions, is_active, sort_order, "
+            " destination, instructions, is_active, "
+            " min_deposit_units, sort_order, "
             " created_by, updated_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
             (
                 form.category,
                 form.display_name,
@@ -426,6 +502,7 @@ def create_payment_method(
                 form.provider,
                 form.destination,
                 form.instructions,
+                min_units,
                 order_value,
                 actor,
                 actor,
@@ -547,6 +624,7 @@ def update_payment_method(
     provider: object,
     destination: object,
     instructions: object = None,
+    min_deposit_units: object = _UNSET,
     updated_by: object = None,
     db_path: str | None = None,
 ) -> PaymentMethod | None:
@@ -555,6 +633,15 @@ def update_payment_method(
     Returns the updated row, or None when the id does not exist.
     The primary key, ``created_at`` and ``created_by`` are untouched —
     ids remain stable across any number of edits.
+
+    Minimum-deposit rules (fail-closed):
+
+    - ``min_deposit_units`` NOT supplied → the stored value is kept —
+      EXCEPT when the asset changes, where the old units belong to the
+      old asset's scale and are cleared automatically (the admin must
+      re-set the minimum against the new asset before deposits can be
+      re-enabled).
+    - Supplied → validated against the resulting (new) asset.
     """
     mid = _require_id(method_id, "method_id")
     form = validate_form(
@@ -565,14 +652,26 @@ def update_payment_method(
 
     with db.transaction(db_path) as conn:
         existing = conn.execute(
-            "SELECT id FROM payment_methods WHERE id = ?", (mid,)
+            "SELECT id, asset, min_deposit_units "
+            "FROM payment_methods WHERE id = ?",
+            (mid,),
         ).fetchone()
         if existing is None:
             return None
+        asset_changed = form.asset != existing["asset"]
+        if min_deposit_units is _UNSET:
+            new_min = (
+                None if asset_changed else existing["min_deposit_units"]
+            )
+        else:
+            new_min = validate_min_deposit_units(
+                min_deposit_units, form.asset
+            )
         conn.execute(
             "UPDATE payment_methods SET "
             "category = ?, display_name = ?, asset = ?, network = ?, "
             "provider = ?, destination = ?, instructions = ?, "
+            "min_deposit_units = ?, "
             "updated_by = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE id = ?",
             (
@@ -583,6 +682,7 @@ def update_payment_method(
                 form.provider,
                 form.destination,
                 form.instructions,
+                new_min,
                 actor,
                 mid,
             ),
@@ -659,6 +759,10 @@ def set_payment_method_deposits_enabled(
 
     This is the ONLY way a method becomes (or stops being) a user
     deposit method — active status alone never implies deposits.
+    ENABLING additionally requires a configured per-method minimum
+    (``min_deposit_units IS NOT NULL``) and an asset with a
+    registered scale — otherwise publication would hand users a
+    method that can only fail closed.  Disabling is always allowed.
     Returns the row afterwards, or None when the id does not exist.
     Running the same toggle twice is a harmless no-op write.
     """
@@ -671,10 +775,23 @@ def set_payment_method_deposits_enabled(
 
     with db.transaction(db_path) as conn:
         existing = conn.execute(
-            "SELECT id FROM payment_methods WHERE id = ?", (mid,)
+            "SELECT id, asset, min_deposit_units "
+            "FROM payment_methods WHERE id = ?",
+            (mid,),
         ).fetchone()
         if existing is None:
             return None
+        if deposits_enabled:
+            if existing["min_deposit_units"] is None:
+                raise PaymentMethodValidationError(
+                    "لا يمكن تفعيل الإيداع: الحد الأدنى للإيداع "
+                    "غير مضبوط — اضبطه أولًا"
+                )
+            if not asset_units.is_supported(existing["asset"]):
+                raise PaymentMethodValidationError(
+                    "لا يمكن تفعيل الإيداع: لا يوجد مقاس مسجل "
+                    "لهذه العملة"
+                )
         conn.execute(
             "UPDATE payment_methods SET deposits_enabled = ?, "
             "updated_by = ?, updated_at = CURRENT_TIMESTAMP "

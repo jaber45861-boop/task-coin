@@ -138,7 +138,6 @@ from test_deposit import (
     _auth,
     _make_pm,
     _read_js,
-    _seed_minimum,
 )
 from test_deposit_verification import (
     AMOUNT,
@@ -243,8 +242,7 @@ def _gif(width: int = 32, height: int = 32) -> bytes:
 
 def _request(db_path: str, *, amount: str = AMOUNT, user_id: int = USER_A):
     """One PENDING deposit intent through the production creator."""
-    _seed_minimum(db_path, MIN_UNITS)
-    pm = _make_pm(db_path)
+    pm = _make_pm(db_path, min_units=MIN_UNITS)
     return deposit_store.create_deposit_request(
         user_id=user_id,
         payment_method_id=pm.id,

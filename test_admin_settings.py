@@ -1,7 +1,7 @@
 """MT-ADMIN-39 — Admin Settings Management (focused tests).
 
 Covers the brief's required matrix against the REAL repository
-contracts (the four registered ``platform_settings`` keys — the
+contracts (the three registered ``platform_settings`` keys — the
 registry test pins the key set — written ONLY through the existing
 admin-only ``set_setting`` contract):
 
@@ -15,7 +15,7 @@ admin-only ``set_setting`` contract):
    6 → test_06   text input re-checks authorization (silent refusal)
    7 → test_07   authorization happens before settings reads
  C. RENDERING (8-12)
-   8 → test_08   all four registered settings shown
+   8 → test_08   all three registered settings shown
    9 → test_09   missing value renders "غير مضبوط"
   10 → test_10   no invented defaults for unset keys
   11 → test_11   rate is never duplicated as a setting
@@ -124,16 +124,16 @@ from test_withdrawal_service import ADMIN_ID
 
 STRANGER = 999_999
 
-# The four REAL registered keys — pinned by
-# test_platform_settings.test_registered_keys_are_exactly_the_required_four.
+# The REAL registered keys — pinned by
+# test_platform_settings.test_registered_keys_are_exactly_the_required_three.
+# (``minimum_deposit_units`` was removed from the global registry:
+# the deposit minimum is per payment method/asset.)
 KEYS = (
     "minimum_withdrawal_units",
-    "minimum_deposit_units",
     "withdrawal_fee_units",
     "advertiser_commission",
 )
 MIN_WITHDRAWAL = "minimum_withdrawal_units"
-MIN_DEPOSIT = "minimum_deposit_units"
 FEE = "withdrawal_fee_units"
 COMMISSION = "advertiser_commission"
 
@@ -147,6 +147,9 @@ ABSENT_KEYS = (
     "deposits_enabled",
     "withdrawals_enabled",
     "evil_setting",
+    # Former global deposit minimum — no longer a settings key at
+    # all (per-method on payment_methods); must never parse here.
+    "minimum_deposit_units",
 )
 
 # Raw input whose exact text must never reach logs (the canonical
@@ -396,14 +399,14 @@ class TestSettingsAuth(SettingsTestBase):
     def test_05_callback_rechecks_authorization(self) -> None:
         """5. Every settings sub-op re-checks authorization — a
         staged context cannot let a stranger confirm."""
-        ctx, _p, _v = self._stage(MIN_DEPOSIT, "0.01")
+        ctx, _p, _v = self._stage(MIN_WITHDRAWAL, "0.01")
         with mock.patch.object(
             platform_settings, "get_setting"
         ) as get_spy, mock.patch.object(
             platform_settings, "set_setting"
         ) as set_spy:
             update = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}",
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}",
                 actor_id=STRANGER,
                 context=ctx,
             )
@@ -416,7 +419,7 @@ class TestSettingsAuth(SettingsTestBase):
         """6. The text handler re-checks authorization BEFORE
         validation or any read; strangers and groups are silent and
         the staged edit stays untouched for the real admin."""
-        ctx, _p, _v = self._stage(MIN_DEPOSIT, "")  # arms pending
+        ctx, _p, _v = self._stage(MIN_WITHDRAWAL, "")  # arms pending
         # NOTE: empty text keeps pending (rejected, not consumed).
         with mock.patch.object(
             platform_settings, "parse_setting_value"
@@ -458,16 +461,17 @@ class TestSettingsAuth(SettingsTestBase):
 
 class TestSettingsRendering(SettingsTestBase):
 
-    def test_08_all_four_settings_shown(self) -> None:
-        """8. The panel shows exactly the four registered settings."""
+    def test_08_all_three_settings_shown(self) -> None:
+        """8. The panel shows exactly the registered settings."""
         _u, text, markup = self._view("ctl:settings")
         for label in (
             "💸 الحد الأدنى للسحب",
-            "💵 الحد الأدنى للإيداع",
             "💳 رسوم السحب",
             "🎁 عمولة المعلن",
         ):
             self.assertIn(label, text)
+        # The deposit minimum is NOT a settings row anymore.
+        self.assertNotIn("💵 الحد الأدنى للإيداع", text)
         edit_buttons = [
             payload for payload in self._payloads(markup)
             if ":edit:" in payload
@@ -480,25 +484,25 @@ class TestSettingsRendering(SettingsTestBase):
     def test_09_missing_value_renders_unset(self) -> None:
         """9. A never-configured key renders "غير مضبوط" — the value
         really is None in the authoritative store."""
-        self._forget(MIN_DEPOSIT, self.db_path)
+        self._forget(MIN_WITHDRAWAL, self.db_path)
         self.assertIsNone(
             platform_settings.get_setting(
-                MIN_DEPOSIT, db_path=self.db_path
+                MIN_WITHDRAWAL, db_path=self.db_path
             )
         )
         _u, text, _m = self._view("ctl:settings")
         line = next(
-            ln for ln in text.splitlines() if "الحد الأدنى للإيداع" in ln
+            ln for ln in text.splitlines() if "الحد الأدنى للسحب" in ln
         )
         self.assertTrue(line.endswith("غير مضبوط"), line)
 
     def test_10_no_invented_defaults(self) -> None:
         """10. Unset keys never display 0 / 1 / 100 / 1000 or any
         other invented number."""
-        for key in (MIN_DEPOSIT, MIN_WITHDRAWAL, FEE):
+        for key in (MIN_WITHDRAWAL, FEE):
             self._forget(key, self.db_path)
         _u, text, _m = self._view("ctl:settings")
-        for label in ("الحد الأدنى للسحب", "الحد الأدنى للإيداع", "رسوم السحب"):
+        for label in ("الحد الأدنى للسحب", "رسوم السحب"):
             line = next(ln for ln in text.splitlines() if label in ln)
             self.assertTrue(line.endswith("غير مضبوط"), line)
             for invented in ("0", "1", "100", "1000"):
@@ -551,7 +555,7 @@ class TestSettingsGrammar(SettingsTestBase):
         self.assertEqual(parse_callback("ctl:settings"), "settings")
 
     def test_14_edit_valid_keys(self) -> None:
-        """14. edit parses for each of the four registered keys."""
+        """14. edit parses for each of the registered keys."""
         for key in KEYS:
             self.assertEqual(
                 parse_callback(f"ctl:settings:edit:{key}"),
@@ -560,7 +564,7 @@ class TestSettingsGrammar(SettingsTestBase):
             )
 
     def test_15_confirm_valid_keys(self) -> None:
-        """15. confirm parses for each of the four registered keys."""
+        """15. confirm parses for each of the registered keys."""
         for key in KEYS:
             self.assertEqual(
                 parse_callback(f"ctl:settings:confirm:{key}"),
@@ -569,7 +573,7 @@ class TestSettingsGrammar(SettingsTestBase):
             )
 
     def test_16_cancel_valid_keys(self) -> None:
-        """16. cancel parses for each of the four registered keys."""
+        """16. cancel parses for each of the registered keys."""
         for key in KEYS:
             self.assertEqual(
                 parse_callback(f"ctl:settings:cancel:{key}"),
@@ -668,14 +672,14 @@ class TestSettingsValidation(SettingsTestBase):
         with mock.patch.object(
             platform_settings, "parse_setting_value", side_effect=spy
         ):
-            ctx, _p, preview = self._stage(MIN_DEPOSIT, "0.01")
+            ctx, _p, preview = self._stage(MIN_WITHDRAWAL, "0.01")
             self.assertIn("⚠️ تأكيد تحديث الإعداد", _reply(preview))
             self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
         # once at staging, again at confirmation (re-validation)
-        self.assertEqual(calls[0], (MIN_DEPOSIT, "0.01"))
-        self.assertEqual(calls[1], (MIN_DEPOSIT, "0.01"))
+        self.assertEqual(calls[0], (MIN_WITHDRAWAL, "0.01"))
+        self.assertEqual(calls[1], (MIN_WITHDRAWAL, "0.01"))
         self.assertGreaterEqual(len(calls), 2)
 
     def test_22_invalid_value_writes_nothing(self) -> None:
@@ -710,7 +714,7 @@ class TestSettingsValidation(SettingsTestBase):
         """23. After a rejection the pending operation survives, so
         a retry with a valid value still reaches the preview."""
         ctx = self._ctx()
-        self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
+        self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx)
         bad = self._send_text("not-a-number", context=ctx)
         self.assertNotIn("⚠️ تأكيد", _reply(bad))
         retry = self._send_text("0.02", context=ctx)
@@ -719,23 +723,23 @@ class TestSettingsValidation(SettingsTestBase):
     def test_24_valid_value_reaches_preview_without_write(self) -> None:
         """24. Valid input renders the preview card with old/new
         values — and writes NOTHING before confirmation."""
-        self._seed_setting(MIN_DEPOSIT, 1000)  # 0.00001 USDT
+        self._seed_setting(MIN_WITHDRAWAL, 1000)  # 0.00001 USDT
         with mock.patch.object(
             platform_settings, "set_setting"
         ) as set_spy:
-            _ctx, _p, preview = self._stage(MIN_DEPOSIT, "0.02")
+            _ctx, _p, preview = self._stage(MIN_WITHDRAWAL, "0.02")
         set_spy.assert_not_called()
         reply = _reply(preview)
         self.assertIn("⚠️ تأكيد تحديث الإعداد", reply)
         self.assertIn("القيمة الحالية:", reply)
         self.assertIn("القيمة الجديدة: 0.02000000 USDT", reply)
         self.assertEqual(
-            1000, self._raw_value(MIN_DEPOSIT, self.db_path)
+            1000, self._raw_value(MIN_WITHDRAWAL, self.db_path)
         )
         markup = preview.message.reply_text.call_args[1]["reply_markup"]
         payloads = self._payloads(markup)
-        self.assertIn(f"ctl:settings:confirm:{MIN_DEPOSIT}", payloads)
-        self.assertIn(f"ctl:settings:cancel:{MIN_DEPOSIT}", payloads)
+        self.assertIn(f"ctl:settings:confirm:{MIN_WITHDRAWAL}", payloads)
+        self.assertIn(f"ctl:settings:cancel:{MIN_WITHDRAWAL}", payloads)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -752,15 +756,15 @@ class TestSettingsMutation(SettingsTestBase):
         with mock.patch.object(
             platform_settings, "set_setting", wraps=original
         ) as set_spy:
-            _ctx, update = self._confirm_flow(MIN_DEPOSIT, "0.03")
+            _ctx, update = self._confirm_flow(MIN_WITHDRAWAL, "0.03")
         set_spy.assert_called_once_with(
-            MIN_DEPOSIT, "0.03", admin_user_id=ADMIN_ID
+            MIN_WITHDRAWAL, "0.03", admin_user_id=ADMIN_ID
         )
         self.assertEqual(
             TOAST_SETTING_UPDATED, _answered(update.callback_query)
         )
         self.assertEqual(
-            3_000_000, self._raw_value(MIN_DEPOSIT, self.db_path)
+            3_000_000, self._raw_value(MIN_WITHDRAWAL, self.db_path)
         )
 
     def test_26_fresh_reread_before_write(self) -> None:
@@ -779,7 +783,7 @@ class TestSettingsMutation(SettingsTestBase):
             return original_set(*args, **kwargs)
 
         ctx = self._ctx()
-        self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
+        self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx)
         self._send_text("0.04", context=ctx)
         calls.clear()
         with mock.patch.object(
@@ -788,7 +792,7 @@ class TestSettingsMutation(SettingsTestBase):
             platform_settings, "set_setting", side_effect=setter
         ):
             self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
         self.assertIn("get", calls)
         self.assertIn("set", calls)
@@ -800,14 +804,14 @@ class TestSettingsMutation(SettingsTestBase):
     def test_27_authorization_before_write(self) -> None:
         """27. A stranger's confirm performs zero reads and zero
         writes even with a perfectly staged context."""
-        ctx, _p, _v = self._stage(MIN_DEPOSIT, "0.05")
+        ctx, _p, _v = self._stage(MIN_WITHDRAWAL, "0.05")
         with mock.patch.object(
             platform_settings, "get_setting"
         ) as get_spy, mock.patch.object(
             platform_settings, "set_setting"
         ) as set_spy:
             update = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}",
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}",
                 actor_id=STRANGER,
                 context=ctx,
             )
@@ -831,7 +835,7 @@ class TestSettingsMutation(SettingsTestBase):
         byte-identical."""
         spies = self._spies_for("wallet")
         before = self._dump_state()
-        _ctx, update = self._confirm_flow(MIN_DEPOSIT, "0.06")
+        _ctx, update = self._confirm_flow(MIN_WITHDRAWAL, "0.06")
         for label, spy in spies.items():
             self.assertFalse(spy.called, f"{label} must never run")
         after = self._dump_state()
@@ -845,7 +849,7 @@ class TestSettingsMutation(SettingsTestBase):
         self.assertNotIn("LedgerService", section)
         self.assertIsNone(re.search(r"\bledger\.\w+\s*\(", section))
         before = self._dump_state()["ledger"]
-        self._confirm_flow(MIN_DEPOSIT, "0.07")
+        self._confirm_flow(MIN_WITHDRAWAL, "0.07")
         self.assertEqual(before, self._dump_state()["ledger"])
 
     def test_31_withdrawal_not_mutated(self) -> None:
@@ -868,7 +872,7 @@ class TestSettingsMutation(SettingsTestBase):
             re.search(r"\bdeposit_proof_store\.\w+\s*\(", section)
         )
         before = self._dump_state()
-        self._confirm_flow(MIN_DEPOSIT, "0.09")
+        self._confirm_flow(MIN_WITHDRAWAL, "0.09")
         after = self._dump_state()
         self.assertEqual(before["deposit_requests"], after["deposit_requests"])
         self.assertEqual(before["deposit_proofs"], after["deposit_proofs"])
@@ -881,7 +885,7 @@ class TestSettingsMutation(SettingsTestBase):
             re.search(r"\bpayment_method_store\.\w+\s*\(", section)
         )
         before = self._dump_state()["payment_methods"]
-        self._confirm_flow(MIN_DEPOSIT, "0.1")
+        self._confirm_flow(MIN_WITHDRAWAL, "0.1")
         self.assertEqual(before, self._dump_state()["payment_methods"])
 
     def test_33b_only_platform_settings_changed(self) -> None:
@@ -920,16 +924,16 @@ class TestSettingsIdempotency(SettingsTestBase):
         times."""
         original = platform_settings.set_setting
         ctx = self._ctx()
-        self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
+        self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx)
         self._send_text("0.11", context=ctx)
         with mock.patch.object(
             platform_settings, "set_setting", wraps=original
         ) as set_spy:
             first = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
             second = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
         set_spy.assert_called_once()
         self.assertEqual(
@@ -946,18 +950,18 @@ class TestSettingsIdempotency(SettingsTestBase):
         ) as set_spy:
             # (a) never staged in THIS context
             update = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=self._ctx()
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=self._ctx()
             )
             self.assertIn(MSG_NO_PENDING, _edited(update.callback_query))
             # (b) staged, then cancelled, then a stale confirm lands
             ctx = self._ctx()
-            self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
+            self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx)
             self._send_text("0.12", context=ctx)
             self._press(
-                f"ctl:settings:cancel:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:cancel:{MIN_WITHDRAWAL}", context=ctx
             )
             stale = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
             self.assertIn(MSG_NO_PENDING, _edited(stale.callback_query))
         set_spy.assert_not_called()
@@ -965,16 +969,16 @@ class TestSettingsIdempotency(SettingsTestBase):
     def test_36_cancel_causes_no_write(self) -> None:
         """36. Cancel drops the staged value, re-renders the panel
         and writes NOTHING — and the confirm button becomes inert."""
-        ctx, _p, _v = self._stage(MIN_DEPOSIT, "0.13")
-        before = self._raw_value(MIN_DEPOSIT, self.db_path)
+        ctx, _p, _v = self._stage(MIN_WITHDRAWAL, "0.13")
+        before = self._raw_value(MIN_WITHDRAWAL, self.db_path)
         with mock.patch.object(
             platform_settings, "set_setting"
         ) as set_spy:
             update, text, markup = self._view(
-                f"ctl:settings:cancel:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:cancel:{MIN_WITHDRAWAL}", context=ctx
             )
             confirm = self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
         set_spy.assert_not_called()
         self.assertEqual(
@@ -983,7 +987,7 @@ class TestSettingsIdempotency(SettingsTestBase):
         self.assertIn(SETTINGS_PANEL_HEADER, text)
         self.assertIn(MSG_NO_PENDING, _edited(confirm.callback_query))
         self.assertEqual(
-            before, self._raw_value(MIN_DEPOSIT, self.db_path)
+            before, self._raw_value(MIN_WITHDRAWAL, self.db_path)
         )
 
 
@@ -997,14 +1001,14 @@ class TestSettingsNavigation(SettingsTestBase):
     def test_37_back_returns_control_center(self) -> None:
         """37. ``ctl:settings:back`` returns the dashboard — and
         drops any staged edit on the way."""
-        ctx, _p, _v = self._stage(MIN_DEPOSIT, "0.14")
+        ctx, _p, _v = self._stage(MIN_WITHDRAWAL, "0.14")
         update, text, _m = self._view(
             "ctl:settings:back", context=ctx
         )
         self.assertIn(HEADER, text)
         self.assertNotIn(SETTINGS_PANEL_HEADER, text)
         confirm = self._press(
-            f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+            f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
         )
         self.assertIn(MSG_NO_PENDING, _edited(confirm.callback_query))
 
@@ -1012,8 +1016,8 @@ class TestSettingsNavigation(SettingsTestBase):
         """38. A successful update toasts the fixed success copy and
         re-renders the panel from a FRESH read showing the new
         value."""
-        self._seed_setting(MIN_DEPOSIT, 1000)
-        _ctx, update = self._confirm_flow(MIN_DEPOSIT, "0.15")
+        self._seed_setting(MIN_WITHDRAWAL, 1000)
+        _ctx, update = self._confirm_flow(MIN_WITHDRAWAL, "0.15")
         self.assertEqual(
             TOAST_SETTING_UPDATED, _answered(update.callback_query)
         )
@@ -1021,7 +1025,7 @@ class TestSettingsNavigation(SettingsTestBase):
         self.assertIn(SETTINGS_PANEL_HEADER, text)
         self.assertIn("0.15000000 USDT", text)
         self.assertEqual(
-            15_000_000, self._raw_value(MIN_DEPOSIT, self.db_path)
+            15_000_000, self._raw_value(MIN_WITHDRAWAL, self.db_path)
         )
 
 
@@ -1041,9 +1045,9 @@ class TestSettingsSecurity(SettingsTestBase):
         """40. Logs carry only admin id + key + action + result —
         never the staged raw input, never a secret."""
         with self.assertLogs(level="INFO") as captured:
-            ctx, _p, _v = self._stage(MIN_DEPOSIT, SECRET_RAW)
+            ctx, _p, _v = self._stage(MIN_WITHDRAWAL, SECRET_RAW)
             self._press(
-                f"ctl:settings:confirm:{MIN_DEPOSIT}", context=ctx
+                f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=ctx
             )
         joined = "\n".join(captured.output)
         # The staged raw text never reaches ANY log line.
@@ -1075,7 +1079,7 @@ class TestSettingsSecurity(SettingsTestBase):
         payloads += self._payloads(markup)
         ctx = self._ctx()
         _u, prompt, markup = self._view(
-            f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx
+            f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx
         )
         payloads += self._payloads(markup)
         preview = self._send_text("0.0123", context=ctx)
@@ -1108,14 +1112,14 @@ class TestSettingsSecurity(SettingsTestBase):
         )
         # Behavioral proof: edit stages in ctx A…
         ctx_a = self._ctx()
-        self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx_a)
+        self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx_a)
         # …a DIFFERENT context B receives the text (silent — no
         # staged value there)…
         silent = self._send_text("0.16", context=self._ctx())
         self.assertFalse(silent.message.reply_text.called)
         # …and a fresh context C cannot confirm anything.
         confirm = self._press(
-            f"ctl:settings:confirm:{MIN_DEPOSIT}", context=self._ctx()
+            f"ctl:settings:confirm:{MIN_WITHDRAWAL}", context=self._ctx()
         )
         self.assertIn(MSG_NO_PENDING, _edited(confirm.callback_query))
         # ctx A still owns its staged edit: the admin's own text
@@ -1140,7 +1144,7 @@ class TestSettingsRegistration(SettingsTestBase):
         self._press("ctl:settings", context=ctx)
         self.assertEqual(app.added, [])
         # a second press never registers anything either
-        self._press(f"ctl:settings:edit:{MIN_DEPOSIT}", context=ctx)
+        self._press(f"ctl:settings:edit:{MIN_WITHDRAWAL}", context=ctx)
         self.assertEqual(app.added, [])
 
         captured, _bot = _capture_handlers()
@@ -1274,8 +1278,8 @@ class TestSettingsRegression(SettingsTestBase):
         self.assertIn(SETTINGS_PANEL_HEADER, text)
         self.assertNotIn("Traceback", text)
         self.assertNotIn("db exploded", text)
-        # all four rows degraded safely
-        self.assertEqual(text.count("غير متاح"), 4)
+        # every registered row degraded safely (3 keys)
+        self.assertEqual(text.count("غير متاح"), 3)
 
 
 if __name__ == "__main__":

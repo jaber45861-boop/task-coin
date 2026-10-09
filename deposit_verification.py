@@ -58,7 +58,8 @@ ERRORS: deterministic domain errors, each exposing a stable ``code``
 (``deposit_not_found``, ``deposit_not_pending``,
 ``deposit_amount_mismatch``, ``invalid_external_tx_id``,
 ``external_tx_id_already_used``, ``deposit_already_credited``,
-``deposit_conflict``, ``invalid_verification_facts``).  Nothing here is
+``deposit_conflict``, ``deposit_asset_not_creditable``,
+``invalid_verification_facts``).  Nothing here is
 an HTTP response: no tracebacks or database internals are formatted
 for users, and no destination or secret is ever logged (audit lines
 carry request id / user id / units / result only).
@@ -76,6 +77,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import asset_units
 import db
 import deposit_store
 import ledger
@@ -158,6 +160,20 @@ class DepositAlreadyCreditedError(DepositConflictError):
     """
 
     code = "deposit_already_credited"
+
+
+class DepositAssetNotCreditableError(DepositVerificationError):
+    """The request's asset cannot be credited to the internal wallet.
+
+    The internal wallet/ledger is single-currency by schema
+    (``CHECK (currency = 'USDT')``): crediting another asset's
+    atomic units would be a silent currency mix.  The credit
+    boundary rejects fail-closed BEFORE any wallet or ledger write —
+    no credit, no ledger entry, no partial credit and NO implicit
+    conversion (none is ever invented here).
+    """
+
+    code = "deposit_asset_not_creditable"
 
 
 class InvalidVerificationFactsError(DepositVerificationError):
@@ -362,6 +378,9 @@ def verify_and_credit(
         DepositNotFoundError: unknown/malformed request id.
         DepositNotPendingError: request is no longer pending.
         DepositAmountMismatchError: verified != persisted amount.
+        DepositAssetNotCreditableError: the request's asset is not
+            the wallet credit currency — rejected BEFORE any
+            wallet/ledger write (no credit, no conversion).
         InvalidExternalTxIdError / InvalidVerificationFactsError:
             unusable supplied facts (validated before any DB work).
         ExternalTxIdAlreadyUsedError: another request owns the tx id.
@@ -426,6 +445,17 @@ def verify_and_credit(
 
         # ── Snapshot compatibility (rule 7) ─────────────────────
         _require_method_compatible(conn, request)
+
+        # ── Creditability: the internal wallet is USDT-only ─────
+        # Fail-closed BEFORE any wallet/ledger write: a request whose
+        # asset is not the wallet credit currency is never credited,
+        # never converted and never partially applied — the whole
+        # transaction rolls back with exactly zero mutations.
+        if not asset_units.is_wallet_credit_asset(request.pm_asset):
+            raise DepositAssetNotCreditableError(
+                f"deposit asset {request.pm_asset!r} cannot be "
+                "credited to the internal wallet"
+            )
 
         # ── One external tx may credit at most ONE request ──────
         owner = deposit_store.find_request_by_external_tx_id(

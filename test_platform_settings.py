@@ -10,7 +10,7 @@ Coverage (task list):
 
   Fresh schema      table + columns, INTEGER-only value, ``typeof()``
                     CHECK rejects REAL/float, primary key on key,
-                    the four registered keys
+                    the three registered keys
   Migration         pre-MT-ADMIN-15 database gains the table +
                     defaults; existing financial rows untouched;
                     re-running init_db is idempotent and NEVER
@@ -62,7 +62,6 @@ STRANGER = 999999
 
 UNIT_KEYS = (
     ps.MINIMUM_WITHDRAWAL_UNITS,
-    ps.MINIMUM_DEPOSIT_UNITS,
     ps.WITHDRAWAL_FEE_UNITS,
 )
 ALL_KEYS = UNIT_KEYS + (ps.ADVERTISER_COMMISSION,)
@@ -171,10 +170,18 @@ class TestFreshSchema(SettingsTestBase):
         finally:
             conn.close()
 
-    def test_registered_keys_are_exactly_the_required_four(self):
-        """4. Exactly the four required settings are registered."""
+    def test_registered_keys_are_exactly_the_required_three(self):
+        """4. Exactly the required settings are registered.
+
+        Three keys — ``minimum_deposit_units`` was deliberately
+        REMOVED from the global registry: the deposit minimum is per
+        payment method (``payment_methods.min_deposit_units``, that
+        method's own asset units), so one global USDT-denominated
+        key could never serve two currencies.  The behavior was
+        replaced, not weakened.
+        """
         self.assertEqual(set(ps.REGISTERED_SETTINGS), set(ALL_KEYS))
-        self.assertEqual(len(ps.REGISTERED_SETTINGS), 4)
+        self.assertEqual(len(ps.REGISTERED_SETTINGS), 3)
 
     def test_fresh_database_seeds_only_defined_defaults(self):
         """5. Commission 30% seeded; no invented monetary defaults."""
@@ -302,8 +309,8 @@ class TestPersistence(SettingsTestBase):
 
     def test_value_survives_a_fresh_connection(self):
         """13. Written value is visible to a brand-new connection."""
-        self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, 250_000)
-        self.assertEqual(self.raw_value(ps.MINIMUM_DEPOSIT_UNITS), 250_000)
+        self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, 250_000)
+        self.assertEqual(self.raw_value(ps.WITHDRAWAL_FEE_UNITS), 250_000)
 
     def test_value_survives_a_reopened_database(self):
         """14. Restart simulation: DB_PATH reopened from scratch."""
@@ -344,7 +351,6 @@ class TestGetSet(SettingsTestBase):
         """16. Each registered key stores and returns its exact value."""
         values = {
             ps.MINIMUM_WITHDRAWAL_UNITS: 1_000_000_000,
-            ps.MINIMUM_DEPOSIT_UNITS: 100_000_000,
             ps.WITHDRAWAL_FEE_UNITS: 10_000_000,
             ps.ADVERTISER_COMMISSION: 2500,
         }
@@ -357,11 +363,11 @@ class TestGetSet(SettingsTestBase):
     def test_int_and_exact_text_agree(self):
         """17. Canonical int input == exact decimal text input."""
         self.assertEqual(
-            self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, 500_000),
-            self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, "0.005"),
+            self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, 500_000),
+            self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, "0.005"),
         )
         self.assertEqual(
-            ps.get_setting(ps.MINIMUM_DEPOSIT_UNITS, db_path=self.db_path),
+            ps.get_setting(ps.WITHDRAWAL_FEE_UNITS, db_path=self.db_path),
             500_000,
         )
 
@@ -379,13 +385,13 @@ class TestGetSet(SettingsTestBase):
 
     def test_list_settings_returns_only_configured_values(self):
         """19. list_settings exposes configured rows, nothing else."""
-        self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, 7)
+        self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, 7)
         listed = ps.list_settings(db_path=self.db_path)
         self.assertEqual(
             listed,
             {
                 ps.ADVERTISER_COMMISSION: ps.COMMISSION_DEFAULT,
-                ps.MINIMUM_DEPOSIT_UNITS: 7,
+                ps.WITHDRAWAL_FEE_UNITS: 7,
             },
         )
 
@@ -470,19 +476,19 @@ class TestInvalidValues(SettingsTestBase):
 
     def test_float_rejected(self):
         """27. float input is never accepted (no silent conversion)."""
-        self.assertRejected(ps.MINIMUM_DEPOSIT_UNITS, 0.005)
+        self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, 0.005)
         self.assertRejected(ps.ADVERTISER_COMMISSION, 30.0)
 
     def test_bool_and_none_rejected(self):
         """28. bool/None are not values."""
         for bad in (True, False, None):
-            self.assertRejected(ps.MINIMUM_DEPOSIT_UNITS, bad)
+            self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, bad)
             self.assertRejected(ps.ADVERTISER_COMMISSION, bad)
 
     def test_unsupported_types_rejected(self):
         """29. Lists/dicts/objects are rejected deterministically."""
         for bad in ([1], {"a": 1}, object()):
-            self.assertRejected(ps.MINIMUM_DEPOSIT_UNITS, bad)
+            self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, bad)
 
     def test_negative_values_rejected(self):
         """30. Negative ints and negative text are rejected."""
@@ -494,12 +500,12 @@ class TestInvalidValues(SettingsTestBase):
     def test_empty_and_malformed_text_rejected(self):
         """31. Empty / non-numeric / scientific text is rejected."""
         for bad in ("", "   ", "abc", "1e-8", "1,5", "1.2.3", ".5", "30.", "٣٠x"):
-            self.assertRejected(ps.MINIMUM_DEPOSIT_UNITS, bad)
+            self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, bad)
             self.assertRejected(ps.ADVERTISER_COMMISSION, bad)
 
     def test_more_than_eight_decimals_rejected(self):
         """32. USDT amounts beyond 8 dp are rejected, never rounded."""
-        self.assertRejected(ps.MINIMUM_DEPOSIT_UNITS, "0.000000001")
+        self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, "0.000000001")
         self.assertRejected(ps.WITHDRAWAL_FEE_UNITS, "1.123456789")
 
     def test_percent_beyond_two_decimals_rejected(self):
@@ -523,7 +529,7 @@ class TestInvalidValues(SettingsTestBase):
     def test_int_overflow_rejected(self):
         """35. Values beyond signed SQLite INTEGER are rejected."""
         self.assertRejected(
-            ps.MINIMUM_DEPOSIT_UNITS, 9_223_372_036_854_775_808
+            ps.WITHDRAWAL_FEE_UNITS, 9_223_372_036_854_775_808
         )
 
     def test_authorization_runs_before_validation(self):
@@ -545,10 +551,10 @@ class TestPrecision(SettingsTestBase):
     def test_sub_cent_value_is_exact(self):
         """37. 0.005 USDT == 500,000 atomic units (below 1 cent)."""
         self.assertEqual(
-            self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, "0.005"), 500_000
+            self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, "0.005"), 500_000
         )
         self.assertEqual(
-            ps.get_setting(ps.MINIMUM_DEPOSIT_UNITS, db_path=self.db_path),
+            ps.get_setting(ps.WITHDRAWAL_FEE_UNITS, db_path=self.db_path),
             500_000,
         )
 
@@ -578,20 +584,20 @@ class TestPrecision(SettingsTestBase):
         expected = 123_456_789_012
         self.assertEqual(
             self.set_as_admin(
-                ps.MINIMUM_DEPOSIT_UNITS, "1234.56789012"
+                ps.WITHDRAWAL_FEE_UNITS, "1234.56789012"
             ),
             expected,
         )
-        self.assertEqual(self.raw_value(ps.MINIMUM_DEPOSIT_UNITS), expected)
+        self.assertEqual(self.raw_value(ps.WITHDRAWAL_FEE_UNITS), expected)
         self.assertEqual(
-            ps.get_setting(ps.MINIMUM_DEPOSIT_UNITS, db_path=self.db_path),
+            ps.get_setting(ps.WITHDRAWAL_FEE_UNITS, db_path=self.db_path),
             expected,
         )
 
     def test_arabic_indic_digits_normalized(self):
         """41. Arabic-Indic input parses to the same exact units."""
         self.assertEqual(
-            self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, "٠.٠٠٥"), 500_000
+            self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, "٠.٠٠٥"), 500_000
         )
 
 
@@ -712,30 +718,30 @@ class TestTransactions(SettingsTestBase):
         """52. conn= joins the caller's transaction and commits."""
         with db.transaction(self.db_path) as conn:
             ps.set_setting(
-                ps.MINIMUM_DEPOSIT_UNITS,
+                ps.WITHDRAWAL_FEE_UNITS,
                 10,
                 admin_user_id=ADMIN_A,
                 conn=conn,
             )
             # Same connection sees the uncommitted write.
             self.assertEqual(
-                ps.get_setting(ps.MINIMUM_DEPOSIT_UNITS, conn=conn), 10
+                ps.get_setting(ps.WITHDRAWAL_FEE_UNITS, conn=conn), 10
             )
-        self.assertEqual(self.raw_value(ps.MINIMUM_DEPOSIT_UNITS), 10)
+        self.assertEqual(self.raw_value(ps.WITHDRAWAL_FEE_UNITS), 10)
 
     def test_rollback_reverts_the_write(self):
         """53. An exception rolls the setting back with the transaction."""
-        self.set_as_admin(ps.MINIMUM_DEPOSIT_UNITS, 5)
+        self.set_as_admin(ps.WITHDRAWAL_FEE_UNITS, 5)
         with self.assertRaises(RuntimeError):
             with db.transaction(self.db_path) as conn:
                 ps.set_setting(
-                    ps.MINIMUM_DEPOSIT_UNITS,
+                    ps.WITHDRAWAL_FEE_UNITS,
                     99,
                     admin_user_id=ADMIN_A,
                     conn=conn,
                 )
                 raise RuntimeError("boom")
-        self.assertEqual(self.raw_value(ps.MINIMUM_DEPOSIT_UNITS), 5)
+        self.assertEqual(self.raw_value(ps.WITHDRAWAL_FEE_UNITS), 5)
 
     def test_multiple_settings_in_one_transaction(self):
         """54. Several settings can be updated atomically."""
