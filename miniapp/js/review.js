@@ -177,6 +177,55 @@ const Review = (() => {
         return page;
     }
 
+    /* ── Authority probe for the Account entry ─────────────────── */
+
+    /**
+     * Ask the server whether this caller is a reviewer.
+     *
+     * The Account page ships the reviewer entry hidden: it is a
+     * reviewer-only surface and must not be offered to anyone the
+     * server has not identified as such.  This probe applies the SAME
+     * authority rule the review page renders from — the catalog is read
+     * with the verified initData header, and only an `ok` answer from
+     * GET /api/tasks/<id>/claims for a manual-family task proves the
+     * server accepted this caller as that task's reviewer.
+     *
+     * It supplies no identity of its own (the header carries it), keeps
+     * no verdict between calls, and fails CLOSED: any error answers
+     * false so the entry simply stays hidden.  A hidden entry therefore
+     * never contradicts what the review page would decide.
+     */
+    async function probeAccess() {
+        let data = null;
+        try {
+            const response = await fetch(LIST_URL, { headers: _headers() });
+            data = await _parse(response);
+            if (!(response.ok && data && data.ok === true)) {
+                return false;
+            }
+        } catch (error) {
+            return false;
+        }
+
+        const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+        for (const task of tasks.filter((entry) => entry && entry.type === 'manual')) {
+            try {
+                const response = await fetch(`/api/tasks/${task.id}/claims`, {
+                    headers: _headers()
+                });
+                const claimsData = await _parse(response);
+                if (response.ok && claimsData && claimsData.ok === true) {
+                    return true;
+                }
+            } catch (error) {
+                // One failed probe is not a verdict either way: keep
+                // asking the server about the remaining manual tasks.
+            }
+        }
+
+        return false;
+    }
+
     /* ── Loading / states ───────────────────────────────────────── */
 
     async function load() {
@@ -420,6 +469,7 @@ const Review = (() => {
     return {
         render,
         load,
+        probeAccess,
         decide
     };
 })();

@@ -629,6 +629,71 @@ body[data-page="profile"] .app-content {
     color: var(--home-text-secondary);
 }
 
+/* ── Account page identity (profile.js) ──────────────────
+   Same Dark Premium tokens as Home: the identity card
+   reuses the welcome-card family, the detail rows are
+   inner tiles on the shared Border #243447. */
+.profile-section {
+    margin-bottom: 12px;
+}
+
+.page-profile .welcome-card {
+    background-color: var(--home-card-bg);
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+
+/* Avatar ring — primary accent (same as Home) */
+.page-profile .welcome-avatar {
+    background-color: var(--home-card-inner-bg);
+    border: 2px solid var(--accent-color);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.30);
+}
+
+/* Account text colors */
+.page-profile .welcome-name {
+    color: var(--home-text);
+}
+
+.page-profile .welcome-username {
+    color: var(--home-text-secondary);
+}
+
+/* Detail rows — inner tiles on the shared border */
+.profile-field {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    background-color: var(--home-card-inner-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+}
+
+.profile-field-label {
+    font-size: 13px;
+    color: var(--home-text-secondary);
+}
+
+.profile-field-value {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--home-text);
+}
+
+/* Stacked rows inside one section */
+.profile-field + .profile-field {
+    margin-top: 8px;
+}
+
+/* Money figures — exact atomic formatting, always LTR */
+.profile-money {
+    direction: ltr;
+    unicode-bidi: isolate;
+    white-space: nowrap;
+}
+
 /* ══════════════════════════════════════════════════════════════
    MT-UI-03 — Wallet UI (State B) + Home wallet button (State A)
    Dark Premium system shared with Home (primary ring + palette).
@@ -1415,6 +1480,13 @@ body[data-page="profile"] .app-content {
 .review-entry:focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 2px;
+}
+
+/* The entry sets `display: flex`, which outranks the user-agent
+   `[hidden] { display: none }` rule — without this the `hidden`
+   attribute the Account page ships it with would not hide it. */
+.review-entry[hidden] {
+    display: none;
 }
 
 .review-list {

@@ -42,6 +42,19 @@ Manual/social-proof extension (MT-TASK-15, minimal):
   authorized ONLY by task_data.approver.telegram_user_id (no admin
   fallback, no arbitrary authenticated user)
 
+Account summary (Mini App «حسابي», minimal):
+
+- ``GET  /api/me``                       the caller's own read-only
+                                         summary: the available balance
+                                         (``wallets.available_units``),
+                                         the completed / in-progress task
+                                         counts (``user_tasks``) and the
+                                         lifetime task earnings (the
+                                         ledger's ``credit``/``task``
+                                         entries).  No XP/level exists
+                                         anywhere in the backend, so
+                                         none is returned.
+
 Idempotency (MT-TASK-04): the submit endpoint accepts the standard
 ``Idempotency-Key`` header.  The key is validated here and enforced by
 the database — a repeated key returns the original submission result
@@ -72,6 +85,11 @@ Security rules enforced here:
   comparison of the requested reward against ``wallets.available_units``
   that rejects (HTTP 400) before any request/pending/notification state
   is created
+- the account summary is read-only as well: ``GET /api/me``
+  composes its figures through the read-only
+  ``account_summary`` service (``wallet_units``,
+  ``db.list_user_tasks`` and the ledger's public
+  ``list_user_entries`` read API) and writes nothing
 """
 
 import json
@@ -109,6 +127,7 @@ from manual_task import (
 import task_request_notifications
 import task_request_rate_limit
 import task_request_store
+from account_summary import load_summary
 from task_catalog import TaskCatalog
 from task_creation import parse_reward_units
 from task_lifecycle import TaskLifecycle
@@ -541,6 +560,67 @@ def list_tasks():
         return _server_error()
 
     return jsonify({"ok": True, "tasks": tasks}), 200
+
+
+# ── GET /api/me — the caller's own account summary ────────
+
+
+@tasks_bp.get("/api/me")
+def account_summary():
+    """Read-only account summary for the verified caller.
+
+    Every figure comes from an existing source of truth:
+
+    - ``wallet.availableUnits`` — ``wallets.available_units``
+      (a user without a wallet row reads as a real zero, the
+      wallet service's documented contract — never "unknown")
+    - ``stats.completedTasks`` / ``stats.inProgressTasks`` —
+      the caller's own ``user_tasks`` rows
+    - ``stats.earnedUnits`` — the ledger's ``credit``/``task``
+      entries, the system's only earnings source (deposits,
+      withdrawals, referrals and admin credits are excluded)
+
+    No XP/level exists anywhere in the backend, so none is
+    returned.  Identity comes only from verified initData — a
+    client-supplied ``user_id`` is never consulted — and the
+    handler mutates nothing: every figure is composed by the
+    read-only ``account_summary`` service.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        summary = load_summary(user_id)
+    except Exception:
+        logger.exception(
+            "Account summary failed: user=%s", user_id
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "user": {
+                "id": user_id,
+                "username": user.get("username"),
+                "firstName": user.get("first_name"),
+            },
+            "wallet": {
+                "availableUnits":
+                    summary["wallet"]["available_units"],
+            },
+            "stats": {
+                "completedTasks":
+                    summary["stats"]["completed_tasks"],
+                "inProgressTasks":
+                    summary["stats"]["in_progress_tasks"],
+                "earnedUnits":
+                    summary["stats"]["earned_units"],
+            },
+        }
+    ), 200
 
 
 # ── POST /api/tasks/<task_id>/start — TaskLifecycle → TaskStartGate ───

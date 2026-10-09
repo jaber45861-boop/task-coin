@@ -6,6 +6,9 @@ Reviewer-facing Mini App UI for the existing manual/social proof
 family, against the unchanged reviewer API contract:
 
 - entry + routing wired through the existing Navigation module
+- the Account entry ships HIDDEN and is revealed only after the server
+  itself identifies the caller as a reviewer (same ok /claims verdict
+  the review page renders from) — never offered to a non-reviewer
 - authority decided ONLY by the server: reviewer controls render
   only from an ok GET /api/tasks/<id>/claims response; anyone else
   gets the denied state with zero data
@@ -206,10 +209,19 @@ class TestClaimsFetchContract:
         assert "`/api/tasks/${task.id}/claims`" in content
 
     def test_no_new_or_invented_endpoints(self):
-        """Exactly the three existing endpoints, nothing else."""
+        """Only the three existing endpoints, nothing else.
+
+        The Account-entry probe re-reads two of them (catalog +
+        claims) instead of inventing an access endpoint, so this
+        guards WHERE every fetch goes rather than how many there are.
+        """
         content = _review_js()
-        assert len(re.findall(r"fetch\(", content)) == 3, \
-            "expected exactly: catalog, claims, decision"
+        allowed = ("LIST_URL",
+                   "/api/tasks/${task.id}/claims",
+                   "/api/tasks/${taskId}/claims/${claimId}/decision")
+        for call in re.findall(r"fetch\((.{0,80})", content, re.DOTALL):
+            assert any(target in call for target in allowed), \
+                f"fetch call to an unexpected target: {call!r}"
         urls = re.findall(r"['\"`]/api/[^'\"`]+['\"`]", content)
         assert set(urls) == {
             "'/api/tasks'",
@@ -539,3 +551,309 @@ class TestReviewStyling:
     def test_page_header_is_arabic(self):
         content = _review_js()
         assert "<h2>مراجعة الإثباتات</h2>" in content
+
+
+# ════════════════════════════════════════════════════════════════════
+# 11. Account entry visibility — the server decides who sees it
+# ════════════════════════════════════════════════════════════════════
+
+
+def _profile_template() -> str:
+    html = _html()
+    start = html.find('<template id="page-profile">')
+    end = html.find("</template>", start)
+    assert start >= 0 and end > start, "page-profile template not found"
+    return html[start:end]
+
+
+def _profile_js() -> str:
+    return _read("miniapp/js/profile.js")
+
+
+def _probe_fn() -> str:
+    return _branch(_review_js(), "async function probeAccess",
+                   "/* ── Loading / states")
+
+
+class TestAccountEntryVisibility:
+    """The reviewer entry is a reviewer-only surface.
+
+    It used to ship visible in the static Account template, so EVERY
+    user — reviewer or not — was offered «مراجعة الإثباتات» on their
+    profile page and only discovered the denial after tapping it.  The
+    entry now ships hidden and is revealed exclusively from the
+    server's own authority verdict.
+    """
+
+    def test_entry_ships_hidden_on_the_account_page(self):
+        tpl = _profile_template()
+        assert re.search(
+            r'<button[^>]*data-testid="review-entry"[^>]*\bhidden\b', tpl
+        ), ("the reviewer entry must ship hidden — no user may be "
+            "offered the reviewer surface before the server answers")
+        assert 'data-goto="review"' in tpl, \
+            "the hidden entry still routes to the review page"
+
+    def test_hidden_entry_gets_its_own_display_none_rule(self):
+        """`.review-entry` sets `display: flex`, which outranks the
+        user-agent `[hidden] { display: none }` rule — without a
+        matching rule the `hidden` attribute would not hide it."""
+        css = _css()
+        assert "display: flex" in _branch(css, ".review-entry {", "}"), \
+            "the entry is a flex button, so [hidden] needs its own rule"
+        assert "display: none" in _branch(css, ".review-entry[hidden] {", "}"), \
+            ".review-entry[hidden] must actually hide the entry"
+
+    def test_entry_is_revealed_only_from_the_server_verdict(self):
+        app = _app_js()
+        assert "page === 'profile'" in app, \
+            "the reveal belongs to the Account page only"
+        assert "Review.probeAccess()" in app, \
+            "visibility must follow the server probe, not the client"
+        reveal = _branch(app, "Review.probeAccess().then", "});")
+        assert "allowed === true" in reveal, \
+            "the entry is unlocked only on an explicit true verdict"
+        assert "_unlockReviewEntry(entry)" in reveal
+        assert "entry.hidden = !allowed" not in app, \
+            "visibility must not be derived from a truthy/falsy value"
+
+    def test_entry_is_locked_inline_not_only_by_the_hidden_attribute(self):
+        """The critical case: a client holding the OLD app.css.
+
+        `.review-entry { display: flex }` is an author rule, so it
+        outranks the user-agent `[hidden] { display: none }` rule — the
+        attribute alone leaves the button rendered there.  The lock must
+        therefore be inline `!important` state, which no cached
+        stylesheet can override.
+        """
+        app = _app_js()
+        lock = _branch(app, "function _lockReviewEntry", "function _unlockReviewEntry")
+        assert "entry.hidden = true" in lock
+        assert "entry.style.setProperty('display', 'none', 'important')" in lock, \
+            "the lock must be inline !important state, independent of CSS"
+        unlock = _branch(app, "function _unlockReviewEntry", "\n    }")
+        assert "entry.hidden = false" in unlock
+        assert "entry.style.removeProperty('display')" in unlock
+
+    def test_lock_runs_before_and_independently_of_the_probe(self):
+        """MIX A guard: new app.js + OLD review.js + OLD app.css.
+
+        Telegram was serving exactly that mix, and the old review.js has
+        no `probeAccess` at all.  The lock must therefore run while
+        building the page — NOT inside a probe guard — so a missing or
+        stale Review module still leaves the entry unrenderable.
+        """
+        app = _app_js()
+        gate = _branch(app, "if (page === 'profile') {", "// Add enter animation")
+        lock_at = gate.find("_lockReviewEntry(entry);")
+        probe_at = gate.find("Review.probeAccess()")
+        assert lock_at >= 0, "the entry must be locked on the Account page"
+        assert probe_at > lock_at >= 0, \
+            "the entry is locked before the authority probe is even called"
+        assert "typeof Review.probeAccess === 'function'" in gate, \
+            "a stale/absent Review module must skip the probe, not the lock"
+        # Nothing inside the probe guard may contain the lock itself.
+        assert "_lockReviewEntry" not in gate[probe_at:], \
+            "the lock must not live inside the probe guard"
+
+    def test_no_other_path_can_reveal_the_entry(self):
+        app = _app_js()
+        assert app.count("_unlockReviewEntry") == 2, \
+            "one definition and exactly one call site (the true verdict)"
+        for banned in ("entry.style.display", "removeAttribute('hidden')",
+                       "entry.removeAttribute"):
+            assert banned not in app, \
+                f"visibility must only change through the lock helpers: {banned!r}"
+
+    def test_probe_uses_the_unchanged_reviewer_contract(self):
+        probe = _probe_fn()
+        assert "fetch(LIST_URL, { headers: _headers() })" in probe, \
+            "the catalog read carries the verified initData header"
+        assert "entry.type === 'manual'" in probe, \
+            "only manual-family tasks carry the reviewer surface"
+        assert "/api/tasks/${task.id}/claims" in probe, \
+            "authority is probed through the existing claims endpoint"
+        assert "response.ok && claimsData && claimsData.ok === true" in probe, \
+            "only an ok claims answer may count as reviewer authority"
+
+    def test_probe_fails_closed(self):
+        probe = _probe_fn()
+        assert probe.count("return false") >= 2, \
+            "a failed catalog read or a failed verdict must stay hidden"
+        for banned in ("localStorage", "sessionStorage", "indexedDB",
+                       "reviewer_id", "user_id", "approver"):
+            assert banned not in probe, \
+                f"the probe must not carry authority or identity: {banned!r}"
+
+    def test_probe_is_exported_for_the_router(self):
+        assert "probeAccess," in _branch(_review_js(), "return {", "})();"), \
+            "app.js needs Review.probeAccess to gate the entry"
+
+
+# ══════════════════════════════════════════════════════════════
+# 12. Account page identity — the caller's own Telegram data
+# ══════════════════════════════════════════════════════════════
+
+
+class TestProfileIdentity:
+    """The Account page renders the caller's own Telegram identity.
+
+    The page used to be a static «معلومات الحساب» placeholder.
+    The Profile module renders the same identity Home's
+    welcome card shows — from the SAME TelegramApp.getUser()
+    source, with the same neutral placeholders.  The account
+    figures (balance / earnings / task counts) come from the
+    real GET /api/me summary — see TestProfileAccountData —
+    and no XP/level exists anywhere in the backend, so none
+    is ever shown.
+    """
+
+    def test_profile_js_exists(self):
+        assert os.path.exists("miniapp/js/profile.js"), \
+            "miniapp/js/profile.js not found"
+
+    def test_profile_module_exports_render(self):
+        content = _profile_js()
+        assert "const Profile" in content
+        assert "return {" in content
+        assert "render" in content
+
+    def test_profile_script_loaded_before_app(self):
+        html = _html()
+        telegram_pos = html.find('src="js/telegram.js"')
+        profile_pos = html.find('src="js/profile.js"')
+        app_pos = html.find('src="js/app.js"')
+        assert profile_pos >= 0, "profile.js must be loaded in index.html"
+        assert telegram_pos < profile_pos < app_pos, \
+            "scripts must load in dependency order (telegram < profile < app)"
+
+    def test_app_routes_profile_page_to_the_module(self):
+        content = _app_js()
+        assert "page === 'profile'" in content
+        assert "Profile.render()" in content
+
+    def test_identity_uses_the_home_extraction_convention(self):
+        """Same data source and optional-chaining fallbacks as Home."""
+        content = _profile_js()
+        assert "TelegramApp.getUser()" in content
+        for field in ("first_name", "last_name", "username",
+                      "id", "photo_url"):
+            assert f"user?.{field}" in content, \
+                f"missing identity field: {field}"
+
+    def test_identity_values_never_become_markup(self):
+        content = _profile_js()
+        for assignment in re.findall(r"\.innerHTML\s*=\s*([^;]+);", content):
+            assert "${" not in assignment, \
+                f"innerHTML interpolated with dynamic data: {assignment!r}"
+        assert ".textContent =" in content
+
+    def test_photo_is_used_only_over_https(self):
+        content = _profile_js()
+        assert "startsWith('https://')" in content
+
+    def test_username_row_renders_only_when_present(self):
+        content = _profile_js()
+        assert 'data-testid="profile-username"' in content
+        assert "usernameEl.hidden = false" in content
+        assert "usernameEl.hidden = true" in content
+
+    def test_missing_identity_keeps_neutral_placeholders(self):
+        content = _profile_js()
+        assert "'—'" in content
+
+    def test_no_invented_figures_and_no_level(self):
+        """No XP/level exists anywhere in the backend, so no
+        level surface may appear; the wallet page itself
+        (المحفظة) and EGP equivalents stay out of the
+        Account page — every figure comes from the confirmed
+        GET /api/me response (TestProfileAccountData)."""
+        content = _profile_js()
+        for banned in ("المحفظة", "المستوى", "EGP", "level"):
+            assert banned not in content, \
+                f"invented wallet-page/level surface in profile: {banned}"
+
+    def test_reviewer_entry_stays_fail_closed(self):
+        content = _profile_js()
+        assert 'data-testid="review-entry"' in content
+        assert 'data-goto="review"' in content
+        assert re.search(
+            r'<button[^>]*data-testid="review-entry"[^>]*\bhidden\b', content
+        ), "the reviewer entry must ship hidden in the Profile render"
+        assert "مراجعة الإثباتات" in content
+
+    def test_profile_styles_reuse_the_home_tokens(self):
+        css = _css()
+        for selector in (".profile-section", ".profile-field",
+                         ".profile-field-label", ".profile-field-value"):
+            assert selector in css, f"missing Profile style: {selector}"
+        card = _branch(css, ".page-profile .welcome-card {", "}")
+        assert "var(--home-card-bg)" in card
+        assert "var(--border-color)" in card
+        field = _branch(css, ".profile-field {", "}")
+        assert "var(--home-card-inner-bg)" in field
+        assert "var(--border-color)" in field
+
+
+class TestProfileAccountData:
+    """The Account page shows the caller's REAL account
+    figures from GET /api/me — the read-only account
+    summary — and keeps its neutral placeholders whenever
+    the backend did not confirm a value."""
+
+    def test_account_section_ships_with_placeholders(self):
+        content = _profile_js()
+        assert 'data-testid="profile-account"' in content
+        for testid in ("profile-balance", "profile-earnings",
+                       "profile-completed", "profile-progress"):
+            assert f'data-testid="{testid}"' in content
+            # every figure starts neutral — never a guessed number
+            row = _branch(content, f'data-testid="{testid}"',
+                          "</span>")
+            assert row.rstrip().endswith("—"), \
+                f"{testid} must ship as a neutral placeholder"
+
+    def test_account_labels(self):
+        content = _profile_js()
+        for label in ("الرصيد المتاح", "إجمالي الأرباح",
+                      "المهام المكتملة", "قيد التنفيذ"):
+            assert label in content, f"missing account label: {label}"
+
+    def test_account_data_comes_from_the_api(self):
+        content = _profile_js()
+        assert "'/api/me'" in content
+        assert "X-Telegram-Init-Data" in content
+        assert "TelegramApp.getInitData()" in content
+        assert "fetch(" in content
+
+    def test_figures_replace_placeholders_only_on_confirmed_data(self):
+        content = _profile_js()
+        # the loader gates every write on a confirmed ok response
+        assert "response.ok" in content
+        assert "data.ok === true" in content
+        # exact integer checks — no float maths, no guessing
+        assert "Number.isSafeInteger" in content
+
+    def test_money_uses_the_shared_exact_formatter(self):
+        """USDT figures go through the shared integer-exact
+        WalletData formatter — the same one Home and the
+        Tasks page use — never float maths."""
+        content = _profile_js()
+        assert "WalletData.formatUsdt" in content
+        assert "parseFloat" not in content
+        assert "toFixed" not in content
+
+    def test_no_level_or_xp_surface(self):
+        content = _profile_js()
+        for banned in ("المستوى", "level"):
+            assert banned not in content, \
+                f"invented level/XP surface in profile: {banned}"
+
+    def test_account_styles_keep_the_home_tokens(self):
+        css = _css()
+        money = _branch(css, ".profile-money {", "}")
+        assert "direction: ltr" in money
+        assert "unicode-bidi: isolate" in money
+        stacked = _branch(css, ".profile-field + .profile-field {",
+                          "}")
+        assert "margin-top" in stacked

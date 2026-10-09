@@ -705,7 +705,17 @@ class TestScopePolicy(WalletTestBase):
         The Home stats cards («المتاح» / «المكافآت») add theirs the
         same way: ``miniapp/js/task-stats.js`` (new, read-only display
         data for the two cards — no wallet behaviour), plus its script
-        tag in ``miniapp/index.html``.
+        tag in ``miniapp/index.html``.          The Account reviewer entry
+        (reviewer surface, MT-TASK-18) adds its visibility gate there
+        too: ``miniapp/js/review.js`` (the server-authority probe) and
+        ``miniapp/js/app.js`` (reveal the entry on the Account page
+        only when that probe says ok) — again no wallet behaviour.
+        The Account page identity («حسابي») adds its renderer the
+        same way: ``miniapp/js/profile.js`` (new, presentational
+        only — the caller's own Telegram identity from
+        TelegramApp.getUser(), no wallet behaviour), plus its script
+        tag in ``miniapp/index.html`` and the ``.profile-*`` styles
+        in ``miniapp/css/app.css``.
         Every other Mini App file — wallet.js, wallet-data.js, the
         rest — must stay byte-identical.
         """
@@ -725,6 +735,9 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/js/task-request.js",   # «إضافة مهمة ➕» submission UI
             "miniapp/js/guide.js",      # «الدليل الرسمي 📖» guide overlay (new)
             "miniapp/js/task-stats.js",  # Home «المتاح»/«المكافآت» data (new)
+            "miniapp/js/review.js",     # reviewer-surface authority probe
+            "miniapp/js/app.js",        # reveal that entry on the Account page
+            "miniapp/js/profile.js",    # «حسابي» identity renderer (new)
             "miniapp/index.html",       # task-request.js / guide.js / task-stats.js tags
             "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
         }

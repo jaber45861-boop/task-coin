@@ -62,7 +62,7 @@ from telegram_channel_task_verifier import (
     validate_telegram_channel_task_data,
 )
 
-load_dotenv()
+load_dotenv('/root/task-coin/.env')
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
