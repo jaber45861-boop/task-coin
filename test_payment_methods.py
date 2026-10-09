@@ -1616,6 +1616,82 @@ class TestMinimumDepositUnits(WizardTestBase):
         fields.update(overrides)
         return store.update_payment_method(method_id, **fields)
 
+    def test_approved_method_minimums_flow_through_admin_save_and_persist(
+        self,
+    ) -> None:
+        """Admin UI amounts are converted for each method's asset,
+        passed to the existing update path, and survive a DB reread."""
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+        methods = store.list_payment_methods()
+        self.assertEqual(
+            [(method.id, method.asset) for method in methods],
+            [(1, "EGP"), (2, "USDT")],
+        )
+
+        # Use the same real save implementation, while spying on the
+        # values delivered from the Telegram edit wizard.
+        with patch.object(
+            store,
+            "update_payment_method",
+            wraps=store.update_payment_method,
+        ) as update_method:
+            for (
+                method_id,
+                expected_asset,
+                amount_text,
+                display_amount,
+                expected_units,
+            ) in (
+                (1, "EGP", "50", "50.00", 5000),
+                (2, "USDT", "1", "1.00000000", 100000000),
+            ):
+                with self.subTest(method_id=method_id):
+                    opening = self._open(method_id)
+                    self.assertIn(
+                        f"العملة: {expected_asset}", _reply(opening)
+                    )
+                    prompt = self._press_w("pm:wfield:8")
+                    self.assertIn(
+                        f"العملة الحالية: {expected_asset}",
+                        _edited(prompt.callback_query),
+                    )
+                    typed = self._type(amount_text)
+                    self.assertIn(
+                        f"الحد الأدنى للإيداع: {display_amount}",
+                        _reply(typed),
+                    )
+                    self._press_w("pm:wsave")
+
+        self.assertEqual(update_method.call_count, 2)
+        for call, (method_id, expected_asset, expected_units) in zip(
+            update_method.call_args_list,
+            ((1, "EGP", 5000), (2, "USDT", 100000000)),
+        ):
+            self.assertEqual(call.args[0], method_id)
+            self.assertEqual(call.kwargs["asset"], expected_asset)
+            self.assertEqual(call.kwargs["min_deposit_units"], expected_units)
+            self.assertEqual(call.kwargs["updated_by"], ADMIN_A)
+
+        # Read independently from SQLite after the wizard and store call
+        # have completed; these assertions do not rely on the staged UI.
+        saved = self._raw(
+            "SELECT id, asset, min_deposit_units, updated_by "
+            "FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["asset"],
+                    row["min_deposit_units"],
+                    row["updated_by"],
+                )
+                for row in saved
+            ],
+            [(1, "EGP", 5000, ADMIN_A), (2, "USDT", 100000000, ADMIN_A)],
+        )
+
     def test_wizard_creates_min_in_asset_units(self) -> None:
         """The wizard stores the typed minimum at the staged asset's
         scale (EGP 50 → 5000 atomic units) and the review page
