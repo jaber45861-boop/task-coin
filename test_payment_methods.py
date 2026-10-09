@@ -1641,6 +1641,7 @@ class TestMinimumDepositUnits(WizardTestBase):
         self.assertIn(
             admin.WZ_PROMPT_MIN_DEPOSIT, _edited(prompt.callback_query)
         )
+        self.assertIn("لا بوحداتها الذرية", _edited(prompt.callback_query))
         resp = self._type("1.5")
         self.assertIn("الحد الأدنى للإيداع: 1.50000000", _reply(resp))
         saved = self._press_w("pm:wsave")
@@ -1668,6 +1669,17 @@ class TestMinimumDepositUnits(WizardTestBase):
                     self._method(mid).min_deposit_units,
                     original.min_deposit_units,
                 )
+
+    def test_minimum_display_never_shows_raw_units_without_asset_scale(
+        self,
+    ) -> None:
+        """An unregistered asset cannot make the admin mistake an
+        atomic-unit integer for a currency amount."""
+        rendered = admin._min_deposit_display(
+            {"asset": "UNREGISTERED", "min_deposit_units": 123456789}
+        )
+        self.assertIn("مقياس الأصل غير مسجل", rendered)
+        self.assertNotIn("123456789", rendered)
 
     def test_revoked_admin_cannot_submit_minimum_edit(self) -> None:
         """Authorization is re-checked when a pending minimum is sent;

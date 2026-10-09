@@ -205,7 +205,7 @@ WZ_PROMPT_DESTINATION = (
 )
 WZ_PROMPT_INSTRUCTIONS = "📝 أرسل ملاحظات أو اضغط \"تخطي\":"
 WZ_PROMPT_MIN_DEPOSIT = (
-    "💵 أرسل الحد الأدنى للإيداع بوحدة العملة الحالية (مثال: 50):\n\n"
+    "💵 أرسل الحد الأدنى للإيداع بوحدة العملة الحالية، لا بوحداتها الذرية.\n\n"
     "اكتب 0 لمسح الحد الأدنى (يُرفض الإيداع حتى تضبطه من جديد)."
 )
 WZ_PROMPT_MIN_DEPOSIT_NO_ASSET = (
@@ -916,8 +916,9 @@ def build_wizard_summary(state: dict) -> str:
 def _min_deposit_display(state: dict) -> str:
     """Staged minimum in the staged asset's unit — never invented.
 
-    ``None`` renders as not-configured; an unregistered asset falls
-    back to the raw integer units so the review text never breaks.
+    ``None`` renders as not-configured. If the asset has no registered
+    scale or the stored units are invalid, never present the atomic
+    integer as if it were an amount in the asset's currency.
     """
     units = state.get("min_deposit_units")
     if units is None:
@@ -928,8 +929,10 @@ def _min_deposit_display(state: dict) -> str:
                 units, state.get("asset")
             )
         )
-    except asset_units.AssetUnitsError:
-        return str(units)
+    except asset_units.UnknownAssetScaleError:
+        return "غير معروض (مقياس الأصل غير مسجل)"
+    except asset_units.AssetAmountError:
+        return "غير معروض (قيمة مخزنة غير صالحة)"
 
 
 def build_review_text(state: dict) -> str:
