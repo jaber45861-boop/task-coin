@@ -1555,6 +1555,50 @@ class TestMinimumDepositUnits(WizardTestBase):
         self.assertIn(f"تم تعديل الوسيلة #{mid}", _edited(saved.callback_query))
         self.assertEqual(self._method(mid).min_deposit_units, 150000000)
 
+    def test_invalid_minimum_values_are_rejected_without_mutation(self) -> None:
+        """Malformed, negative, over-precision, boolean and float values
+        cannot replace an already configured asset-specific minimum."""
+        mid = self._create()  # USDT
+        original = self._update_row(mid, min_deposit_units="1.25")
+
+        for invalid in (
+            "NULL",
+            "not-a-number",
+            "-1",
+            "1.000000001",  # USDT supports at most 8 decimal places
+            True,
+            1.0,
+        ):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaises(store.PaymentMethodValidationError):
+                    self._update_row(mid, min_deposit_units=invalid)
+                self.assertEqual(
+                    self._method(mid).min_deposit_units,
+                    original.min_deposit_units,
+                )
+
+    def test_revoked_admin_cannot_submit_minimum_edit(self) -> None:
+        """Authorization is re-checked when a pending minimum is sent;
+        revoking the actor drops the wizard and persists nothing."""
+        mid = self._create()
+        original = self._update_row(mid, min_deposit_units="1.25")
+        self._open(mid)
+        self._press_w("pm:wfield:8")
+
+        configured_admins = list(config.ADMINS)
+        try:
+            config.ADMINS.clear()
+            denied = self._type("2.5")
+        finally:
+            config.ADMINS[:] = configured_admins
+
+        self.assertEqual(_reply(denied), admin.MSG_ADMIN_ONLY)
+        self.assertNotIn(ADMIN_A, admin._WIZARD_STATES)
+        self.assertEqual(
+            self._method(mid).min_deposit_units,
+            original.min_deposit_units,
+        )
+
     def test_wizard_asset_change_clears_staged_min(self) -> None:
         """Changing the asset inside the edit wizard drops the
         old-asset units immediately (menu shows not-configured) and
