@@ -142,8 +142,16 @@ PAGE_PREV = "◀️ السابق"
 
 STATUS_ACTIVE = "🟢 نشطة"
 STATUS_INACTIVE = "🔴 متوقفة"
-DEPOSIT_ON = "الإيداع: 🟢 متاح"
-DEPOSIT_OFF = "الإيداع: 🔴 غير متاح"
+DEPOSIT_ON = "الإيداع: 🟢 مفعّل"
+DEPOSIT_OFF = "الإيداع: 🔴 غير مفعّل"
+DEPOSIT_UNAVAILABLE_HEADER = "⚠️ وسائل إيداع مفعّلة لا يمكنها استقبال الطلبات:"
+DEPOSIT_UNAVAILABLE_LABEL = "⚠️ لا يمكن استقبال الإيداعات:"
+DEPOSIT_UNAVAILABLE_REASONS = {
+    "inactive": "الوسيلة غير نشطة",
+    "asset": "مقياس الأصل غير مسجل",
+    "minimum_missing": "الحد الأدنى غير مضبوط",
+    "minimum_invalid": "الحد الأدنى غير صالح",
+}
 
 DEST_LABEL = {"crypto": "العنوان", "cash": "الحساب"}
 
@@ -318,13 +326,58 @@ def _field_or_dash(value: str | None) -> str:
 # ── Rendering (pure, deterministic, bounded) ──────────────────────────
 
 
+def _deposit_unavailable_reasons(method: PaymentMethod) -> tuple[str, ...]:
+    """Explain why an opted-in deposit method currently rejects requests.
+
+    This is a read-only diagnostic mirroring the fail-closed checks in
+    ``deposit_store.create_deposit_request``. Methods not opted in for
+    deposits are intentionally omitted from this warning.
+    """
+    if not method.deposits_enabled:
+        return ()
+
+    reasons: list[str] = []
+    if not method.is_active:
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["inactive"])
+    if not asset_units.is_supported(method.asset):
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["asset"])
+
+    minimum = method.min_deposit_units
+    if minimum is None:
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["minimum_missing"])
+    elif (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or minimum <= 0
+    ):
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["minimum_invalid"])
+    return tuple(reasons)
+
+
 def build_panel_text(methods: list[PaymentMethod]) -> str:
     active = sum(1 for m in methods if m.is_active)
-    return (
+    text = (
         f"{PANEL_HEADER}\n"
         f"النشطة: {active} — الإجمالي: {len(methods)}\n\n"
         "استخدم ➕ لإظهار صيغة الإضافة، أو 📋 لعرض الوسائل."
     )
+    unavailable = [
+        (method, reasons)
+        for method in methods
+        if (reasons := _deposit_unavailable_reasons(method))
+    ]
+    if not unavailable:
+        return text
+
+    lines = ["", "", DEPOSIT_UNAVAILABLE_HEADER]
+    for method, reasons in unavailable[:PAGE_SIZE]:
+        lines.append(
+            f"• #{method.id} {method.display_name}: {'، '.join(reasons)}"
+        )
+    remaining = len(unavailable) - PAGE_SIZE
+    if remaining > 0:
+        lines.append(f"• و{remaining} وسيلة أخرى؛ راجع 📋 عرض الوسائل.")
+    return text + "\n".join(lines)
 
 
 def build_panel_keyboard() -> InlineKeyboardMarkup:
@@ -361,6 +414,12 @@ def _method_lines(
         lines.append(
             f"   {DEPOSIT_ON if method.deposits_enabled else DEPOSIT_OFF}"
         )
+        unavailable_reasons = _deposit_unavailable_reasons(method)
+        if unavailable_reasons:
+            lines.append(
+                f"   {DEPOSIT_UNAVAILABLE_LABEL} "
+                f"{'، '.join(unavailable_reasons)}"
+            )
         lines.append("")
     return lines
 

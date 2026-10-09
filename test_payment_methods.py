@@ -788,6 +788,98 @@ class TestPersistenceAndPanels(PaymentMethodTestBase):
         help_update = self._press("pm:help")
         self.assertIn("/addpm", _edited(help_update.callback_query))
 
+    def test_panel_and_list_explain_unusable_deposit_methods_read_only(
+        self,
+    ) -> None:
+        """Opted-in methods with missing minimums, unknown asset scales,
+        or inactive status are named with reasons, without database writes
+        or exposing their configured destinations."""
+        missing_min = self._create()
+        unsupported = store.create_payment_method(
+            category="crypto",
+            display_name="أصل غير مدعوم",
+            asset="TESTCOIN",
+            network="TESTNET",
+            provider="مزود الاختبار",
+            destination="SENSITIVE-PAYMENT-DEST",
+            min_deposit_units=1,
+            created_by=ADMIN_A,
+        )
+        inactive = store.create_payment_method(
+            category="crypto",
+            display_name="وسيلة متوقفة",
+            asset="USDT",
+            network="TESTNET",
+            provider="مزود الاختبار",
+            destination="INACTIVE-PAYMENT-DEST",
+            min_deposit_units=1,
+            created_by=ADMIN_A,
+        )
+        usable = store.create_payment_method(
+            category="cash",
+            display_name="وسيلة جاهزة",
+            asset="EGP",
+            provider="مزود الاختبار",
+            destination="READY-PAYMENT-DEST",
+            min_deposit_units=100,
+            created_by=ADMIN_A,
+        )
+
+        # Model pre-existing inconsistent rows (e.g. imported/live config):
+        # the diagnostic must describe them, never repair them implicitly.
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE payment_methods SET deposits_enabled = 1 "
+                "WHERE id IN (?, ?)",
+                (missing_min, unsupported.id),
+            )
+        store.set_payment_method_deposits_enabled(
+            inactive.id, True, updated_by=ADMIN_A
+        )
+        store.set_payment_method_active(
+            inactive.id, False, updated_by=ADMIN_A
+        )
+        store.set_payment_method_deposits_enabled(
+            usable.id, True, updated_by=ADMIN_A
+        )
+
+        before = self._raw(
+            "SELECT id, asset, is_active, deposits_enabled, "
+            "min_deposit_units, updated_at FROM payment_methods "
+            "ORDER BY id"
+        )
+        panel = admin.build_panel_text(store.list_payment_methods())
+
+        self.assertIn(
+            f"#{missing_min} محفظة الاختبار: الحد الأدنى غير مضبوط",
+            panel,
+        )
+        self.assertIn(
+            f"#{unsupported.id} أصل غير مدعوم: مقياس الأصل غير مسجل",
+            panel,
+        )
+        self.assertIn(
+            f"#{inactive.id} وسيلة متوقفة: الوسيلة غير نشطة",
+            panel,
+        )
+        self.assertNotIn("وسيلة جاهزة", panel)
+        self.assertNotIn("SENSITIVE-PAYMENT-DEST", panel)
+
+        listed = self._press("pm:list")
+        list_text = _edited(listed.callback_query)
+        self.assertIn(admin.DEPOSIT_UNAVAILABLE_LABEL, list_text)
+        self.assertIn("الحد الأدنى غير مضبوط", list_text)
+        self.assertIn("مقياس الأصل غير مسجل", list_text)
+        self.assertIn("الوسيلة غير نشطة", list_text)
+        self.assertNotIn("SENSITIVE-PAYMENT-DEST", list_text)
+
+        after = self._raw(
+            "SELECT id, asset, is_active, deposits_enabled, "
+            "min_deposit_units, updated_at FROM payment_methods "
+            "ORDER BY id"
+        )
+        self.assertEqual([tuple(row) for row in before], [tuple(row) for row in after])
+
     def test_edit_template_shows_full_values_and_prefilled_command(self) -> None:
         mid = self._create()
         update = self._press(f"pm:edit:{mid}")
