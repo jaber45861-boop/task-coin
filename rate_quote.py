@@ -49,10 +49,13 @@ Canonical parsing (``parse_rate``)
 
 Providers
 ---------
-The ONLY approved source today is ``"manual"`` (``PROVIDER_MANUAL``).
-There are no fake providers and nothing here fetches anything.  A
-future provider simply constructs the same ``RateQuote(rate, provider,
-captured_at)`` — the consumer contract never changes.
+Approved sources are ``"manual"`` (``PROVIDER_MANUAL``) and
+``"coingecko"`` (``PROVIDER_COINGECKO``).  This module does not fetch
+anything; ``rate_api`` owns external HTTP access while this module
+validates provider identifiers and keeps the quote representation
+exact and immutable.  A future provider simply constructs the same
+``RateQuote(rate, provider, captured_at)`` — the consumer contract
+never changes.
 
 Timestamp
 ---------
@@ -104,7 +107,8 @@ _CANONICAL_DECIMAL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 # ── Provider boundary ────────────────────────────────────────────────
 
 PROVIDER_MANUAL = "manual"
-APPROVED_RATE_PROVIDERS = frozenset({PROVIDER_MANUAL})
+PROVIDER_COINGECKO = "coingecko"
+APPROVED_RATE_PROVIDERS = frozenset({PROVIDER_MANUAL, PROVIDER_COINGECKO})
 
 
 # ── Errors ───────────────────────────────────────────────────────────

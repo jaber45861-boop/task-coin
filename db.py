@@ -1493,10 +1493,35 @@ def init_db(db_path: str | None = None) -> None:
                 external_tx_id TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                wallet_rate_usdt_egp TEXT,
+                rate_provider TEXT,
+                rate_captured_at TIMESTAMP,
+                credited_usdt_units INTEGER CHECK (credited_usdt_units IS NULL OR credited_usdt_units > 0),
                 FOREIGN KEY (user_id) REFERENCES users(user_id),
                 FOREIGN KEY (payment_method_id) REFERENCES payment_methods(id)
             )
         """)
+        # Additive snapshot migration for EGP -> USDT deposit pricing.
+        # Existing rows keep NULL (added columns default to NULL) and
+        # are deliberately never assigned a fabricated/current rate:
+        # crediting a legacy row without a frozen snapshot is refused
+        # fail-closed by deposit_verification.  Guarded per column so
+        # re-running init_db on an existing database is a no-op.
+        _deposit_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(deposit_requests)")
+        }
+        for _name, _definition in (
+            ("wallet_rate_usdt_egp", "TEXT"),
+            ("rate_provider", "TEXT"),
+            ("rate_captured_at", "TIMESTAMP"),
+            ("credited_usdt_units", "INTEGER CHECK (credited_usdt_units IS NULL OR credited_usdt_units > 0)"),
+        ):
+            if _name not in _deposit_columns:
+                conn.execute(
+                    f"ALTER TABLE deposit_requests "
+                    f"ADD COLUMN {_name} {_definition}"
+                )
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_deposit_requests_tx
             ON deposit_requests (external_tx_id)

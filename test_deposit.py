@@ -48,7 +48,8 @@ D. WALLET SAFETY (22–25)
    22 creating a deposit request does not credit wallet
    23 creating a deposit request does not write a credit ledger entry
    24 no fake blockchain transaction is created
-   25 no fake conversion rate is created
+   25 rate facts are server-side only (frozen snapshot columns, never
+      in the response; no fabricated rate)
 
 E. IDEMPOTENCY (26–28)
    26 duplicate request behavior is deterministic
@@ -81,6 +82,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -90,9 +92,15 @@ import config
 import deposit_proof_admin
 import deposit_store
 import payment_method_store
+import rate_store
 import serve_miniapp
 import wallet
 from config import CHANNELS
+from rate_quote import (
+    PROVIDER_COINGECKO,
+    RateQuote,
+    canonical_timestamp_text,
+)
 
 # Reuse the existing, independently implemented Telegram initData helper.
 from test_miniapp_auth import _TEST_BOT_TOKEN, _make_init_data
@@ -184,6 +192,21 @@ def _make_pm(db_path: str, *, enabled: bool = True, active: bool = True,
             method.id, False, updated_by=ADMIN_ID, db_path=db_path
         )
     return payment_method_store.get_payment_method(method.id, db_path)
+
+
+def _seed_auto_rate(
+    db_path: str, rate: str = "48.5", *, age_seconds: float = 0.0
+) -> RateQuote:
+    """A fresh AUTOMATIC quote — the normal operating mode.
+
+    ``age_seconds`` backdates the capture instant so the staleness
+    path (age >= TTL) is deterministically reachable.  Returns the
+    stored quote so tests can assert the exact frozen snapshot.
+    """
+    captured = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    quote = RateQuote(Decimal(rate), PROVIDER_COINGECKO, captured)
+    rate_store.set_automatic_rate(quote, db_path=db_path)
+    return quote
 
 
 def _get_methods(client, headers: dict | None = None):
@@ -748,20 +771,35 @@ class TestWalletSafety:
         assert "external_tx_id" in _deposit_columns(env)  # future key,
         # present but deliberately NULL — never invented at creation.
 
-    def test_25_no_fake_conversion_rate(self, client, env):
-        """25. No rate/conversion fact exists anywhere in the deposit
-        flow — crediting a non-USDT asset later requires an explicit
-        future mapping rule."""
+    def test_25_rate_facts_are_server_side_only(self, client, env):
+        """25. Rate/conversion facts exist ONLY in server-side
+        columns — the additive EGP snapshot columns (frozen at
+        creation, NULL for USDT and for legacy rows), never in the
+        API response, and no rate is ever fabricated: an EGP method
+        without a fresh quote fails closed (see TestEgpRateFreeze)."""
         pm = _make_pm(env)
 
         columns = _deposit_columns(env)
-        assert not any("rate" in name for name in columns)
+        for name in (
+            "wallet_rate_usdt_egp",
+            "rate_provider",
+            "rate_captured_at",
+            "credited_usdt_units",
+        ):
+            assert name in columns
         assert not any("conversion" in name for name in columns)
 
         response = _post(client, _payload(pm.id))
         data = response.get_json()
+        assert response.status_code == 200
         assert not any("rate" in key for key in _keys(data))
-        # The wallet was never consulted for a conversion either.
+        # A USDT creation fills none of the snapshot columns and the
+        # wallet is never consulted at creation.
+        row = _deposit_rows(env)[0]
+        assert row["wallet_rate_usdt_egp"] is None
+        assert row["rate_provider"] is None
+        assert row["rate_captured_at"] is None
+        assert row["credited_usdt_units"] is None
         assert _wallet_row(env) is None
 
 
@@ -1272,6 +1310,7 @@ class TestPerAssetMinimums:
         """40. EGP 50 → accepted, stored as 5000 EGP cents — NEVER
         the old 8-dp USDT interpretation (5_000_000_000)."""
         pm = self._make_egp_pm(env)
+        _seed_auto_rate(env)
         response = _post(client, _payload(pm.id, "50"))
         assert response.status_code == 200
         request = response.get_json()["request"]
@@ -1320,6 +1359,7 @@ class TestPerAssetMinimums:
         100_000_000 for USDT — scale is per-method, never global."""
         egp = self._make_egp_pm(env, min_units=100)
         usdt = _make_pm(env)
+        _seed_auto_rate(env)
         egp_units = _post(
             client, _payload(egp.id, "1")
         ).get_json()["request"]["amount_units"]
@@ -1363,6 +1403,7 @@ class TestPerAssetMinimums:
         assert ") USDT" not in deposit    # the old hardcoded unit
 
         egp = self._make_egp_pm(env)
+        _seed_auto_rate(env)
         egp_request_id = _post(
             client, _payload(egp.id, "50")
         ).get_json()["request"]["request_id"]
@@ -1404,6 +1445,7 @@ class TestPerAssetMinimums:
         assert usdt["amount"] == "1.50000000"   # 8-dp USDT scale
 
         egp = self._make_egp_pm(env)
+        _seed_auto_rate(env)
         egp_request = _post(
             client, _payload(egp.id, "50")
         ).get_json()["request"]
@@ -1433,6 +1475,174 @@ class TestPerAssetMinimums:
             deposit.index("function _buildShell(")
         ]
         assert "${method.asset}" not in composition
+
+
+# ══════════════════════════════════════════════════════════════════
+# J. AUTOMATIC-RATE POLICY AT THE DEPOSIT EDGE (56–59)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestEgpRateFreeze:
+    """The automatic-rate policy where deposits are created: a fresh
+    trustworthy quote is REQUIRED for EGP (fail-closed otherwise) and
+    is FROZEN into the row — exact rate text, provider, capture
+    instant and the ROUND_CEILING unit count.  Rate facts never leak
+    into the API response."""
+
+    EGP_RATE = "48.5"
+    # 50 EGP at 48.5 EGP/USDT = 1.030927835051546… USDT → ×1e8 →
+    # 103_092_783.505… atomic units → ROUND_CEILING (MT-ADMIN-17:
+    # the wallet never under-holds) → 103_092_784 — computed here
+    # independently of the production Decimal code path.
+    FROZEN_UNITS = 103_092_784
+
+    @staticmethod
+    def _make_egp_pm(db_path: str, min_units: int = 5000):
+        return _make_pm(
+            db_path,
+            category="cash",
+            asset="EGP",
+            network=None,
+            display_name="TEST EGP",
+            min_units=min_units,
+        )
+
+    def test_56_egp_creation_without_rate_fails_closed(self, client, env):
+        """56. No quote at all → 503 rate_unavailable with a clear
+        message, no row, no wallet — never a guessed price."""
+        pm = self._make_egp_pm(env)
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 503
+        body = response.get_json()
+        assert body["error"] == "rate_unavailable"
+        assert "سعر" in body["message"]       # clear Arabic message
+        assert _deposit_rows(env) == []
+        assert _wallet_row(env) is None
+
+    def test_57_egp_creation_with_stale_rate_fails_closed(
+        self, client, env
+    ):
+        """57. A quote aged out (age >= TTL) is as unusable as a
+        missing one — a failed refresh never extends freshness."""
+        pm = self._make_egp_pm(env)
+        _seed_auto_rate(
+            env, self.EGP_RATE,
+            age_seconds=rate_store.RATE_TTL_SECONDS,
+        )
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 503
+        assert response.get_json()["error"] == "rate_unavailable"
+        assert _deposit_rows(env) == []
+
+    def test_58_egp_creation_freezes_the_quote(self, client, env):
+        """58. A fresh quote is frozen canonically — exact rate text,
+        provider, capture instant, exact converted units — while the
+        response carries NO rate facts and the wallet is untouched."""
+        pm = self._make_egp_pm(env)
+        quote = _seed_auto_rate(env, self.EGP_RATE)
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 200
+        data = response.get_json()
+        assert not any("rate" in key for key in _keys(data))
+
+        row = _deposit_rows(env)[0]
+        assert row["request_id"] == data["request"]["request_id"]
+        assert row["wallet_rate_usdt_egp"] == self.EGP_RATE  # canonical
+        assert row["rate_provider"] == PROVIDER_COINGECKO
+        assert row["rate_captured_at"] == canonical_timestamp_text(
+            quote.captured_at
+        )
+        assert row["credited_usdt_units"] == self.FROZEN_UNITS
+        assert row["amount_units"] == 5000          # EGP cents, exact
+        assert _wallet_row(env) is None             # no credit yet
+
+    def test_59_usdt_creation_needs_no_rate(self, client, env):
+        """59. The USDT path never consults a rate: creation works
+        with NO quote present and freezes nothing."""
+        pm = _make_pm(env)
+        response = _post(client, _payload(pm.id, "1.5"))
+        assert response.status_code == 200
+        row = _deposit_rows(env)[0]
+        assert row["wallet_rate_usdt_egp"] is None
+        assert row["rate_provider"] is None
+        assert row["credited_usdt_units"] is None
+
+    def test_60_init_db_migrates_a_preexisting_database(self, tmp_path):
+        """60. Database compatibility: a ``deposit_requests`` created
+        BEFORE the snapshot columns gains them through the additive
+        startup migration; existing rows keep NULL snapshot fields
+        (never a fabricated rate), old data stays byte-for-byte, and
+        a second ``init_db`` run is a no-op."""
+        legacy = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(legacy)
+        try:
+            conn.execute(
+                "CREATE TABLE deposit_requests ("
+                " request_id TEXT PRIMARY KEY,"
+                " user_id INTEGER NOT NULL,"
+                " payment_method_id INTEGER NOT NULL,"
+                " amount_units INTEGER NOT NULL,"
+                " status TEXT NOT NULL,"
+                " pm_display_name TEXT NOT NULL,"
+                " pm_asset TEXT NOT NULL,"
+                " pm_network TEXT,"
+                " pm_provider TEXT NOT NULL,"
+                " pm_destination TEXT NOT NULL,"
+                " external_tx_id TEXT,"
+                " created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                " updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                " FOREIGN KEY (user_id) REFERENCES users(user_id),"
+                " FOREIGN KEY (payment_method_id)"
+                " REFERENCES payment_methods(id))"
+            )
+            conn.execute(
+                "INSERT INTO deposit_requests (request_id, user_id, "
+                " payment_method_id, amount_units, status, "
+                " pm_display_name, pm_asset, pm_provider, pm_destination,"
+                " external_tx_id) "
+                "VALUES ('legacy1', 1, 1, 5000, 'pending', 'OLD', 'EGP', "
+                " 'P', 'D', NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        db.init_db(legacy)          # additive migration runs
+        db.init_db(legacy)          # idempotent — no error, no dupes
+
+        conn = sqlite3.connect(legacy)
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(deposit_requests)"
+                )
+            }
+            for name in (
+                "wallet_rate_usdt_egp",
+                "rate_provider",
+                "rate_captured_at",
+                "credited_usdt_units",
+            ):
+                assert name in columns
+            rows = conn.execute(
+                "SELECT * FROM deposit_requests"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1
+        legacy_row = rows[0]
+        # Old data intact; the new columns are NULL — a legacy row is
+        # NEVER assigned a fabricated/current rate (it is refused at
+        # the credit boundary instead).
+        assert legacy_row["request_id"] == "legacy1"
+        assert legacy_row["amount_units"] == 5000
+        assert legacy_row["status"] == "pending"
+        assert legacy_row["wallet_rate_usdt_egp"] is None
+        assert legacy_row["rate_provider"] is None
+        assert legacy_row["rate_captured_at"] is None
+        assert legacy_row["credited_usdt_units"] is None
 
 
 if __name__ == "__main__":

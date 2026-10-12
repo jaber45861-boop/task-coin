@@ -138,6 +138,7 @@ from test_deposit import (
     _auth,
     _make_pm,
     _read_js,
+    _seed_auto_rate,
 )
 from test_deposit_verification import (
     AMOUNT,
@@ -757,6 +758,48 @@ class TestManualApproval:
         assert row["updated_at"] is not None
         stored = deposit_proof_store.get_proof(proof.proof_id, db_path=env)
         assert stored.status == deposit_proof_store.STATUS_APPROVED
+
+    def test_egp_approval_credits_frozen_units_exactly_once(self, env):
+        """An EGP deposit approved manually credits the FROZEN USDT
+        units (rate captured at creation — 50 EGP @ 48.5 →
+        103_092_784 units, ROUND_CEILING) exactly once; the EGP amount
+        row is untouched and a replay is an idempotent no-op."""
+        _fund()
+        frozen_units = 103_092_784
+        pm = _make_pm(
+            env, category="cash", asset="EGP", network=None,
+            display_name="TEST EGP", min_units=5000,
+        )
+        _seed_auto_rate(env, "48.5")
+        req = deposit_store.create_deposit_request(
+            user_id=USER_A,
+            payment_method_id=pm.id,
+            amount="50",
+            db_path=env,
+        )
+        proof = _new_proof(req.request_id)
+
+        first = deposit_manual_review.approve(
+            proof.proof_id, admin_id=ADMIN_ID, db_path=env
+        )
+        assert first.credited is True
+        assert first.already_processed is False
+        assert _wallet_units(env) == (FUND + frozen_units, 0)
+        rows = _deposit_ledger(env, req.request_id)
+        assert len(rows) == 1
+        assert rows[0]["amount_units"] == frozen_units
+        assert rows[0]["rate_usdt_egp"] == "48.5"
+
+        # The EGP intent itself never becomes USDT units.
+        assert _row(env, req.request_id)["amount_units"] == 5000
+
+        second = deposit_manual_review.approve(
+            proof.proof_id, admin_id=ADMIN_ID, db_path=env
+        )
+        assert second.credited is False
+        assert second.already_processed is True
+        assert _wallet_units(env) == (FUND + frozen_units, 0)
+        assert len(_deposit_ledger(env, req.request_id)) == 1
 
     def test_22_approval_is_atomic(self, env):
         """22. Two concurrent approvals → exactly ONE financial

@@ -31,9 +31,12 @@ What this module NEVER does:
 - Never credits from the user-facing ``POST /api/deposit`` flow — a
   user request alone is an intent, never proof of payment.
 - Never fabricates a transaction id, a confirmation or a conversion:
-  amounts are exact integer USDT atomic units; the verified amount
-  must equal the persisted ``amount_units`` exactly (no float, no
-  Decimal-to-float, no EGP, no rate, no rounding).
+  the verified amount must equal the persisted ``amount_units``
+  exactly (no float, no Decimal-to-float).  USDT credits are exact
+  integer USDT atomic units; an EGP request credits ONLY the frozen
+  ``credited_usdt_units`` snapshot captured at creation (Decimal,
+  ROUND_CEILING at creation time) — this module reads no rate and
+  applies no rounding of its own.
 - Never touches withdrawals, payment-method semantics or the user Mini
   App.
 
@@ -82,6 +85,7 @@ import db
 import deposit_store
 import ledger
 import wallet
+from rate_quote import APPROVED_RATE_PROVIDERS, RateQuoteError, parse_rate
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +174,14 @@ class DepositAssetNotCreditableError(DepositVerificationError):
     atomic units would be a silent currency mix.  The credit
     boundary rejects fail-closed BEFORE any wallet or ledger write —
     no credit, no ledger entry, no partial credit and NO implicit
-    conversion (none is ever invented here).
+    conversion.
+
+    The ONLY conversion path is the explicit one: an EGP request
+    carrying a valid frozen snapshot (rate + provider + capture
+    instant + precomputed ``credited_usdt_units`` from creation) is
+    credited in those frozen USDT units.  A request without such a
+    snapshot (legacy pre-migration row, or a corrupted one) is
+    refused here — no current rate is ever substituted.
     """
 
     code = "deposit_asset_not_creditable"
@@ -188,6 +199,10 @@ class InvalidVerificationFactsError(DepositVerificationError):
 @dataclass(frozen=True)
 class DepositVerificationResult:
     """Deterministic outcome of one verification call.
+
+    ``amount_units`` is what was actually CREDITED: identical to the
+    verified/persisted amount for USDT, and the frozen converted USDT
+    units for an EGP request (its ``credited_usdt_units`` snapshot).
 
     ``already_credited=True`` marks the idempotent replay of an
     identical earlier verification: the request is credited exactly
@@ -297,6 +312,33 @@ def _timestamp_text(value: datetime) -> str:
 # ── Snapshot compatibility (contract rule 7) ─────────────────────────
 
 
+def _valid_frozen_conversion(request: deposit_store.DepositRequest) -> bool:
+    """True only when the EGP → USDT snapshot is complete and parseable.
+
+    Fail-closed: a legacy row (all snapshot columns NULL), an
+    unapproved provider, a non-positive/non-int unit count, unparsable
+    rate text or a naive/absent capture instant is refused BEFORE any
+    wallet/ledger write.  Nothing is guessed and the CURRENT rate is
+    never consulted as a substitute.
+    """
+    if (
+        not request.wallet_rate_usdt_egp
+        or not isinstance(request.rate_provider, str)
+        or request.rate_provider not in APPROVED_RATE_PROVIDERS
+        or not isinstance(request.rate_captured_at, str)
+        or isinstance(request.credited_usdt_units, bool)
+        or not isinstance(request.credited_usdt_units, int)
+        or request.credited_usdt_units <= 0
+    ):
+        return False
+    try:
+        parse_rate(request.wallet_rate_usdt_egp)
+        captured_at = datetime.fromisoformat(request.rate_captured_at)
+    except (RateQuoteError, TypeError, ValueError):
+        return False
+    return captured_at.tzinfo is not None and captured_at.utcoffset() is not None
+
+
 def _require_method_compatible(
     connection, request: deposit_store.DepositRequest
 ) -> None:
@@ -378,9 +420,10 @@ def verify_and_credit(
         DepositNotFoundError: unknown/malformed request id.
         DepositNotPendingError: request is no longer pending.
         DepositAmountMismatchError: verified != persisted amount.
-        DepositAssetNotCreditableError: the request's asset is not
-            the wallet credit currency — rejected BEFORE any
-            wallet/ledger write (no credit, no conversion).
+        DepositAssetNotCreditableError: the request's asset cannot
+            be credited — a non-wallet asset without a valid frozen
+            conversion snapshot — rejected BEFORE any wallet/ledger
+            write (no credit, no substitute conversion).
         InvalidExternalTxIdError / InvalidVerificationFactsError:
             unusable supplied facts (validated before any DB work).
         ExternalTxIdAlreadyUsedError: another request owns the tx id.
@@ -411,16 +454,28 @@ def verify_and_credit(
         # ── Idempotent replay: credited with the SAME tx id ─────
         if request.status == deposit_store.STATUS_CREDITED:
             if request.external_tx_id == tx_id:
+                # Report what was ACTUALLY credited: the frozen USDT
+                # units for an EGP request, the persisted amount for
+                # USDT (identical semantics to the fresh path).
+                replay_units = request.amount_units
+                if (
+                    isinstance(request.pm_asset, str)
+                    and request.pm_asset.strip().casefold() == "egp"
+                    and isinstance(request.credited_usdt_units, int)
+                    and not isinstance(request.credited_usdt_units, bool)
+                    and request.credited_usdt_units > 0
+                ):
+                    replay_units = request.credited_usdt_units
                 logger.info(
                     "Deposit verification replay: request=%s user=%s "
                     "units=%d result=idempotent",
                     request.request_id, request.user_id,
-                    request.amount_units,
+                    replay_units,
                 )
                 return DepositVerificationResult(
                     request_id=request.request_id,
                     user_id=request.user_id,
-                    amount_units=request.amount_units,
+                    amount_units=replay_units,
                     external_tx_id=request.external_tx_id,
                     status=deposit_store.STATUS_CREDITED,
                     already_credited=True,
@@ -446,12 +501,40 @@ def verify_and_credit(
         # ── Snapshot compatibility (rule 7) ─────────────────────
         _require_method_compatible(conn, request)
 
-        # ── Creditability: the internal wallet is USDT-only ─────
-        # Fail-closed BEFORE any wallet/ledger write: a request whose
-        # asset is not the wallet credit currency is never credited,
-        # never converted and never partially applied — the whole
-        # transaction rolls back with exactly zero mutations.
-        if not asset_units.is_wallet_credit_asset(request.pm_asset):
+        # ── Credit amount: USDT stays byte-for-byte on the old path;
+        # EGP credits the conversion units FROZEN when the request was
+        # created (rate + provider + capture instant + exact units).
+        # The current rate is NEVER read here — an old request keeps
+        # its own rate and amount forever, and a request without a
+        # valid frozen snapshot is refused BEFORE any wallet/ledger
+        # write (the whole transaction rolls back with zero mutations).
+        credit_units = request.amount_units
+        rate_text = None
+        conversion_metadata = {}
+        if asset_units.is_wallet_credit_asset(request.pm_asset):
+            pass
+        elif (
+            isinstance(request.pm_asset, str)
+            and request.pm_asset.strip().casefold() == "egp"
+        ):
+            if not _valid_frozen_conversion(request):
+                raise DepositAssetNotCreditableError(
+                    "EGP deposit has no valid frozen USDT conversion "
+                    "snapshot — credit refused before any wallet or "
+                    "ledger write"
+                )
+            credit_units = request.credited_usdt_units
+            rate_text = request.wallet_rate_usdt_egp
+            conversion_metadata = {
+                "conversion": "egp_to_usdt",
+                "source_asset": "EGP",
+                "source_amount_units": request.amount_units,
+                "rate_usdt_egp": request.wallet_rate_usdt_egp,
+                "rate_provider": request.rate_provider,
+                "rate_captured_at": request.rate_captured_at,
+                "credited_usdt_units": credit_units,
+            }
+        else:
             raise DepositAssetNotCreditableError(
                 f"deposit asset {request.pm_asset!r} cannot be "
                 "credited to the internal wallet"
@@ -468,21 +551,24 @@ def verify_and_credit(
             )
 
         # ── ONE atomic credit ───────────────────────────────────
-        # 1) wallet: available += exact persisted amount on THIS
+        # 1) wallet: available += the credit amount (the frozen USDT
+        #    units for EGP, the verified amount for USDT) on THIS
         #    transaction's connection (row created if missing).
         wallet.ensure_wallet(request.user_id, connection=conn)
-        wallet.credit_units(request.user_id, verified_units, connection=conn)
+        wallet.credit_units(request.user_id, credit_units, connection=conn)
 
         # 2) ledger: exactly one credit entry, tied to this request.
         ledger.LedgerService(connection=conn).record_credit(
             request.user_id,
-            amount_units=verified_units,
+            amount_units=credit_units,
             reference_type=REFERENCE_TYPE,
             reference_id=request.request_id,
             idempotency_key=f"{_LEDGER_KEY_PREFIX}{request.request_id}",
+            rate_usdt_egp=rate_text,
             metadata={
                 "verification_source": evidence["source"],
                 "external_tx_id": tx_id,
+                **conversion_metadata,
             },
         )
 
@@ -505,7 +591,7 @@ def verify_and_credit(
         return DepositVerificationResult(
             request_id=request.request_id,
             user_id=request.user_id,
-            amount_units=verified_units,
+            amount_units=credit_units,
             external_tx_id=tx_id,
             status=deposit_store.STATUS_CREDITED,
             already_credited=False,

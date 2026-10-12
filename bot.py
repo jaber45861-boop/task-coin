@@ -1860,6 +1860,12 @@ def main() -> None:
     db.load_channels()
     _refresh_required_ids()
 
+    # Refresh the market quote in the background. A provider failure is
+    # fail-closed by rate_store.get_current_quote once the last quote ages
+    # past its 15-minute TTL; it never silently extends quote freshness.
+    import rate_worker
+    rate_worker.start()
+
     app = ApplicationBuilder().token(token).build()
 
     # Clear legacy command menus registered by earlier bot versions.

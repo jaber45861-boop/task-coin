@@ -1,17 +1,38 @@
 """
-Manual Rate Store (MT-ADMIN-26)
-===============================
+Rate Store (MT-ADMIN-26 → automatic-first)
+==========================================
 
-The authoritative, admin-managed source of the current EGP-per-USDT
-rate — the missing link MT-ADMIN-25's WithdrawalService will consume
-later.  This task ONLY provides the source: nothing here is wired into
-``WithdrawalService`` (its explicit-RateQuote requirement is untouched),
-there is no Mini App endpoint, no HTTP fetching, and no external API.
+The authoritative source of the current EGP-per-USDT rate — the
+missing link MT-ADMIN-25's WithdrawalService will consume later.
+Consumers read through ``get_current_quote`` only.
+
+Modes (policy: automatic is NORMAL, manual is EMERGENCY-only)
+-------------------------------------------------------------
+- NORMAL: ``rate_worker`` fetches a market quote (``rate_api``,
+  provider ``coingecko``) and persists it through
+  ``set_automatic_rate`` — no human in the loop.
+- EMERGENCY: while a fresh AUTOMATIC quote exists, ``set_rate``
+  (``/setrate``) is BLOCKED (``ManualRateBlockedError``) — the manual
+  path opens only once the automatic quote is missing or older than
+  the TTL (i.e. the provider failed to keep it fresh), and only for a
+  configured admin.  A successful automatic refresh overwrites a
+  manual emergency quote and re-closes the gate (return to normal).
+- Every write records who (``updated_by``: admin id, or ``0`` = the
+  system worker) and when (``captured_at`` / ``updated_at``); the
+  worker logs the automatic refresh, and ``set_rate`` logs every
+  manual override (value + admin id + the evaluated emergency
+  context — why the gate was open).
+- Staleness applies to BOTH providers: one TTL, one parser, no
+  provider-specific grace period.
+
+There is no Mini App endpoint and this module performs no HTTP
+fetching itself — ``rate_api`` owns that boundary.
 
 Rate meaning
 ------------
 ``rate_usdt_egp`` is **EGP per 1 USDT** (``1 USDT = rate_usdt_egp
-EGP``) — exactly the ``rate_quote.RateQuote`` contract.
+EGP``) — exactly the ``rate_quote.RateQuote`` contract.  It is a
+market reference price, not a guaranteed execution price.
 
 Storage — one dedicated singleton row, never platform_settings
 ---------------------------------------------------------------
@@ -20,9 +41,10 @@ Storage — one dedicated singleton row, never platform_settings
     current_rate (
         id            INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
         rate_usdt_egp TEXT NOT NULL,   -- canonical plain-decimal TEXT
-        provider      TEXT NOT NULL,   -- "manual" (the ONLY provider)
+        provider      TEXT NOT NULL,   -- "coingecko" (automatic)
+                                      -- | "manual" (emergency)
         captured_at   TIMESTAMP NOT NULL,  -- aware UTC ISO-8601
-        updated_by    INTEGER NOT NULL,    -- admin Telegram id
+        updated_by    INTEGER NOT NULL,    -- admin Telegram id | 0 = system
         updated_at    TIMESTAMP NOT NULL   -- aware UTC ISO-8601
     )
 
@@ -91,6 +113,7 @@ from datetime import datetime, timedelta, timezone
 import db
 from config import is_admin
 from rate_quote import (
+    PROVIDER_COINGECKO,
     PROVIDER_MANUAL,
     RateQuote,
     RateQuoteError,
@@ -134,6 +157,16 @@ class RateStaleError(RateUnavailableError):
 class InvalidPersistedRateError(RateQuoteError):
     """The stored row is invalid data (future/naive timestamp, bad
     text or an unapproved provider) — rejected, never treated as fresh."""
+
+
+class ManualRateBlockedError(RateStoreError):
+    """``/setrate`` attempted while the AUTOMATIC quote is fresh.
+
+    Manual updates are the EMERGENCY path only: they open once the
+    automatic provider fails to keep a fresh quote (missing or aged
+    past the TTL).  The store error carries English diagnostics; the
+    command layer renders the operator-facing Arabic message.
+    """
 
 
 # ── Connection handling (caller-owned or repository-owned) ────────────
@@ -237,7 +270,9 @@ def set_rate(
         RatePermissionError: non-admin actor (before anything is read
             or written).
         RateValidationError: malformed/zero/negative/exponent/float
-            input (nothing is written — the prior rate is intact).
+            input (nothing is written — the prior rate intact).
+        ManualRateBlockedError: the AUTOMATIC quote is still fresh —
+            manual updates are emergency-only (nothing is written).
 
     The provider is NOT a parameter: it is always ``"manual"``, so no
     caller (Telegram included) can ever select another source.  Both
@@ -251,6 +286,54 @@ def set_rate(
     captured_text = canonical_timestamp_text(captured_at)
 
     with _connection(connection, db_path=db_path, write=True) as active:
+        # ── Emergency gate ────────────────────────────────────────
+        # The manual path is CLOSED while the AUTOMATIC quote is
+        # positively fresh; it opens only when the provider failed to
+        # keep one (missing / stale / unparsable row).  Admin
+        # authorization already happened above.  The raise rolls
+        # back with zero writes (the transaction owns the outcome).
+        # The evaluated context doubles as the audit REASON logged
+        # for every accepted manual override.
+        row = active.execute(
+            "SELECT provider, captured_at FROM current_rate WHERE id = ?",
+            (SINGLETON_ID,),
+        ).fetchone()
+        manual_context = "no automatic quote on record (bootstrap)"
+        if row is not None and row["provider"] != PROVIDER_MANUAL:
+            try:
+                previous_at = datetime.fromisoformat(row["captured_at"])
+            except (TypeError, ValueError):
+                previous_at = None
+            if previous_at is None or (
+                previous_at.tzinfo is None or previous_at.utcoffset() is None
+            ):
+                manual_context = (
+                    "emergency: automatic quote capture instant is "
+                    "unparsable"
+                )
+            elif captured_at < previous_at:
+                manual_context = (
+                    "emergency: automatic quote capture instant is in "
+                    "the future (invalid row)"
+                )
+            elif captured_at - previous_at >= timedelta(
+                seconds=RATE_TTL_SECONDS
+            ):
+                age = int((captured_at - previous_at).total_seconds())
+                manual_context = (
+                    f"emergency: automatic quote stale "
+                    f"(age {age}s >= TTL {RATE_TTL_SECONDS}s)"
+                )
+            else:
+                age = int((captured_at - previous_at).total_seconds())
+                raise ManualRateBlockedError(
+                    "automatic provider quote is fresh "
+                    f"(age {age}s < TTL {RATE_TTL_SECONDS}s) — "
+                    "/setrate is emergency-only while the automatic "
+                    "source is healthy"
+                )
+        elif row is not None:
+            manual_context = "already in manual (emergency) mode"
         cursor = active.execute(
             "UPDATE current_rate "
             "SET rate_usdt_egp = ?, provider = ?, captured_at = ?, "
@@ -281,10 +364,83 @@ def set_rate(
                 ),
             )
 
-    # Audit line: canonical value + actor id only — the rate and the
-    # admin id are no secret; nothing else is ever logged.
-    logger.info("Manual rate set: rate=%s admin=%d", rate_text, admin_user_id)
+    # Audit line: canonical value + actor id + WHY the emergency path
+    # was open — the rate and the admin id are no secret, and no
+    # other financial data is ever logged.
+    logger.info(
+        "Manual rate set: rate=%s admin=%d reason=%s",
+        rate_text, admin_user_id, manual_context,
+    )
     return RateQuote(rate, PROVIDER_MANUAL, captured_at)
+
+
+def set_automatic_rate(
+    quote: RateQuote,
+    *,
+    connection: sqlite3.Connection | None = None,
+    db_path: str | None = None,
+) -> RateQuote:
+    """Persist a validated AUTOMATIC provider quote (the normal mode).
+
+    Called by ``rate_worker`` only — no admin credential is required
+    because the source is the trusted provider adapter; ``updated_by
+    = 0`` marks the system as the actor in the existing schema and
+    every write is logged (provider + capture instant).
+
+    The provider must be the approved automatic provider
+    (``coingecko``); ``captured_at`` comes from the quote itself and
+    is persisted verbatim.  A successful call OVERWRITES any manual
+    emergency quote — that is the return-to-normal path after the
+    provider recovers.  Freshness is NOT re-evaluated here: the ONE
+    staleness policy stays in ``get_current_quote`` (a quote written
+    here ages out exactly like any other).
+
+    Raises:
+        RateStoreError: not a ``RateQuote``, or a provider other
+            than the approved automatic one (nothing is written).
+    """
+    if not isinstance(quote, RateQuote):
+        raise RateStoreError("quote must be a RateQuote")
+    if quote.provider != PROVIDER_COINGECKO:
+        raise RateStoreError(
+            "automatic rate requires the CoinGecko provider"
+        )
+    rate_text = canonical_rate_text(quote.rate_usdt_egp)
+    captured_text = canonical_timestamp_text(quote.captured_at)
+    with _connection(connection, db_path=db_path, write=True) as active:
+        cursor = active.execute(
+            "UPDATE current_rate SET rate_usdt_egp = ?, provider = ?, "
+            "captured_at = ?, updated_by = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                rate_text,
+                PROVIDER_COINGECKO,
+                captured_text,
+                0,
+                captured_text,
+                SINGLETON_ID,
+            ),
+        )
+        if cursor.rowcount == 0:
+            active.execute(
+                "INSERT INTO current_rate "
+                "(id, rate_usdt_egp, provider, captured_at, "
+                " updated_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    SINGLETON_ID,
+                    rate_text,
+                    PROVIDER_COINGECKO,
+                    captured_text,
+                    0,
+                    captured_text,
+                ),
+            )
+    logger.info(
+        "Automatic rate stored: provider=%s captured_at=%s",
+        PROVIDER_COINGECKO, captured_text,
+    )
+    return quote
 
 
 # ── Read: the authoritative quote ─────────────────────────────────────
