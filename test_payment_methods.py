@@ -46,6 +46,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram import InlineKeyboardMarkup
@@ -1772,6 +1773,67 @@ class TestMinimumDepositUnits(WizardTestBase):
         self.assertEqual(_reply(denied), admin.MSG_ADMIN_ONLY)
         self.assertEqual(group.message.reply_text.call_count, 0)
         update_method.assert_not_called()
+
+    def test_repair_command_success_only_after_commit(self) -> None:
+        """Regression (merge blocker): the ✅ success message must be
+        sent only AFTER db.transaction() exits and COMMIT succeeds.
+        A simulated COMMIT failure must surface the rollback error
+        message and NEVER a false success."""
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+
+        # sqlite3.Connection is immutable, so the COMMIT failure is
+        # simulated by re-running the REAL db.transaction() generator
+        # machinery with a patched Connection factory: the open
+        # connection is a subclass whose execute() fails the one
+        # COMMIT statement — exactly the production commit path.
+        real_transaction = db.transaction
+        commit_attempts: list[str] = []
+
+        class _FailingCommitConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore
+                if sql == "COMMIT":
+                    commit_attempts.append("failed")
+                    raise sqlite3.OperationalError(
+                        "simulated COMMIT failure (disk full)"
+                    )
+                return super().execute(sql, *args, **kwargs)
+
+        @contextmanager
+        def transaction_with_failing_commit(*args, **kwargs):
+            """Re-run the REAL transaction() opening a connection
+            subclass whose COMMIT fails."""
+            real_connect = sqlite3.connect
+
+            def connect_subclass(*a, **k):
+                k.pop("factory", None)
+                return real_connect(*a, factory=_FailingCommitConnection, **k)
+
+            commit_attempts.append("entered")
+            with patch.object(sqlite3, "connect", connect_subclass):
+                with real_transaction(*args, **kwargs) as connection:
+                    yield connection
+
+        with patch.object(
+            db, "transaction", side_effect=transaction_with_failing_commit
+        ):
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        # COMMIT was attempted exactly once and refused.
+        self.assertEqual(commit_attempts, ["entered", "failed"])
+        text = _reply(response)
+        self.assertNotIn("تم حفظ الحدين والتحقق منهما", text)
+        self.assertIn("تم التراجع عن العملية", text)
+        # Nothing persisted.
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [(1, None), (2, None)],
+        )
 
     def test_approved_method_minimums_flow_through_admin_save_and_persist(
         self,

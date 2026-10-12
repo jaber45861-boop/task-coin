@@ -1383,6 +1383,9 @@ async def repair_deposit_minimums_command(update, context) -> None:
         # One transaction owned HERE and passed explicitly to every
         # store call below — a caller-owned connection is borrowed,
         # never committed/rolled back/closed by the store itself.
+        # The success reply is sent ONLY after this ``with`` block
+        # exits (i.e. after COMMIT): a commit failure rolls back and
+        # raises, so no false "saved" message can be sent.
         with db.transaction() as connection:
             prepared, problems = _prepare(connection)
             if problems:
@@ -1390,7 +1393,7 @@ async def repair_deposit_minimums_command(update, context) -> None:
                     "❌ أُوقف التطبيق قبل الكتابة:\n"
                     + "\n".join(problems)
                 )
-                return False
+                return None
             for method, _expected_asset, amount_text, _units in prepared:
                 updated = store.update_payment_method(
                     method.id,
@@ -1423,15 +1426,16 @@ async def repair_deposit_minimums_command(update, context) -> None:
                         f"Payment method #{method.id} did not verify after repair"
                     )
                 saved.append(current)
-            await message.reply_text(
-                "✅ تم حفظ الحدين والتحقق منهما:\n"
-                + "\n".join(
-                    f"#{method.id} ({method.asset}): "
-                    f"{_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
-                    for method in saved
-                )
+        # COMMIT has succeeded at this point — only now is success sent.
+        await message.reply_text(
+            "✅ تم حفظ الحدين والتحقق منهما:\n"
+            + "\n".join(
+                f"#{method.id} ({method.asset}): "
+                f"{_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
+                for method in saved
             )
-            return True
+        )
+        return True
 
     try:
         if not await _apply():

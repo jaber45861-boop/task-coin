@@ -106,6 +106,8 @@ import sqlite3
 import struct
 import threading
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telegram import InlineKeyboardMarkup, InputFile
@@ -1059,6 +1061,67 @@ class TestIdempotency:
         assert len(_deposit_ledger(env, req.request_id)) == 1
         assert _row(env, req.request_id)["external_tx_id"] == manual_tx
         assert _row(env, req.request_id)["status"] == "credited"
+
+    def test_49_photo_message_card_edits_caption_not_text(self, env):
+        """49. Regression (merge blocker): the detail card is built as
+        a PHOTO message, and in python-telegram-bot ``message.photo``
+        is a tuple of PhotoSize (never a list).  The approve and
+        reject callbacks must therefore edit the card via
+        ``edit_message_caption`` on a photo card, while a text card
+        keeps the ``edit_message_text`` fallback.  The old
+        ``isinstance(photo, list)`` guard never matched a real PTB
+        message and silently degraded every photo edit."""
+        _fund()
+        # The REAL PTB shape: tuple of PhotoSize, truthy one-element.
+        photo_sizes = ("photosize",)
+
+        # ── photo card → caption edit, never a text edit ──
+        req_a = _request(env)
+        proof_a = _new_proof(req_a.request_id)
+        approve = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_approve_callback_data(proof_a.proof_id),
+        )
+        approve.callback_query.message = SimpleNamespace(photo=photo_sizes)
+        approve.callback_query.edit_message_caption = AsyncMock()
+        approve.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(approve, _context()))
+        approve.callback_query.edit_message_caption.assert_awaited_once()
+        assert "تم اعتماد الدفع" in (
+            approve.callback_query.edit_message_caption.await_args[0][0]
+        )
+        approve.callback_query.edit_message_text.assert_not_called()
+        assert _wallet_units(env) == (FUND + AMOUNT_UNITS, 0)
+
+        # A rejection is possible on its own (still-pending) request.
+        req_b = _request(env)
+        proof_b = _new_proof(req_b.request_id)
+        reject = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_reject_callback_data(proof_b.proof_id),
+        )
+        reject.callback_query.message = SimpleNamespace(photo=photo_sizes)
+        reject.callback_query.edit_message_caption = AsyncMock()
+        reject.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(reject, _context()))
+        reject.callback_query.edit_message_caption.assert_awaited_once()
+        assert "تم رفض" in (
+            reject.callback_query.edit_message_caption.await_args[0][0]
+        )
+        reject.callback_query.edit_message_text.assert_not_called()
+
+        # ── text card (photo is None) → the text fallback stays ──
+        req_c = _request(env)
+        proof_c = _new_proof(req_c.request_id)
+        text_card = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_reject_callback_data(proof_c.proof_id),
+        )
+        text_card.callback_query.message = SimpleNamespace(photo=None)
+        text_card.callback_query.edit_message_caption = AsyncMock()
+        text_card.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(text_card, _context()))
+        text_card.callback_query.edit_message_text.assert_awaited_once()
 
 
 # ══════════════════════════════════════════════════════════════════
