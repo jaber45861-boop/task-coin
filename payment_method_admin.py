@@ -64,7 +64,6 @@ from payment_method_store import (
     PaymentMethodNotFoundError,
     PaymentMethodValidationError,
 )
-from unittest import mock as _mock
 
 logger = logging.getLogger(__name__)
 
@@ -139,12 +138,28 @@ def _format_method(method: PaymentMethod) -> str:
 
 
 def _min_deposit_display(fields: dict) -> str:
-    """Human-readable current or proposed minimum for one method."""
+    """Human-readable minimum for one method/state — the ONE shared
+    formatter.
+
+    ``None``/missing units render as not-configured.  If the asset has
+    no registered scale or the stored units are invalid, never present
+    the atomic integer as if it were an amount in the asset's currency.
+    Used by the preview/confirmation rendering, the wizard summary and
+    the /repairdepositminimums plan.
+    """
     asset = fields.get("asset", "")
     units = fields.get("min_deposit_units")
     if units is None:
-        return "لا يوجد حد أدنى"
-    return f"{asset_units.units_to_asset_decimal(units, asset)} {asset}"
+        return "غير مضبوط"
+    try:
+        return (
+            str(asset_units.units_to_asset_decimal(units, asset))
+            + (f" {asset}" if asset else "")
+        )
+    except asset_units.UnknownAssetScaleError:
+        return "غير معروض (مقياس الأصل غير مسجل)"
+    except asset_units.AssetAmountError:
+        return "غير معروض (قيمة مخزنة غير صالحة)"
 
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 
@@ -938,28 +953,6 @@ def build_wizard_summary(state: dict) -> str:
     )
 
 
-def _min_deposit_display(state: dict) -> str:
-    """Staged minimum in the staged asset's unit — never invented.
-
-    ``None`` renders as not-configured. If the asset has no registered
-    scale or the stored units are invalid, never present the atomic
-    integer as if it were an amount in the asset's currency.
-    """
-    units = state.get("min_deposit_units")
-    if units is None:
-        return "غير مضبوط"
-    try:
-        return str(
-            asset_units.units_to_asset_decimal(
-                units, state.get("asset")
-            )
-        )
-    except asset_units.UnknownAssetScaleError:
-        return "غير معروض (مقياس الأصل غير مسجل)"
-    except asset_units.AssetAmountError:
-        return "غير معروض (قيمة مخزنة غير صالحة)"
-
-
 def build_review_text(state: dict) -> str:
     return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
 
@@ -1191,11 +1184,7 @@ async def add_pm_command(update, context) -> None:
         # The interactive wizard (requested UX).  The pipe form below
         # stays byte-for-byte compatible for existing scripts.
         await _start_add_wizard(actor, message)
-        return    # Allow a single ``connection=`` to flow from admin commands that
-    # already own a transaction (for example /repairdepositminimums).
-    connection = getattr(context, "_repair_connection", None)
-    if isinstance(connection, _mock.Mock):
-        connection = None
+        return
 
     async def _run_add_pipe() -> bool:
         form = parse_add_form(body)
@@ -1213,7 +1202,6 @@ async def add_pm_command(update, context) -> None:
                 destination=destination,
                 instructions=instructions,
                 created_by=actor,
-                connection=connection,
             )
 
         except PaymentMethodValidationError as exc:
@@ -1258,14 +1246,16 @@ async def edit_pm_command(update, context) -> None:
 
     async def _run_edit_pipe():
         """Shared pipe-form path used by both /editpm and the repair
-        command so edits can run inside an existing transaction."""
+        command so edits can run inside an existing transaction.
+        Ownership stays with the caller: the repair command supplies
+        its own live transaction connection explicitly, and a plain
+        invocation opens the standard self-contained write scope."""
         parsed = parse_edit_form(body)
         if parsed is None:
             await message.reply_text(MSG_USAGE_EDIT)
             return False
         method_id, form = parsed
         category, name, asset, network, provider, destination, instructions = form
-        connection = getattr(context, "_repair_connection", None)
         try:
             updated = store.update_payment_method(
                 method_id,
@@ -1390,8 +1380,10 @@ async def repair_deposit_minimums_command(update, context) -> None:
         return
 
     async def _apply():
+        # One transaction owned HERE and passed explicitly to every
+        # store call below — a caller-owned connection is borrowed,
+        # never committed/rolled back/closed by the store itself.
         with db.transaction() as connection:
-            context._repair_connection = connection
             prepared, problems = _prepare(connection)
             if problems:
                 await message.reply_text(
