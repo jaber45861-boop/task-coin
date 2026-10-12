@@ -73,8 +73,9 @@ never rewrite an old request).
 
 - `python3 -m pytest -q` → **3810 passed, 11 skipped**, exit 0
   (full repository suite; the 11 skips predate this change).
-- Targeted suites: rate (quote/store/api/worker) 97 passed; deposit
-  (store/verification/proof/admin-control/manual-review) all passed.
+- Targeted suites: rate (quote/store/api/worker) **102 passed**,
+  exit 0; deposit (store/verification/proof/admin-control/
+  manual-review) all passed in the full run.
 - Requirement mapping lives in the test names: auto write, gate in
   normal mode, emergency path for admins only, rejected
   missing/stale/corrupt quotes, first-fetch failure, failure never
