@@ -1087,6 +1087,159 @@ class TestUI:
 
 
 # ══════════════════════════════════════════════════════════════════
+# G2. PROOF-UPLOAD BUTTON PATH (regression: silent dead button)
+# ══════════════════════════════════════════════════════════════════
+
+
+def _slice(deposit: str, start: str, end: str) -> str:
+    """Source between two anchors (the JS is plain, top-level ordered)."""
+    return deposit[deposit.index(start):deposit.index(end)]
+
+
+class TestProofUploadUI:
+    """The «إرسال إثبات الدفع» button must actually fire its upload,
+    report only server-confirmed success, and recover from every
+    failure.  Root cause of the production incident: `_submit()`
+    left the shared `busy` lock true after a SUCCESSFUL create, so
+    `_uploadProof()`'s `if (busy) return;` guard silently swallowed
+    every click on the proof button of that receipt."""
+
+    def test_49_create_success_releases_lock_before_receipt(self):
+        """49. REGRESSION: the create-success path resets `busy`
+        BEFORE rendering the created panel — otherwise the proof
+        button on that receipt is dead (its handler returns on the
+        still-true lock and never contacts the server)."""
+        deposit = _read_js("deposit.js")
+        submit_body = _slice(
+            deposit, "async function _submit()",
+            "/* ── Created (ALWAYS pending",
+        )
+        # Exactly one successful-create render…
+        assert submit_body.count("_renderCreated(data.request") == 1
+        # …and the lock is released on EVERY exit: HTTP error,
+        # success, and thrown/network failure.
+        assert submit_body.count("busy = false;") == 3
+        render = submit_body.index("_renderCreated(data.request")
+        # The SUCCESS branch must release the lock right BEFORE the
+        # receipt panel swap: the last `busy` mutation preceding the
+        # render is a release, and nothing re-takes it in between.
+        prefix = submit_body[:render]
+        last_release = prefix.rindex("busy = false;")
+        between = prefix[last_release:]
+        assert "busy = true;" not in between
+        assert between.count("busy = false;") == 1
+        assert "catch (err)" in submit_body
+
+    def test_50_proof_button_wired_and_guards_duplicate(self):
+        """50. The receipt wires the proof button to `_uploadProof`,
+        which refuses re-entry while an upload is in flight (the
+        shared lock) and disables the button during that window."""
+        deposit = _read_js("deposit.js")
+        assert (
+            "'[data-testid=\"deposit-proof-submit\"]'" in deposit
+            and "_uploadProof(request)" in deposit
+        )
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        # Duplicate-submission guard: the lock is taken first…
+        assert proof.index("if (busy) {") < proof.index("busy = true;")
+        # …the button is disabled for the whole flight…
+        assert "button.disabled = true" in proof
+        # …and only re-enabled when the server did NOT confirm.
+        assert proof.count("button.disabled = false") == 2
+
+    def test_51_no_file_shows_error_and_sends_nothing(self):
+        """51. With no file chosen the user gets a clear message and
+        NO upload is attempted (the fetch is never reached)."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        nofile = proof[:proof.index("busy = true;")]
+        assert "if (!file)" in nofile
+        assert "اختر صورة إثبات الدفع أولاً" in nofile
+        assert "_proofError" in nofile
+        assert "fetch(" not in nofile      # nothing is sent
+
+    def test_52_upload_posts_expected_fields_only(self):
+        """52. The upload sends exactly the server-expected
+        `request_id` form field plus the file under `file`, with the
+        initData header and NO JSON content-type (multipart needs
+        the browser-set boundary)."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert "form.append('request_id', request.request_id)" in proof
+        assert "form.append('file', file)" in proof
+        assert "headers[INIT_DATA_HEADER] = _initData()" in proof
+        # No user id / amount / status is ever uploaded from here.
+        for forbidden in ("user_id", "amount", "status"):
+            assert f"form.append('{forbidden}'" not in proof
+        # Server side reads the same names.
+        routes = open("deposit_routes.py", encoding="utf-8").read()
+        assert 'request.form.get("request_id")' in routes
+        assert 'request.files.get("file")' in routes
+
+    def test_53_success_claim_only_when_server_confirms(self):
+        """53. The review-pending success claim is rendered only on
+        an ok response with `ok: true`; an HTTP failure, a malformed
+        body, or a thrown/network error shows the error path instead
+        and re-enables the button."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert "if (!response.ok || !data.ok)" in proof
+        # The single success render sits inside the else-branch only.
+        after_guard = proof[proof.index("if (!response.ok || !data.ok)"):]
+        assert after_guard.count("_renderProofSent(data.message)") == 1
+        assert "catch (err)" in proof
+        assert "_proofError(_messageFor(null))" in proof   # network fail
+        assert "_proofError(_messageFor(data))" in proof   # HTTP fail
+
+    def test_54_unsupported_file_rejected_by_server_contract(self):
+        """54. File type/size validation stays SERVER-side (magic
+        bytes, bounded size) and the client surfaces the server's
+        Arabic message verbatim — the UI never pre-accepts a file."""
+        deposit = _read_js("deposit.js")
+        assert "unsupported_image_type" in deposit       # error map
+        assert "file_too_large" in deposit
+        # The client does not filter by extension/MIME before send.
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert ".type" not in proof
+        assert ".name" not in proof
+        routes = open("deposit_routes.py", encoding="utf-8").read()
+        assert "probe_image" in routes                  # magic bytes
+        assert "MAX_IMAGE_BYTES" in routes
+
+    def test_55_deposit_creation_behavior_unchanged(self):
+        """55. The fix touched ONLY the lock release: the create
+        request still posts the same body, the same header and the
+        same URL, and never claims credit."""
+        deposit = _read_js("deposit.js")
+        submit_body = _slice(
+            deposit, "async function _submit()",
+            "/* ── Created (ALWAYS pending",
+        )
+        assert "const CREATE_URL = '/api/deposit'" in deposit
+        assert "payment_method_id: method.id" in submit_body
+        assert "amount: amount" in submit_body
+        assert "headers: _headers()" in submit_body
+        # No success claim beyond the server-provided pending text.
+        for claim in ("تمت إضافة", "credited", "تم الإيداع بنجاح"):
+            assert claim not in submit_body
+
+
+# ══════════════════════════════════════════════════════════════════
 # H. PER-ASSET MINIMUM / SCALE (39–47)
 # ══════════════════════════════════════════════════════════════════
 
@@ -1233,6 +1386,53 @@ class TestPerAssetMinimums:
         assert deposit_proof_admin._amount_text(request) == (
             "1.50000000 USDT"
         )
+
+    def test_48_receipt_currency_is_the_request_asset(
+        self, client, env
+    ):
+        """48. The receipt currency is ALWAYS the API's
+        request.asset: an EGP request shows EGP (2 dp), a USDT
+        request shows USDT (8 dp), and a missing asset degrades to
+        the amount ALONE — never a default USDT and never the
+        literal 'undefined'.  The amount text keeps the asset's
+        registered scale (server-rendered, never reformatted here)."""
+        pm = _make_pm(env)          # USDT, min 1 USDT
+        usdt = _post(
+            client, _payload(pm.id, "1.5")
+        ).get_json()["request"]
+        assert usdt["asset"] == "USDT"
+        assert usdt["amount"] == "1.50000000"   # 8-dp USDT scale
+
+        egp = self._make_egp_pm(env)
+        egp_request = _post(
+            client, _payload(egp.id, "50")
+        ).get_json()["request"]
+        assert egp_request["asset"] == "EGP"
+        assert egp_request["amount"] == "50.00"  # 2-dp EGP scale
+
+        deposit = _read_js("deposit.js")
+        # Receipt: server-rendered amount + the API-provided asset.
+        assert (
+            "${_esc(request.amount)} ${_esc(request.asset)}" in deposit
+        )
+        # No currency string literal anywhere in the deposit panel —
+        # the unit is only ever server data (prose in comments and
+        # the Arabic error map is not a currency literal).
+        assert "'USDT'" not in deposit
+        assert '\"USDT\"' not in deposit
+        assert "EGP" not in deposit   # EGP appears only via the API
+        # Missing-asset safety: ONE helper decides every currency
+        # label and degrades to '' — never 'undefined'/'null'.
+        assert "function _assetLabel(" in deposit
+        assert "_assetLabel(method.asset)" in deposit
+        assert "_assetLabel(first.asset)" in deposit
+        assert ".textContent = method.asset" not in deposit
+        # The composition never invents "undefined · NETWORK".
+        composition = deposit[
+            deposit.index("function _composition("):
+            deposit.index("function _buildShell(")
+        ]
+        assert "${method.asset}" not in composition
 
 
 if __name__ == "__main__":

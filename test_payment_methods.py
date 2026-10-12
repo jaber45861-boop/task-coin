@@ -1797,6 +1797,23 @@ class TestMinimumDepositUnits(WizardTestBase):
         self.assertEqual(method.asset, "WZNEWASSET")
         self.assertIsNone(method.min_deposit_units)
 
+    def test_save_with_unset_minimum_warns_admin(self) -> None:
+        """A save that leaves the minimum unconfigured (settings
+        incomplete) tells the admin clearly, in the save
+        confirmation itself, that deposits stay refused — the
+        warning names the problem and the consequence."""
+        mid = self._create()  # minimum never configured
+        self._open(mid)
+        saved = self._press_w("pm:wsave")
+        text = _edited(saved.callback_query)
+        self.assertIn(f"تم تعديل الوسيلة #{mid}", text)
+        self.assertIn("⚠️ الحد الأدنى للإيداع غير مضبوط", text)
+        self.assertIn("الإيداع مرفوض حتى تضبطه", text)
+        # The warning never fabricates a value or silently enables
+        # deposits: the row is saved with the minimum still unset.
+        self.assertIsNone(self._method(mid).min_deposit_units)
+        self.assertFalse(self._method(mid).deposits_enabled)
+
     def test_enabling_deposits_requires_min(self) -> None:
         """Decision 10: with no minimum the enable flag is refused at
         the store AND on the pm:depon callback — the row stays
@@ -1995,6 +2012,24 @@ class TestBotRegistrations(unittest.TestCase):
             ]
             self.assertEqual(len(matches), 1, f"one /{name} handler")
             self.assertIs(matches[0].callback, callback)
+
+    def test_repair_command_not_shipped(self) -> None:
+        """Release exclusion: the /repairdepositminimums admin
+        command (function + registration) is deliberately NOT part
+        of the shipped bot — no handler registers it and neither
+        bot.py nor the payment-method store defines it."""
+        from telegram.ext import CommandHandler
+
+        captured = self._capture_main_handlers()
+        for handler, _group in captured:
+            if isinstance(handler, CommandHandler):
+                self.assertNotIn(
+                    "repairdepositminimums", handler.commands
+                )
+        for path in ("bot.py", "payment_method_store.py"):
+            source = open(path, encoding="utf-8").read()
+            self.assertNotIn("repairdepositminimums", source, path)
+            self.assertNotIn("repair_deposit_minimums", source, path)
 
     def test_callback_family_registered(self) -> None:
         from telegram.ext import CallbackQueryHandler
