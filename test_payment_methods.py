@@ -1616,6 +1616,163 @@ class TestMinimumDepositUnits(WizardTestBase):
         fields.update(overrides)
         return store.update_payment_method(method_id, **fields)
 
+    def _run_approved_minimum_repair(
+        self,
+        text: str = "/repairdepositminimums",
+        *,
+        admin_id: int = ADMIN_A,
+        chat_type: str = "private",
+        chat_id: int | None = None,
+    ) -> MagicMock:
+        update = _update(
+            admin_id,
+            text,
+            chat_type=chat_type,
+            chat_id=chat_id,
+        )
+        _run(admin.repair_deposit_minimums_command(update, MagicMock()))
+        return update
+
+    def test_repair_command_previews_without_writing(self) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+
+        preview = self._run_approved_minimum_repair()
+
+        self.assertIn("معاينة فقط", _reply(preview))
+        self.assertIn("50.00", _reply(preview))
+        self.assertIn("1.00000000", _reply(preview))
+        saved = self._raw(
+            "SELECT id, min_deposit_units, updated_by "
+            "FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [(1, None), (2, None)],
+        )
+
+    def test_repair_command_confirms_via_existing_save_path_atomically(
+        self,
+    ) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+
+        with patch.object(
+            store,
+            "update_payment_method",
+            wraps=store.update_payment_method,
+        ) as update_method:
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("تم حفظ الحدين والتحقق منهما", _reply(response))
+        self.assertEqual(update_method.call_count, 2)
+        expected = ((1, "EGP", "50"), (2, "USDT", "1"))
+        connection = update_method.call_args_list[0].kwargs["connection"]
+        for call, (method_id, asset, amount) in zip(
+            update_method.call_args_list, expected
+        ):
+            self.assertEqual(call.args[0], method_id)
+            self.assertEqual(call.kwargs["asset"], asset)
+            self.assertEqual(call.kwargs["min_deposit_units"], amount)
+            self.assertEqual(call.kwargs["updated_by"], ADMIN_A)
+            self.assertIs(call.kwargs["connection"], connection)
+
+        saved = self._raw(
+            "SELECT id, asset, min_deposit_units, updated_by, is_active, "
+            "deposits_enabled FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["asset"],
+                    row["min_deposit_units"],
+                    row["updated_by"],
+                    row["is_active"],
+                    row["deposits_enabled"],
+                )
+                for row in saved
+            ],
+            [
+                (1, "EGP", 5000, ADMIN_A, 1, 0),
+                (2, "USDT", 100000000, ADMIN_A, 1, 0),
+            ],
+        )
+
+    def test_repair_command_preflights_both_assets_before_writing(self) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+        self._update_row(2, asset="EGP")
+
+        with patch.object(
+            store,
+            "update_payment_method",
+            wraps=store.update_payment_method,
+        ) as update_method:
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("الأصل الحالي EGP", _reply(response))
+        update_method.assert_not_called()
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [(1, None), (2, None)],
+        )
+
+    def test_repair_command_rolls_back_both_methods_on_store_failure(
+        self,
+    ) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+        original_update = store.update_payment_method
+
+        def fail_on_second(method_id, **kwargs):
+            if method_id == 2:
+                raise RuntimeError("simulated write failure")
+            return original_update(method_id, **kwargs)
+
+        with patch.object(
+            store, "update_payment_method", side_effect=fail_on_second
+        ):
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("تم التراجع عن العملية", _reply(response))
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [(1, None), (2, None)],
+        )
+
+    def test_repair_command_is_admin_only_and_private_only(self) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+
+        with patch.object(
+            store, "update_payment_method", wraps=store.update_payment_method
+        ) as update_method:
+            denied = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY", admin_id=STRANGER
+            )
+            group = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY",
+                chat_type="supergroup",
+                chat_id=-1009,
+            )
+
+        self.assertEqual(_reply(denied), admin.MSG_ADMIN_ONLY)
+        self.assertEqual(group.message.reply_text.call_count, 0)
+        update_method.assert_not_called()
+
     def test_approved_method_minimums_flow_through_admin_save_and_persist(
         self,
     ) -> None:
@@ -2003,6 +2160,7 @@ class TestBotRegistrations(unittest.TestCase):
             "paymethods": admin.paymethods_command,
             "addpm": admin.add_pm_command,
             "editpm": admin.edit_pm_command,
+            "repairdepositminimums": admin.repair_deposit_minimums_command,
         }
         for name, callback in expected.items():
             matches = [
@@ -2013,23 +2171,42 @@ class TestBotRegistrations(unittest.TestCase):
             self.assertEqual(len(matches), 1, f"one /{name} handler")
             self.assertIs(matches[0].callback, callback)
 
-    def test_repair_command_not_shipped(self) -> None:
-        """Release exclusion: the /repairdepositminimums admin
-        command (function + registration) is deliberately NOT part
-        of the shipped bot — no handler registers it and neither
-        bot.py nor the payment-method store defines it."""
+    def test_repair_command_registered(self) -> None:
         from telegram.ext import CommandHandler
 
         captured = self._capture_main_handlers()
-        for handler, _group in captured:
-            if isinstance(handler, CommandHandler):
-                self.assertNotIn(
-                    "repairdepositminimums", handler.commands
-                )
-        for path in ("bot.py", "payment_method_store.py"):
-            source = open(path, encoding="utf-8").read()
-            self.assertNotIn("repairdepositminimums", source, path)
-            self.assertNotIn("repair_deposit_minimums", source, path)
+        matches = [
+            h
+            for h, _g in captured
+            if isinstance(h, CommandHandler)
+            and "repairdepositminimums" in h.commands
+        ]
+        self.assertEqual(len(matches), 1, "exactly one /repairdepositminimums handler")
+        self.assertIs(
+            matches[0].callback,
+            admin.repair_deposit_minimums_command,
+            "handler is the admin command"
+        )
+
+
+    def test_repair_command_is_registered(self) -> None:
+        """After integration: bot.py registers /repairdepositminimums
+        exactly once and connects it to the admin command."""
+        from telegram.ext import CommandHandler
+
+        captured = self._capture_main_handlers()
+        matches = [
+            h
+            for h, _g in captured
+            if isinstance(h, CommandHandler)
+            and "repairdepositminimums" in h.commands
+        ]
+        self.assertEqual(len(matches), 1, "exactly one /repairdepositminimums handler")
+        self.assertIs(
+            matches[0].callback,
+            admin.repair_deposit_minimums_command,
+            "handler is the admin command"
+        )
 
     def test_callback_family_registered(self) -> None:
         from telegram.ext import CallbackQueryHandler

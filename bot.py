@@ -2036,6 +2036,14 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "editpm", payment_method_admin.edit_pm_command,
     ), group=0)
+    # MT-ADMIN-08b: emergency deposit minimum repair — private admin
+    #    chat ONLY.  First invocation is read-only; the admin must
+    #    explicitly repeat with APPLY to write the approved minimums to
+    #    payment methods #1 and #2 inside one transaction.
+    app.add_handler(CommandHandler(
+        "repairdepositminimums",
+        payment_method_admin.repair_deposit_minimums_command,
+    ), group=0)
     # MT-ADMIN-26: /setrate — authoritative manual EGP-per-USDT rate.
     #    Private admin chat ONLY; authorization is enforced inside the
     #    handler (config.is_admin) and the rate is validated by the
