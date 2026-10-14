@@ -571,9 +571,11 @@ def account_summary():
 
     Every figure comes from an existing source of truth:
 
-    - ``wallet.availableUnits`` — ``wallets.available_units``
-      (a user without a wallet row reads as a real zero, the
-      wallet service's documented contract — never "unknown")
+    - ``wallet`` — ``null`` when the caller has no wallet row
+      (never had a wallet created), else
+      ``{"availableUnits": <int>}`` with the exact
+      ``wallets.available_units`` — a wallet that exists with a
+      zero balance is a real zero, never "unknown".
     - ``stats.completedTasks`` / ``stats.inProgressTasks`` —
       the caller's own ``user_tasks`` rows
     - ``stats.earnedUnits`` — the ledger's ``credit``/``task``
@@ -607,10 +609,12 @@ def account_summary():
                 "username": user.get("username"),
                 "firstName": user.get("first_name"),
             },
-            "wallet": {
-                "availableUnits":
-                    summary["wallet"]["available_units"],
-            },
+            "wallet": (
+                {"availableUnits":
+                    summary["wallet"]["available_units"]}
+                if summary["wallet"] is not None
+                else None
+            ),
             "stats": {
                 "completedTasks":
                     summary["stats"]["completed_tasks"],

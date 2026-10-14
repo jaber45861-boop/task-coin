@@ -47,18 +47,38 @@ _EARNINGS_ENTRY_TYPE = "credit"
 _EARNINGS_REFERENCE_TYPE = "task"
 
 
+def _user_has_wallet(user_id: int) -> bool:
+    """True when the user has a wallet row.
+
+    A user without a wallet row has no balance at all —
+    distinct from a wallet that exists with a zero balance.
+    """
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
 def load_summary(user_id: int) -> dict:
     """The caller's own read-only account figures.
 
     Returns:
         {
-            "wallet": {"available_units": int},
+            "wallet": {"available_units": int} | null,
             "stats": {
                 "completed_tasks": int,
                 "in_progress_tasks": int,
                 "earned_units": int,
             },
         }
+
+    ``wallet`` is ``null`` when the user has no wallet row at all
+    (never had a wallet created).  When the user has a wallet —
+    even with a zero balance — ``wallet`` is
+    ``{"available_units": <int>}`` with the real available_units
+    from ``wallets.available_units``.
 
     All money is integer USDT units (1 USDT = 100,000,000
     units).  A user with no wallet, no tasks and no earnings
@@ -69,7 +89,9 @@ def load_summary(user_id: int) -> dict:
             (the transport guarantees an existing user).
         InvalidLedgerEntryError: malformed user_id.
     """
-    available_units = wallet.wallet_units(user_id).available_units
+    wallet_data = None if not _user_has_wallet(user_id) else {
+        "available_units": wallet.wallet_units(user_id).available_units,
+    }
 
     rows = db.list_user_tasks(user_id)
     completed_tasks = sum(
@@ -89,7 +111,7 @@ def load_summary(user_id: int) -> dict:
     )
 
     return {
-        "wallet": {"available_units": available_units},
+        "wallet": wallet_data,
         "stats": {
             "completed_tasks": completed_tasks,
             "in_progress_tasks": in_progress_tasks,

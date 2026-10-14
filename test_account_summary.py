@@ -267,7 +267,8 @@ class TestAuthentication:
         assert data["user"]["id"] == USER_A
         assert data["stats"]["completedTasks"] == 0
         assert data["stats"]["earnedUnits"] == 0
-        assert data["wallet"]["availableUnits"] == 0
+        # USER_A has no wallet row — never USER_B's balance.
+        assert data["wallet"] is None
 
 
 # ════════════════════════════════════════════════════════════
@@ -276,12 +277,23 @@ class TestAuthentication:
 
 
 class TestBalance:
-    def test_no_wallet_reads_as_a_real_zero(self, client):
-        """A user without a wallet row has a REAL zero balance —
-        the wallet service contract — not an unknown value."""
+    def test_no_wallet_reads_as_null(self, client):
+        """A user without a wallet row has wallet == null on /api/me —
+        the explicit "no wallet" representation, distinct from a
+        wallet that exists with a zero balance."""
         response = client.get("/api/me", headers=_auth())
         assert response.status_code == 200
-        assert response.get_json()["wallet"]["availableUnits"] == 0
+        data = response.get_json()
+        assert data["wallet"] is None
+
+    def test_wallet_with_zero_balance_reads_as_zero(self, client):
+        """A wallet row that exists with a real zero balance is a
+        real zero — {"availableUnits": 0}, never null."""
+        wallet.ensure_wallet(USER_A)
+        response = client.get("/api/me", headers=_auth())
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["wallet"] == {"availableUnits": 0}
 
     def test_available_balance_is_exact(self, client):
         wallet.ensure_wallet(USER_A)
@@ -422,7 +434,7 @@ class TestServiceComposition:
 
     def test_service_shape_and_real_zeros(self, env):
         assert load_summary(USER_A) == {
-            "wallet": {"available_units": 0},
+            "wallet": None,
             "stats": {
                 "completed_tasks": 0,
                 "in_progress_tasks": 0,
@@ -457,6 +469,10 @@ class TestServiceComposition:
 
 class TestResponseShape:
     def test_safe_fields_only(self, client):
+        # An existing wallet so the wallet object's exact field set
+        # is observable (the no-wallet shape is null — pinned by
+        # test_no_wallet_reads_as_null).
+        wallet.ensure_wallet(USER_A)
         response = client.get("/api/me", headers=_auth())
         data = response.get_json()
         assert data["ok"] is True
@@ -514,7 +530,9 @@ class TestSourceContract:
 
     def test_service_composes_only_existing_read_apis(self):
         """The service reads ONLY through the existing
-        services' public read APIs — no SQL of its own, no
+        services' public read APIs plus one read-only wallet-row
+        existence probe (SELECT only — the distinction between
+        "no wallet" and "zero balance" has no public API), no
         mutation call, no money logic."""
         with open("account_summary.py", "r", encoding="utf-8") as fh:
             source = fh.read()
