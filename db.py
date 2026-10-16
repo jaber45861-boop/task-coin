@@ -1802,16 +1802,16 @@ def validate_repeat_policy(repeat_policy, repeat_hours) -> tuple[str, int | None
     if repeat_policy is None:
         repeat_policy = REPEAT_POLICY_ONE_TIME
     if not isinstance(repeat_policy, str) or repeat_policy not in REPEAT_POLICIES:
-        raise ValueError(f"invalid repeat_policy: {repeat_policy!r}")
+        raise ValueError("سياسة تكرار غير صالحة.")
     if repeat_hours is not None:
         if isinstance(repeat_hours, bool) or not isinstance(repeat_hours, int):
-            raise ValueError("repeat_hours must be an integer")
+            raise ValueError("اختر فاصل تكرار صالحًا.")
     if repeat_policy == REPEAT_POLICY_ONE_TIME:
         if repeat_hours is not None:
-            raise ValueError("repeat_hours is only valid for repeatable tasks")
+            raise ValueError("فاصل التكرار لا يُستخدم مع المهام مرة واحدة.")
     else:
         if repeat_hours is None or repeat_hours < 1:
-            raise ValueError("repeatable tasks require repeat_hours >= 1")
+            raise ValueError("اختر فاصل تكرار صالحًا.")
     return repeat_policy, repeat_hours
 
 

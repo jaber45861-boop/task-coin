@@ -295,6 +295,23 @@ class TestRepeatConstraints:
                 repeat_policy="one_time", repeat_hours=5,
             )
 
+    def test_validation_error_messages_are_arabic(self, path):
+        """No technical English leaks to the user-facing error text."""
+        with pytest.raises(ValueError, match="اختر فاصل تكرار صالحًا"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="repeatable", repeat_hours="24",
+            )
+        with pytest.raises(ValueError, match="فاصل التكرار لا يُستخدم"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="one_time", repeat_hours=5,
+            )
+        with pytest.raises(ValueError, match="سياسة تكرار غير صالحة"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="banana",
+            )
     def test_db_check_rejects_orphan_hours(self, path):
         """Direct SQL cannot bypass the cross-column CHECK."""
         with sqlite3.connect(path) as conn, pytest.raises(

@@ -717,3 +717,64 @@ class TestRateLimit:
         assert "task_request_rate_limit" not in inspect.getsource(
             task_request_store
         )
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28 (repeat_hours fix only): supported intervals [1, 3, 6, 12, 24]
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRepeatIntervals:
+    @pytest.mark.parametrize("hours", [1, 3, 6, 12, 24])
+    def test_all_supported_intervals_accepted(self, client, hours):
+        """كل فاصل مدعوم من قائمة الاختيار يُنشأ الطلب بنجاح (200)."""
+        response = self._post(client, repeat_policy="repeatable", repeat_hours=hours)
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+    def test_every_hour_is_stored_as_sent(self, client):
+        """القيمة تُخزّن كما أُُرسلت (عدد صحيح)، لا تُستبدل بالنص المعروض."""
+        created = _create(client, repeat_policy="repeatable", repeat_hours=24)
+        assert created["repeat_policy"] == "repeatable"
+        assert created["repeat_hours"] == 24
+        assert isinstance(created["repeat_hours"], int)
+
+    def test_one_time_without_hours_is_accepted(self, client):
+        """السياسة one_time لا تفرض فاصل تكرار — العقد الحالي للـ API."""
+        assert self._post(client).status_code == 200
+        assert self._post(client, repeat_policy="one_time").status_code == 200
+
+    def test_one_time_with_hours_is_rejected(self, client):
+        """one_time مع repeat_hours مرفوضة وفقًا للعقد الحالي."""
+        assert self._post(client, repeat_policy="one_time", repeat_hours=6).status_code == 400
+
+    @pytest.mark.parametrize("bad", ["1", "01", 1.5, 2.5, True, None])
+    def test_repeat_hours_must_be_strict_integer(self, client, bad):
+        """النص، الكسر، المنطق، والقيمة الناقصة مرفوضة — لا تحويل متساهل."""
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=bad).status_code == 400
+
+    def test_unsupported_integer_interval_rejected(self, client):
+        """عدد صحيح غير مدرج في القائمة [1, 3, 6, 12, 24] مرفوض."""
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=5).status_code == 400
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=48).status_code == 400
+
+    def test_repeat_error_message_is_localized_arabic(self, client):
+        """رسالة الخطأ مترجمة للعربية، لا تُعرض العبارة التقنية الإنجليزية."""
+        response = self._post(client, repeat_policy="repeatable", repeat_hours=5)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["ok"] is False
+        assert "اختر فاصل تكرار صالحًا" in data["message"]
+
+    def test_one_time_hours_error_message_is_localized_arabic(self, client):
+        response = self._post(client, repeat_policy="one_time", repeat_hours=6)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "فاصل التكرار لا يُستخدم" in data["message"]
+
+    @staticmethod
+    def _post(client, **overrides):
+        return client.post(
+            "/api/task-requests",
+            headers=_auth(),
+            json=_payload(**overrides),
+        )

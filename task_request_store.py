@@ -74,7 +74,10 @@ REQUEST_STATUSES = (
 # Fields a proposal may carry (client-sent keys are validated against
 # exactly this set — status/user_id/history and friends are rejected).
 PAYLOAD_FIELDS = ("title", "description", "provider", "action",
-                  "target_ref", "reward")
+                  "target_ref", "reward",
+                  # repeat_policy is always sent by the mini app; repeat_hours
+                  # only when repeatable (one_time keeps legacy contract).
+                  "repeat_policy", "repeat_hours")
 # Admin-editable fields exposed by the Telegram review surface.
 ADMIN_EDITABLE_FIELDS = ("title", "description", "target_ref", "reward")
 
@@ -119,6 +122,22 @@ class TaskRequest:
     def reward(self) -> int:
         """Whole-USDT compatibility/display value (int math only)."""
         return whole_usdt_reward(self.reward_units)
+
+    @property
+    def repeat_policy(self):
+        return self.payload.get("repeat_policy") or db.REPEAT_POLICY_ONE_TIME
+
+    @property
+    def repeat_hours(self):
+        return self.payload.get("repeat_hours")
+
+    @property
+    def max_executions(self):
+        return self.payload.get("max_executions")
+
+    @property
+    def reservation_minutes(self):
+        return self.payload.get("reservation_minutes")
 
 
 def _row_to_request(row: sqlite3.Row | None) -> TaskRequest | None:
@@ -189,10 +208,14 @@ def validate_payload(raw: object) -> dict:
             "حقول غير مسموحة في طلب المهمة: "
             + ", ".join(sorted(str(k) for k in unknown))
         )
-    # target_ref is optional (may be empty/absent); all others required.
+    # target_ref, repeat_policy and repeat_hours are optional:
+    #   * target_ref may be empty/absent
+    #   * repeat_policy defaults to one_time when absent
+    #   * repeat_hours is only sent for repeatable tasks; one_time omits it
+    _optional = ("target_ref", "repeat_policy", "repeat_hours")
     absent = [
         f for f in PAYLOAD_FIELDS
-        if f != "target_ref" and f not in raw
+        if f not in _optional and f not in raw
     ]
     if absent:
         raise TaskRequestError(
@@ -228,6 +251,21 @@ def validate_payload(raw: object) -> dict:
     except ValueError as exc:
         raise TaskRequestError(str(exc).lstrip("❌ ")) from exc
 
+    # MT-TASK-28: validate repeat policy / hours using the existing
+    # server-side validator, then enforce the mini app's allowed
+    # intervals [1, 3, 6, 12, 24].  one_time keeps the existing
+    # contract: no hours, and no repetition value is forced on it.
+    try:
+        repeat_policy, repeat_hours = db.validate_repeat_policy(
+            raw.get("repeat_policy"), raw.get("repeat_hours")
+        )
+    except ValueError as exc:
+        raise TaskRequestError(str(exc)) from exc
+
+    SUPPORTED_INTERVALS = (1, 3, 6, 12, 24)
+    if repeat_policy == db.REPEAT_POLICY_REPEATABLE and repeat_hours not in SUPPORTED_INTERVALS:
+        raise TaskRequestError("اختر فاصل تكرار صالحًا.")
+
     return {
         "title": title,
         "description": description,
@@ -235,6 +273,8 @@ def validate_payload(raw: object) -> dict:
         "action": action,
         "target_ref": target_ref,
         "reward_units": reward_units,
+        "repeat_policy": repeat_policy,
+        "repeat_hours": repeat_hours,
     }
 
 

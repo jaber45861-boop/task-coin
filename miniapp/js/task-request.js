@@ -312,6 +312,28 @@ const TaskRequestUI = (() => {
                        inputmode="decimal" autocomplete="off"
                        data-testid="taskreq-reward" placeholder="0.5">
             </div>
+            <div class="taskreq-field">
+                <label class="taskreq-label" for="taskreq-repeat-policy">سياسة التكرار</label>
+                <select class="taskreq-select" id="taskreq-repeat-policy"
+                        data-testid="taskreq-repeat-policy">
+                    <option value="one_time">مرة واحدة لكل مستخدم</option>
+                    <option value="repeatable">قابلة للتكرار</option>
+                </select>
+            </div>
+            <div class="taskreq-field" data-testid="taskreq-repeat-hours-field"
+                 hidden>
+                <label class="taskreq-label" for="taskreq-repeat-hours">
+                    فاصل التكرار (ساعات)
+                </label>
+                <select class="taskreq-select" id="taskreq-repeat-hours"
+                        data-testid="taskreq-repeat-hours">
+                    <option value="1">كل ساعة</option>
+                    <option value="3">كل 3 ساعات</option>
+                    <option value="6">كل 6 ساعات</option>
+                    <option value="12">كل 12 ساعة</option>
+                    <option value="24">كل 24 ساعة</option>
+                </select>
+            </div>
             <div class="taskreq-error" data-testid="taskreq-form-error"
                  hidden></div>
             <button type="button" class="taskreq-submit"
@@ -323,6 +345,7 @@ const TaskRequestUI = (() => {
         _renderList();
         _fillProviderOptions();
         _wireProviderFilter();
+        _wireRepeatToggle();
         _applyEditMode();
         overlay.querySelector('[data-testid="taskreq-submit"]')
             .addEventListener('click', _submit);
@@ -405,6 +428,24 @@ const TaskRequestUI = (() => {
             .addEventListener('change', () => {
                 _fillActionOptions();
             });
+    }
+
+    /** The repeat interval applies to repeatable tasks only. */
+    function _wireRepeatToggle() {
+        const select = overlay.querySelector(
+            '[data-testid="taskreq-repeat-policy"]'
+        );
+        const field = overlay.querySelector(
+            '[data-testid="taskreq-repeat-hours-field"]'
+        );
+        if (!select || !field) {
+            return;
+        }
+        const apply = () => {
+            field.hidden = select.value !== 'repeatable';
+        };
+        select.addEventListener('change', apply);
+        apply();
     }
 
     function _setField(testid, value) {
@@ -508,13 +549,27 @@ const TaskRequestUI = (() => {
             provider: _field('taskreq-provider'),
             action: _field('taskreq-action'),
             target_ref: _field('taskreq-target').trim(),
-            reward: _field('taskreq-reward').trim()
+            reward: _field('taskreq-reward').trim(),
+            repeat_policy: _field('taskreq-repeat-policy')
         };
 
         // Quick feedback only — the server is authoritative.
         if (!payload.title || !payload.description || !payload.reward) {
             _formError('أدخل عنوان المهمة ووصفها والمكافأة');
             return;
+        }
+        // The interval applies to repeatable tasks only, so it is sent
+        // only then — a one_time task must never carry repeat_hours
+        // (the server rejects that combination).  Send a strict integer:
+        // the <select> options carry fixed numeric values, so coercion
+        // here is safe and never accepts an invalid choice.
+        if (payload.repeat_policy === 'repeatable') {
+            const hours = Number(_field('taskreq-repeat-hours'));
+            if (!Number.isInteger(hours) || ![1, 3, 6, 12, 24].includes(hours)) {
+                _formError('اختر فاصل تكرار صالحًا.');
+                return;
+            }
+            payload.repeat_hours = hours;
         }
 
         _haptic();

@@ -87,6 +87,10 @@ class TestValidation:
             "action": "follow",
             "target_ref": "https://instagram.com/example",
             "reward_units": 50_000_000,
+            # MT-TASK-28 (repeat_hours fix): repeat policy defaults to
+            # one_time and hours to None when not supplied.
+            "repeat_policy": "one_time",
+            "repeat_hours": None,
         }
         assert [e["event"] for e in request.history] == ["submitted"]
 
@@ -472,3 +476,39 @@ class TestApproval:
         assert spec.reward == 0
         assert spec.reward_units == 50_000_000
         assert spec.target == {"ref": VALID["target_ref"]}
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28 (repeat_hours fix only): supported intervals [1, 3, 6, 12, 24]
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRepeatIntervals:
+    @pytest.mark.parametrize("hours", [1, 3, 6, 12, 24])
+    def test_supported_intervals_accepted(self, env, hours):
+        request = _create(repeat_policy="repeatable", repeat_hours=hours)
+        assert request.payload["repeat_policy"] == "repeatable"
+        assert request.payload["repeat_hours"] == hours
+        assert isinstance(request.payload["repeat_hours"], int)
+
+    def test_one_time_without_hours_keeps_legacy_contract(self, env):
+        request = _create()
+        assert request.payload["repeat_policy"] == "one_time"
+        assert request.payload["repeat_hours"] is None
+
+    def test_one_time_with_hours_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="فاصل التكرار"):
+            _create(repeat_policy="one_time", repeat_hours=6)
+
+    @pytest.mark.parametrize("bad", ["1", 1.5, True, None])
+    def test_repeat_hours_must_be_strict_integer(self, env, bad):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable", repeat_hours=bad)
+
+    def test_unsupported_integer_interval_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable", repeat_hours=5)
+
+    def test_repeatable_without_hours_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable")

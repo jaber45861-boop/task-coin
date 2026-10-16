@@ -329,3 +329,21 @@ class TestRuntimeEscaping:
         assert "<b>" not in html
         # The message card still rendered with its retry control.
         assert 'data-testid="taskreq-retry"' in html
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28 (repeat_hours fix only): interval sent as strict integer
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRepeatIntervalsUI:
+    def test_interval_is_sent_only_when_repeatable(self):
+        """repeatable sends a strict integer after a client-side
+        allow-list check; one_time never carries repeat_hours."""
+        body = _fn_body("_submit")
+        assert "repeat_policy === 'repeatable'" in body
+        assert "Number(_field('taskreq-repeat-hours'))" in body
+        assert "payload.repeat_hours = hours" in body
+        assert "Number.isInteger(hours)" in body
+        assert "![1, 3, 6, 12, 24].includes(hours)" in body
+        assert "_formError('اختر فاصل تكرار صالحًا.')" in body
