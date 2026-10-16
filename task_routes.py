@@ -1002,6 +1002,12 @@ def _trq_safe(req) -> dict:
         "target_ref": req.payload.get("target_ref"),
         "reward": req.reward,
         "reward_units": req.reward_units,
+        # MT-TASK-28: the advertiser's execution policy (all optional;
+        # null = not configured = legacy behaviour on the task row).
+        "repeat_policy": req.repeat_policy,
+        "repeat_hours": req.repeat_hours,
+        "max_executions": req.max_executions,
+        "reservation_minutes": req.reservation_minutes,
         "reason": req.decision_reason,
         "task_id": req.published_task_id,
         "created_at": req.created_at,
