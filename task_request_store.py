@@ -43,6 +43,10 @@ import sqlite3
 from dataclasses import dataclass
 
 import db
+from task_capacity import (
+    validate_max_executions,
+    validate_reservation_minutes,
+)
 from task_creation import (
     parse_reward_units,
     reward_units_to_text,
@@ -77,7 +81,9 @@ PAYLOAD_FIELDS = ("title", "description", "provider", "action",
                   "target_ref", "reward",
                   # repeat_policy is always sent by the mini app; repeat_hours
                   # only when repeatable (one_time keeps legacy contract).
-                  "repeat_policy", "repeat_hours")
+                  "repeat_policy", "repeat_hours",
+                  # MT-TASK-28: optional execution limits, absent = legacy.
+                  "max_executions", "reservation_minutes")
 # Admin-editable fields exposed by the Telegram review surface.
 ADMIN_EDITABLE_FIELDS = ("title", "description", "target_ref", "reward")
 
@@ -212,7 +218,10 @@ def validate_payload(raw: object) -> dict:
     #   * target_ref may be empty/absent
     #   * repeat_policy defaults to one_time when absent
     #   * repeat_hours is only sent for repeatable tasks; one_time omits it
-    _optional = ("target_ref", "repeat_policy", "repeat_hours")
+    # MT-TASK-28: max_executions / reservation_minutes are optional too;
+    # absent means "not configured" (legacy behaviour), never a default.
+    _optional = ("target_ref", "repeat_policy", "repeat_hours",
+                 "max_executions", "reservation_minutes")
     absent = [
         f for f in PAYLOAD_FIELDS
         if f not in _optional and f not in raw
@@ -266,6 +275,16 @@ def validate_payload(raw: object) -> dict:
     if repeat_policy == db.REPEAT_POLICY_REPEATABLE and repeat_hours not in SUPPORTED_INTERVALS:
         raise TaskRequestError("اختر فاصل تكرار صالحًا.")
 
+    # MT-TASK-28: optional execution limits.  Absent/empty stays None
+    # (legacy behaviour); otherwise the same strict validators the task
+    # creation path uses decide type and bounds — no lenient coercion.
+    try:
+        max_executions = validate_max_executions(raw.get("max_executions"))
+        reservation_minutes = validate_reservation_minutes(
+            raw.get("reservation_minutes"))
+    except ValueError as exc:
+        raise TaskRequestError(str(exc)) from exc
+
     return {
         "title": title,
         "description": description,
@@ -275,6 +294,8 @@ def validate_payload(raw: object) -> dict:
         "reward_units": reward_units,
         "repeat_policy": repeat_policy,
         "repeat_hours": repeat_hours,
+        "max_executions": max_executions,
+        "reservation_minutes": reservation_minutes,
     }
 
 
