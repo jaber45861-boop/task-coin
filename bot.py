@@ -1860,6 +1860,12 @@ def main() -> None:
     db.load_channels()
     _refresh_required_ids()
 
+    # Refresh the market quote in the background. A provider failure is
+    # fail-closed by rate_store.get_current_quote once the last quote ages
+    # past its 15-minute TTL; it never silently extends quote freshness.
+    import rate_worker
+    rate_worker.start()
+
     app = ApplicationBuilder().token(token).build()
 
     # Clear legacy command menus registered by earlier bot versions.
@@ -2029,6 +2035,14 @@ def main() -> None:
     ), group=0)
     app.add_handler(CommandHandler(
         "editpm", payment_method_admin.edit_pm_command,
+    ), group=0)
+    # MT-ADMIN-08b: emergency deposit minimum repair — private admin
+    #    chat ONLY.  First invocation is read-only; the admin must
+    #    explicitly repeat with APPLY to write the approved minimums to
+    #    payment methods #1 and #2 inside one transaction.
+    app.add_handler(CommandHandler(
+        "repairdepositminimums",
+        payment_method_admin.repair_deposit_minimums_command,
     ), group=0)
     # MT-ADMIN-26: /setrate — authoritative manual EGP-per-USDT rate.
     #    Private admin chat ONLY; authorization is enforced inside the

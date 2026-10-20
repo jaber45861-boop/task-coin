@@ -501,10 +501,16 @@ async def _safe_answer(query, text: str | None) -> None:
 
 async def _safe_edit(query, text: str, reply_markup=None) -> None:
     """Edit the card in place — caption for photo messages, text
-    otherwise (the detail card is a screenshot message)."""
+    otherwise (the detail card is a screenshot message).
+
+    In python-telegram-bot (≥ v13), ``message.photo`` is a tuple of
+    ``PhotoSize`` (never a list) for a photo message and ``None``
+    otherwise, so the guard checks a non-empty tuple/sequence — not
+    ``list`` — and the text edit stays the fallback for text cards.
+    """
     try:
         photo = getattr(getattr(query, "message", None), "photo", None)
-        if isinstance(photo, list) and photo:
+        if isinstance(photo, (tuple, list)) and len(photo) > 0:
             await query.edit_message_caption(
                 text, reply_markup=reply_markup
             )

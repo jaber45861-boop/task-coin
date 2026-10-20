@@ -54,6 +54,8 @@ import db
 import rate_admin
 import rate_store
 from rate_quote import (
+    PROVIDER_COINBASE,
+    PROVIDER_COINGECKO,
     PROVIDER_MANUAL,
     RateQuote,
     RateQuoteError,
@@ -62,6 +64,7 @@ from rate_quote import (
 )
 from rate_store import (
     InvalidPersistedRateError,
+    ManualRateBlockedError,
     RATE_TTL_SECONDS,
     RatePermissionError,
     RateStaleError,
@@ -542,6 +545,57 @@ class TestSetRateCommand(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(row[0], _ADMIN_A)
 
+    async def test_command_blocked_while_auto_quote_is_fresh(self):
+        """44. Normal mode: /setrate gets the operator-facing
+        emergency refusal and NOTHING is persisted."""
+        rate_store.set_automatic_rate(
+            _auto_quote(), db_path=self.db_path
+        )
+        before = self._rate_text()
+        update = _make_update(_ADMIN_A, "/setrate 49")
+        await rate_admin.setrate_command(update, _make_context())
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertEqual(reply, rate_admin.MSG_EMERGENCY_ONLY)
+        self.assertEqual(self._rate_text(), before)
+
+    async def test_command_allowed_once_auto_quote_expires(self):
+        """45. Emergency mode: once the automatic quote is stale the
+        same command succeeds and records the admin as actor."""
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=RATE_TTL_SECONDS
+        )
+        rate_store.set_automatic_rate(
+            _auto_quote(at=stale), db_path=self.db_path
+        )
+        update = _make_update(_ADMIN_A, "/setrate 49")
+        await rate_admin.setrate_command(update, _make_context())
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅ تم تحديث سعر الصرف", reply)
+        self.assertEqual(self._rate_text(), "49")
+        updated_by = sqlite3.connect(self.db_path).execute(
+            "SELECT updated_by FROM current_rate WHERE id = 1"
+        ).fetchone()[0]
+        self.assertEqual(updated_by, _ADMIN_A)
+
+    async def test_command_non_admin_refused_even_in_emergency(self):
+        """46. The emergency opening never widens authorization: a
+        non-admin still gets the admin-only refusal."""
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=RATE_TTL_SECONDS
+        )
+        rate_store.set_automatic_rate(
+            _auto_quote(at=stale), db_path=self.db_path
+        )
+        before = self._rate_text()
+        update = _make_update(_NON_ADMIN, "/setrate 49")
+        await rate_admin.setrate_command(update, _make_context())
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("للمشرفين فقط", reply)
+        self.assertEqual(self._rate_text(), before)  # nothing written
+
 
 # ── 32..36  Transactions / connection ownership ───────────────────────
 
@@ -697,6 +751,7 @@ class TestBotRegistration(unittest.TestCase):
 
     def test_setrate_handler_registered_exactly_once(self):
         import bot as bot_mod
+        import rate_worker
         from telegram.ext import CommandHandler
 
         captured: list = []
@@ -710,8 +765,14 @@ class TestBotRegistration(unittest.TestCase):
             os.environ, {"TELEGRAM_BOT_TOKEN": "12345:TESTTOKEN"}
         ), patch.object(
             bot_mod, "ApplicationBuilder", return_value=builder
-        ), patch.object(bot_mod, "run_single_entry"), patch.object(bot_mod, "db"):
+        ), patch.object(bot_mod, "run_single_entry"), patch.object(bot_mod, "db"), patch.object(
+            rate_worker, "start"
+        ) as rate_start:
             bot_mod.main()
+
+        # Normal mode: the automatic refresh worker starts with the
+        # bot (mocked here — no real network inside the test suite).
+        rate_start.assert_called_once()
 
         setrate = [
             h for h, _g in captured
@@ -724,6 +785,195 @@ class TestBotRegistration(unittest.TestCase):
         # Exactly one setrate registration line exists in main().
         source = open(bot_mod.__file__, encoding="utf-8").read()
         self.assertEqual(source.count('"setrate"'), 1)
+
+
+# ── 37+  Automatic mode + emergency-only manual gate ─────────────────
+
+
+def _iso(moment: datetime) -> str:
+    """The stored timestamp text for an aware UTC datetime."""
+    return moment.astimezone(timezone.utc).isoformat()
+
+def _auto_quote(rate: str = "48.75", at: datetime | None = None) -> RateQuote:
+    """A provider quote as the automatic worker would persist it."""
+    return RateQuote(Decimal(rate), PROVIDER_COINGECKO, at or datetime.now(timezone.utc))
+
+
+class TestAutomaticRateAndEmergencyGate(_RateStoreTestCase):
+    """Automatic is the NORMAL mode: ``set_automatic_rate`` is the
+    system writer, and ``set_rate`` (the /setrate path) is closed
+    while a fresh automatic quote exists — opening only when the
+    provider failed to keep one fresh."""
+
+    def test_auto_write_persists_provider_capture_and_system_actor(self):
+        """37. The automatic writer persists provider + capture
+        instant verbatim with updated_by = 0 (system), and the quote
+        reads back as a fresh automatic quote."""
+        quote = _auto_quote()
+        stored = rate_store.set_automatic_rate(quote, db_path=self.db_path)
+        assert stored is quote
+        row = self.raw_row()
+        assert row["provider"] == PROVIDER_COINGECKO
+        assert row["rate_usdt_egp"] == "48.75"
+        assert row["updated_by"] == 0            # system, not an admin
+        back = rate_store.get_current_quote(
+            db_path=self.db_path, now=quote.captured_at
+        )
+        assert back.provider == PROVIDER_COINGECKO
+        assert back.captured_at == quote.captured_at
+        assert back.rate_usdt_egp == Decimal("48.75")
+
+    def test_auto_write_rejects_unapproved_sources(self):
+        """38. Only the approved automatic provider can be written
+        through the system writer — a manual quote or a non-quote is
+        refused with nothing persisted."""
+        for bad in (
+            RateQuote(Decimal("48"), PROVIDER_MANUAL, datetime.now(timezone.utc)),
+            "48.5",
+            None,
+            48.5,
+        ):
+            with self.subTest(bad=bad), self.assertRaises(RateStoreError):
+                rate_store.set_automatic_rate(bad, db_path=self.db_path)
+        assert self.raw_count() == 0
+
+    def test_auto_write_overwrites_manual_quote(self):
+        """39. A successful automatic refresh replaces the emergency
+        manual quote (return to normal), keeping ONE singleton row."""
+        self.set_rate("47.9", now=datetime.now(timezone.utc))
+        rate_store.set_automatic_rate(
+            _auto_quote("48.8"), db_path=self.db_path
+        )
+        assert self.raw_count() == 1
+        row = self.raw_row()
+        assert row["provider"] == PROVIDER_COINGECKO
+        assert row["rate_usdt_egp"] == "48.8"
+        assert row["updated_by"] == 0
+
+    def test_coinbase_auto_write_persists_provider_and_timestamp(self):
+        """39b. A Coinbase quote (the active automatic provider) is
+        persisted verbatim: the provider name and the LOCAL capture
+        instant are stored exactly as given — never rewritten to the
+        old provider or to "now"."""
+        captured = datetime(2026, 10, 13, 10, 0, 0, tzinfo=timezone.utc)
+        quote = RateQuote(
+            Decimal("50.25"), PROVIDER_COINBASE, captured
+        )
+        stored = rate_store.set_automatic_rate(quote, db_path=self.db_path)
+        assert stored.provider == PROVIDER_COINBASE
+        assert self.raw_count() == 1
+        row = self.raw_row()
+        assert row["provider"] == PROVIDER_COINBASE
+        assert row["rate_usdt_egp"] == "50.25"
+        assert row["captured_at"] == _iso(captured)
+        assert row["updated_by"] == 0                # system actor
+        # The quote reads back through the ONE staleness policy.
+        got = rate_store.get_current_quote(
+            db_path=self.db_path, now=captured + timedelta(seconds=1)
+        )
+        assert got.provider == PROVIDER_COINBASE
+        assert got.rate_usdt_egp == Decimal("50.25")
+        assert got.captured_at == captured
+
+    def test_coinbase_and_coingecko_are_both_automatic_sources(self):
+        """39c. The automatic writer accepts every approved AUTOMATIC
+        provider (coingecko AND coinbase) and still refuses manual."""
+        for provider in (PROVIDER_COINGECKO, PROVIDER_COINBASE):
+            with self.subTest(provider=provider):
+                quote = RateQuote(
+                    Decimal("48"),  provider, datetime.now(timezone.utc)
+                )
+                rate_store.set_automatic_rate(quote, db_path=self.db_path)
+                assert self.raw_row()["provider"] == provider
+        with self.assertRaises(RateStoreError):
+            rate_store.set_automatic_rate(
+                RateQuote(Decimal("48"), PROVIDER_MANUAL,
+                          datetime.now(timezone.utc)),
+                db_path=self.db_path,
+            )
+
+    def test_coinbase_quote_ages_out_like_any_other(self):
+        """39d. The TTL policy is provider-agnostic: a coinbase quote
+        is refused at exactly the 900s boundary, never silently."""
+        captured = datetime.now(timezone.utc)
+        rate_store.set_automatic_rate(
+            RateQuote(Decimal("50.25"), PROVIDER_COINBASE, captured),
+            db_path=self.db_path,
+        )
+        fresh = rate_store.get_current_quote(
+            db_path=self.db_path,
+            now=captured + timedelta(seconds=RATE_TTL_SECONDS - 1),
+        )
+        assert fresh.provider == PROVIDER_COINBASE
+        with self.assertRaises(RateStaleError):
+            rate_store.get_current_quote(
+                db_path=self.db_path,
+                now=captured + timedelta(seconds=RATE_TTL_SECONDS),
+            )
+
+    def test_manual_blocked_while_auto_quote_is_fresh(self):
+        """40. Normal mode: the manual path is closed while the
+        automatic quote is fresh — rejected value writes NOTHING."""
+        captured = datetime.now(timezone.utc) - timedelta(seconds=60)
+        rate_store.set_automatic_rate(
+            _auto_quote(at=captured), db_path=self.db_path
+        )
+        before = self.raw_row()
+        with self.assertRaises(ManualRateBlockedError):
+            self.set_rate(
+                "49", now=captured + timedelta(seconds=RATE_TTL_SECONDS - 1)
+            )
+        assert dict(self.raw_row()) == dict(before)  # byte-for-byte intact
+
+    def test_manual_allowed_once_auto_quote_expires(self):
+        """41. Emergency activation is pinned at the TTL boundary:
+        age >= TTL (the quote is stale/unusable) opens the manual
+        path, and the manual quote is persisted normally."""
+        captured = datetime.now(timezone.utc) - timedelta(seconds=60)
+        rate_store.set_automatic_rate(
+            _auto_quote(at=captured), db_path=self.db_path
+        )
+        self.set_rate(
+            "49", now=captured + timedelta(seconds=RATE_TTL_SECONDS)
+        )
+        row = self.raw_row()
+        assert row["provider"] == PROVIDER_MANUAL
+        assert row["rate_usdt_egp"] == "49"
+        assert row["updated_by"] == _ADMIN_A
+
+    def test_manual_allowed_when_auto_row_is_corrupt(self):
+        """42. A corrupt automatic row is NOT positively fresh — the
+        emergency path opens so an admin can repair state."""
+        rate_store.set_automatic_rate(
+            _auto_quote(), db_path=self.db_path
+        )
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE current_rate SET captured_at = 'garbage' "
+                "WHERE id = 1"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.set_rate("49", now=datetime.now(timezone.utc))
+        assert self.raw_row()["provider"] == PROVIDER_MANUAL
+
+    def test_non_admin_rejected_before_the_gate(self):
+        """43. Authorization is checked BEFORE the emergency gate: a
+        non-admin always gets the permission error — the gate never
+        becomes an oracle or a bypass."""
+        captured = datetime.now(timezone.utc) - timedelta(seconds=60)
+        rate_store.set_automatic_rate(
+            _auto_quote(at=captured), db_path=self.db_path
+        )
+        before = self.raw_row()
+        with self.assertRaises(RatePermissionError):
+            self.set_rate(
+                "49", admin=_NON_ADMIN,
+                now=captured + timedelta(seconds=RATE_TTL_SECONDS - 1),
+            )
+        assert dict(self.raw_row()) == dict(before)
 
 
 if __name__ == "__main__":

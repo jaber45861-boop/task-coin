@@ -148,7 +148,8 @@ class CompletionGate:
             #    terminal and no reward/wallet/ledger state is touched)
             cursor = conn.execute(
                 "UPDATE user_tasks "
-                "SET status = ?, completed_at = CURRENT_TIMESTAMP "
+                "SET status = ?, completed_at = CURRENT_TIMESTAMP, "
+                "    reserved_until = NULL "
                 "WHERE user_id = ? AND task_id = ? AND status = ?",
                 (
                     db.USER_TASK_STATUS_COMPLETED,

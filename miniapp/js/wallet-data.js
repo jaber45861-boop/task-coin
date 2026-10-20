@@ -5,15 +5,12 @@
  * BOTH the Home profile area and the Wallet page, so the two screens can
  * never contradict each other.
  *
- * The Mini App backend does not expose a wallet API yet, so every read
- * returns a neutral "no data" value — never fake money, never fake
- * history.  When a real read API arrives, only this module changes.
- *
+ * Balance comes from GET /api/me (same auth pattern as profile.js).
  * All formatting is integer-unit arithmetic only (no floats, no
  * financial calculations):
  *     1 USDT = 100,000,000 wallet units   (integer)
  *     1 EGP  = 100 minor units            (integer)
- * The EGP figure is a display equivalent provided by the backend later;
+ * The EGP figure is a display equivalent provided by the backend;
  * this module never converts currencies on its own.
  */
 const WalletData = (() => {
@@ -22,17 +19,74 @@ const WalletData = (() => {
     const EGP_DECIMALS = 2;
     const USDT_DECIMALS = 8;
 
+    const ACCOUNT_URL = '/api/me';
+    const INIT_DATA_HEADER = 'X-Telegram-Init-Data';
+
     /**
-     * Current wallet balance for the signed-in user.
-     *
-     * @returns {{availableUnits: number|null, egpDisplayMinor: number|null}}
-     *   `null` everywhere while no backend wallet API exists — the UI
-     *   renders an em-dash placeholder instead of an invented amount.
+     * Build the auth header from verified Telegram initData — same
+     * source the Profile page uses.
      */
-    function getBalance() {
+    function _initData() {
+        return (typeof TelegramApp !== 'undefined' && TelegramApp.getInitData)
+            ? TelegramApp.getInitData()
+            : '';
+    }
+
+    function _headers() {
+        const headers = {};
+        headers[INIT_DATA_HEADER] = _initData();
+        return headers;
+    }
+
+    /**
+     * Current wallet balance for the signed-in user, fetched from
+     * GET /api/me.  While the request is in flight the balance is
+     * `null` (UI renders an em-dash).  On any failure the balance
+     * stays `null` — never an invented amount.
+     *
+     * @returns {Promise<{availableUnits: number|null, egpDisplayMinor: number|null}>}
+     *   `availableUnits` is integer USDT units or null.
+     *   `egpDisplayMinor` is integer EGP minor units or null.
+     */
+    async function getBalance() {
+        let data = null;
+        let ok = false;
+        try {
+            const response = await fetch(ACCOUNT_URL, { headers: _headers() });
+            data = await response.json();
+            ok = response.ok && !!data && data.ok === true;
+        } catch (error) {
+            ok = false;
+        }
+        if (!ok || !data || !data.wallet) {
+            return {
+                availableUnits: null,
+                egpDisplayMinor: null
+            };
+        }
+
+        const wallet = data.wallet;
+        // The backend returns null when the user has no wallet row,
+        // or {availableUnits: <int>} when a wallet exists (possibly
+        // with a zero balance).  Both are passed through verbatim so
+        // the UI can distinguish "no wallet" from "zero balance".
+        if (wallet.availableUnits === null || wallet.availableUnits === undefined) {
+            return {
+                availableUnits: null,
+                egpDisplayMinor: null
+            };
+        }
+
+        // Integer USDT units → EGP display minor units from the
+        // backend-provided display equivalent.  If the backend did
+        // not send one, leave it null — never invent a conversion.
+        const egpMinor = (data.wallet.egpDisplayMinor !== undefined)
+            ? data.wallet.egpDisplayMinor
+            : null;
+
         return {
-            availableUnits: null,      // integer USDT units, null = unknown
-            egpDisplayMinor: null      // integer EGP minor units, null = unknown
+            availableUnits: wallet.availableUnits,
+            egpDisplayMinor: egpMinor
         };
     }
 
@@ -69,6 +123,25 @@ const WalletData = (() => {
     }
 
     /**
+     * Format integer minor EGP units as a 2-decimal EGP display string.
+     * Integer-exact for every safe-integer minor-unit count; null → '—'.
+     *
+     * @param {number|null} minorUnits integer EGP minor units
+     * @returns {string} a 2-decimal string (whole.frac2), or "—" while
+     *   the display equivalent is unknown
+     */
+    function formatEgpMinor(minorUnits) {
+        if (minorUnits === null || minorUnits === undefined) {
+            return '—';
+        }
+        const negative = minorUnits < 0;
+        const abs = Math.abs(minorUnits);
+        const whole = Math.floor(abs / EGP_MINOR_PER_EGP);
+        const frac = String(abs % EGP_MINOR_PER_EGP).padStart(EGP_DECIMALS, '0');
+        return (negative ? '-' : '') + whole + '.' + frac;
+    }
+
+    /**
      * Format integer minor units as a 2-decimal EGP display string.
      * The value arrives from the backend as a display equivalent — this
      * function only renders it; it never converts currencies.
@@ -93,6 +166,7 @@ const WalletData = (() => {
         getTransactions,
         formatUsdt,
         formatEgp,
+        formatEgpMinor,
         USDT_UNITS_PER_USDT,
         EGP_MINOR_PER_EGP
     };

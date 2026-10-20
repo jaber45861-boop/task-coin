@@ -450,6 +450,7 @@ def create_payment_method(
     created_by: object = None,
     sort_order: object = None,
     db_path: str | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> PaymentMethod:
     """Validate and persist one NEW payment method.
 
@@ -459,6 +460,10 @@ def create_payment_method(
     optional per-method deposit minimum in atomic units of the
     method's own asset (``None`` = not configured = deposits fail
     closed until an admin sets it).
+
+    A caller-owned ``connection`` joins an existing transaction and is
+    never committed, rolled back or closed here. Without it, this
+    function owns the same single-method transaction as before.
     """
     form = validate_form(
         category, display_name, asset, network,
@@ -480,7 +485,8 @@ def create_payment_method(
             )
         order_value = sort_order
 
-    with db.transaction(db_path) as conn:
+    def insert_row(conn: sqlite3.Connection):
+        nonlocal order_value
         if order_value is None:
             row = conn.execute(
                 "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order "
@@ -509,10 +515,16 @@ def create_payment_method(
             ),
         )
         new_id = cursor.lastrowid
-        row = conn.execute(
+        return conn.execute(
             f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
             (new_id,),
         ).fetchone()
+
+    if connection is not None:
+        row = insert_row(connection)
+    else:
+        with db.transaction(db_path) as conn:
+            row = insert_row(conn)
 
     created = _row_to_method(row)
     # Audit line: ids/operation/actor only — NEVER the destination.
@@ -527,20 +539,33 @@ def create_payment_method(
 
 
 def get_payment_method(
-    method_id: object, db_path: str | None = None
+    method_id: object,
+    db_path: str | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> PaymentMethod | None:
-    """Fetch one payment method by id; None for invalid/missing ids."""
+    """Fetch one payment method by id; None for invalid/missing ids.
+
+    With ``connection``, the lookup uses that caller-owned connection
+    without opening or closing another database connection.
+    """
     if (
         isinstance(method_id, bool)
         or not isinstance(method_id, int)
         or method_id <= 0
     ):
         return None
-    with db.get_connection(db_path) as conn:
-        row = conn.execute(
+    if connection is not None:
+        row = connection.execute(
             f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
             (method_id,),
         ).fetchone()
+    else:
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
+                (method_id,),
+            ).fetchone()
     return _row_to_method(row) if row else None
 
 
@@ -627,6 +652,7 @@ def update_payment_method(
     min_deposit_units: object = _UNSET,
     updated_by: object = None,
     db_path: str | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> PaymentMethod | None:
     """Replace every editable field of one payment method.
 
@@ -642,6 +668,10 @@ def update_payment_method(
       re-set the minimum against the new asset before deposits can be
       re-enabled).
     - Supplied → validated against the resulting (new) asset.
+
+    A caller-owned ``connection`` joins an existing transaction and is
+    never committed, rolled back or closed here. Without it, this
+    function owns the same single-method transaction as before.
     """
     mid = _require_id(method_id, "method_id")
     form = validate_form(
@@ -650,7 +680,7 @@ def update_payment_method(
     )
     actor = _require_admin_id(updated_by, "updated_by")
 
-    with db.transaction(db_path) as conn:
+    def update_row(conn: sqlite3.Connection):
         existing = conn.execute(
             "SELECT id, asset, min_deposit_units "
             "FROM payment_methods WHERE id = ?",
@@ -687,16 +717,25 @@ def update_payment_method(
                 mid,
             ),
         )
-        row = conn.execute(
+        return conn.execute(
             f"SELECT {_COLUMNS} FROM payment_methods WHERE id = ?",
             (mid,),
         ).fetchone()
 
+    if connection is not None:
+        row = update_row(connection)
+    else:
+        with db.transaction(db_path) as conn:
+            row = update_row(conn)
+
+    if row is None:
+        return None
     updated = _row_to_method(row)
-    logger.info(
-        "Payment method updated: id=%d category=%s admin=%r",
-        updated.id, updated.category, updated.updated_by,
-    )
+    if connection is None:
+        logger.info(
+            "Payment method updated: id=%d category=%s admin=%r",
+            updated.id, updated.category, updated.updated_by,
+        )
     return updated
 
 

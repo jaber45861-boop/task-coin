@@ -80,10 +80,12 @@ from bsc_deposit_adapter import (
     verify_deposit_transaction,
 )
 from deposit_verification import (
+    DepositAssetNotCreditableError,
     DepositNotFoundError,
     ExternalTxIdAlreadyUsedError,
 )
 from test_deposit import ADMIN_ID, _make_pm
+from test_deposit_verification import _egp_request
 from test_miniapp_auth import _TEST_BOT_TOKEN
 
 # ── Test constants (obviously fake — no production values) ───────────
@@ -489,6 +491,54 @@ class TestSuccessPath:
                 "no-such-request", TX_HASH, client=_client(fake)
             )
         assert fake.calls == []
+
+    def test_egp_request_rejected_before_provider_and_any_write(
+        self, env
+    ):
+        """An EGP deposit is NOT verifiable on-chain.
+
+        `request.amount_units` for an EGP intent holds EGP cents, not
+        the surface token's atomic units, so the adapter must refuse
+        BEFORE opening a provider connection or touching wallet/ledger
+        state — never feed EGP cents to the chain verifier.
+        """
+        # 50.00 EGP at the 2-dp scale == 5000 cents, NOT 5000 USDT
+        # atomic units (0.00005 USDT).  The gate must fire regardless.
+        # `_egp_request` seeds a valid rate so the EGP intent can be
+        # created (creation is fail-closed without a quote).
+        req = _egp_request(env)
+        assert req.pm_asset == "EGP"
+        assert req.amount_units == 5000
+
+        fake = FakeRpc()
+        with pytest.raises(DepositAssetNotCreditableError) as excinfo:
+            verify_and_credit_deposit(
+                req.request_id, TX_HASH, client=_client(fake)
+            )
+        assert excinfo.value.code == "deposit_asset_not_creditable"
+
+        # No provider connection was ever opened.
+        assert fake.calls == []
+        # Zero financial mutation: no wallet row, no ledger entry,
+        # the request stays PENDING with no external tx id.
+        assert _wallet_units(env) is None
+        assert _deposit_ledger(env, req.request_id) == []
+        row = _row(env, req.request_id)
+        assert row["status"] == "pending"
+        assert row["external_tx_id"] is None
+
+    def test_usdt_request_still_reaches_the_adapter(self, env):
+        """The gate is asset-scoped: a USDT request is unaffected and
+        still flows through the on-chain verification path."""
+        req = _request(env)          # defaults: USDT / BEP20
+        assert req.pm_asset == "USDT"
+        fake = FakeRpc()
+        result, _ = verify_and_credit_deposit(
+            req.request_id, TX_HASH, client=_client(fake)
+        )
+        assert result.status == "credited"
+        # the provider WAS consulted for the supported asset
+        assert fake.methods
 
 
 def adapter_read_only_methods() -> set:

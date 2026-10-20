@@ -37,6 +37,11 @@ from dataclasses import dataclass
 
 import db
 from task_attempt import TaskAttemptPolicy
+from task_capacity import (
+    claimed_capacity,
+    reservation_deadline,
+    _utcnow_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +124,35 @@ class TaskStartGate:
             if not task["active"]:
                 raise StartGateError(f"Task {task_id} is not active")
 
-            # 4. Check current user_task state (inside the transaction,
+            # 4. Task must not be paused or archived (MT-ADMIN-36S)
+            if task.get("paused"):
+                raise StartGateError(f"Task {task_id} is paused and cannot be started")
+            if task.get("archived_at") is not None:
+                raise StartGateError(f"Task {task_id} is archived and cannot be started")
+
+            # 5. MT-TASK-28 — capacity gate.  The slot count and the
+            #    state change happen inside THIS transaction (BEGIN
+            #    IMMEDIATE), so concurrent starts serialize: exactly one
+            #    observes the last free slot, the rest are refused.
+            #    A legacy task (max_executions NULL) is unlimited and
+            #    keeps its exact previous behaviour.
+            max_executions = task.get("max_executions")
+            if (
+                not isinstance(max_executions, bool)
+                and isinstance(max_executions, int)
+                and max_executions > 0
+            ):
+                claimed = claimed_capacity(task_id, connection=conn)
+                if claimed >= max_executions:
+                    raise StartGateError(
+                        f"Task {task_id} has reached its execution limit"
+                    )
+            # The reservation deadline of the cycle this start opens,
+            # derived from the task's own policy and the server clock.
+            # None for a legacy task = the start never expires.
+            reserved_until = reservation_deadline(task)
+
+            # 6. Check current user_task state (inside the transaction,
             #    so no other writer can change it before the transition)
             user_task = db.get_user_task(user_id, task_id)
 
@@ -144,11 +177,13 @@ class TaskStartGate:
                             "UPDATE user_tasks "
                             "SET status = ?, "
                             "    started_at = CURRENT_TIMESTAMP, "
-                            "    completed_at = NULL "
+                            "    completed_at = NULL, "
+                            "    reserved_until = ? "
                             "WHERE user_id = ? AND task_id = ? "
                             "AND status = ?",
                             (
                                 db.USER_TASK_STATUS_STARTED,
+                                reserved_until,
                                 user_id,
                                 task_id,
                                 db.USER_TASK_STATUS_COMPLETED,
@@ -182,19 +217,62 @@ class TaskStartGate:
                         f"Task {task_id} already completed for user {user_id}"
                     )
 
-                # Already started → reject (idempotent, no mutation)
+                # Already started → if the reservation expired, release it
+                # and let the user start again; otherwise reject.
                 if current_status == db.USER_TASK_STATUS_STARTED:
-                    raise StartGateError(
-                        f"Task {task_id} already started for user {user_id}"
-                    )
+                    current_reserved_until = user_task.get("reserved_until")
+                    if (
+                        current_reserved_until is not None
+                        and current_reserved_until <= _utcnow_text()
+                    ):
+                        # Release the lapsed reservation (guarded compare-and-set
+                        # so a concurrent completion/submission cannot be undone).
+                        cursor = conn.execute(
+                            "UPDATE user_tasks "
+                            "SET status = ?, started_at = NULL, reserved_until = NULL "
+                            "WHERE user_id = ? AND task_id = ? AND status = ? "
+                            "AND reserved_until IS NOT NULL AND reserved_until <= ?",
+                            (
+                                db.USER_TASK_STATUS_AVAILABLE,
+                                user_id,
+                                task_id,
+                                db.USER_TASK_STATUS_STARTED,
+                                _utcnow_text(),
+                            ),
+                        )
+                        if cursor.rowcount == 1:
+                            # Released — fall through to available → started below
+                            current_status = db.USER_TASK_STATUS_AVAILABLE
+                        else:
+                            # Lost a race — re-read and report with existing
+                            # error vocabulary.
+                            latest = db.get_user_task(user_id, task_id)
+                            latest_status = latest["status"] if latest else None
+                            if latest_status == db.USER_TASK_STATUS_COMPLETED:
+                                raise StartGateError(
+                                    f"Task {task_id} already completed "
+                                    f"for user {user_id}"
+                                )
+                            raise StartGateError(
+                                f"Task {task_id} already started "
+                                f"for user {user_id}"
+                            )
+
+                    if current_status == db.USER_TASK_STATUS_STARTED:
+                        raise StartGateError(
+                            f"Task {task_id} already started "
+                            f"for user {user_id}"
+                        )
 
                 # available → started (guarded compare-and-set below)
                 cursor = conn.execute(
                     "UPDATE user_tasks "
-                    "SET status = ?, started_at = CURRENT_TIMESTAMP "
+                    "SET status = ?, started_at = CURRENT_TIMESTAMP, "
+                    "    reserved_until = ? "
                     "WHERE user_id = ? AND task_id = ? AND status = ?",
                     (
                         db.USER_TASK_STATUS_STARTED,
+                        reserved_until,
                         user_id,
                         task_id,
                         db.USER_TASK_STATUS_AVAILABLE,
@@ -220,9 +298,14 @@ class TaskStartGate:
                 # above inside this same transaction).
                 conn.execute(
                     "INSERT INTO user_tasks "
-                    "(user_id, task_id, status, started_at) "
-                    "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                    (user_id, task_id, db.USER_TASK_STATUS_STARTED),
+                    "(user_id, task_id, status, started_at, reserved_until) "
+                    "VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)",
+                    (
+                        user_id,
+                        task_id,
+                        db.USER_TASK_STATUS_STARTED,
+                        reserved_until,
+                    ),
                 )
 
         logger.info("Task started via gate: user=%d task=%d", user_id, task_id)

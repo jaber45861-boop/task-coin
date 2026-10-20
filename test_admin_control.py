@@ -288,6 +288,14 @@ class ControlTestBase(_Base):
         payment_method_store.set_payment_method_deposits_enabled(
             self.pm.id, True, updated_by=ADMIN_ID, db_path=self.db_path
         )
+        # The method is EGP: creation now freezes a fresh rate quote
+        # and fails closed without one.  A manual quote keeps this
+        # fixture independent of the automatic worker (and later
+        # set_rate calls in the suite stay allowed — manual never
+        # blocks manual).
+        rate_store.set_rate(
+            "48.5", admin_user_id=ADMIN_ID, db_path=self.db_path
+        )
         deposit = deposit_store.create_deposit_request(
             user_id=user_id,
             payment_method_id=self.pm.id,

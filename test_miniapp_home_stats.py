@@ -23,7 +23,8 @@ together against a backend-shaped payload, then:
 - an empty backend list shows the real zero ("0" / "0.00000000 USDT")
 - a failed or unauthenticated read keeps the existing neutral «—»
   placeholder — no mock value, no invented fallback number
-- every read goes to '/api/tasks' with the verified initData header
+- every read goes to '/api/tasks' (the cards) or '/api/me' (the shared
+  balance source) with the verified initData header
 
 End-to-end (real backend + real database):
 - the production Flask endpoint (isolated temp DB) answers GET
@@ -438,9 +439,10 @@ class TestRuntimeValues:
         assert "balance-empty" in reward["removed"]
 
         # Same source as the Tasks screen: every read is GET /api/tasks
+        # (the cards) or GET /api/me (the shared balance source),
         # carrying the verified initData identity header.
         assert out["urls"], "no backend read happened"
-        assert set(out["urls"]) == {"/api/tasks"}
+        assert set(out["urls"]) == {"/api/tasks", "/api/me"}
         for headers in out["headers"]:
             assert headers.get(INIT_DATA_HEADER) == FAKE_INIT_DATA
 
@@ -472,7 +474,7 @@ class TestRuntimeValues:
         assert out["nodes"] == {}
         assert "—" in out["balanceHtml"], \
             "the placeholder markup must remain untouched"
-        assert set(out["urls"]) == {"/api/tasks"}
+        assert set(out["urls"]) == {"/api/tasks", "/api/me"}
 
     def test_sum_is_recomputed_fresh_on_every_render(self):
         """Adding/removing tasks is reflected on the next Home render."""

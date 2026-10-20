@@ -50,6 +50,14 @@ E. FACTS / SECURITY (19–20 + extras)
       (extra — pins the operational-vs-facts boundary)
    24 error codes are deterministic and stable (extra)
 
+F. EGP FROZEN-SNAPSHOT GATE (extra — automatic-rate policy)
+   creation freezes rate/provider/capture/units → credit uses the
+   frozen units with full ledger metadata; an old request keeps its
+   rate after a market move; legacy/corrupt snapshots are rejected
+   with ZERO mutation; the credit is idempotent (once, ever); the
+   amount check stays in the request's own EGP units; USDT is
+   untouched.
+
 Temp databases only; no production destinations or balances are used.
 Money math is int-only — floats are rejected everywhere.
 
@@ -59,8 +67,12 @@ Run:
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -69,7 +81,9 @@ import db
 import deposit_store
 import deposit_verification
 import ledger
+import rate_store
 import wallet
+from rate_quote import PROVIDER_COINGECKO, RateQuote
 from deposit_verification import (
     DepositAlreadyCreditedError,
     DepositAmountMismatchError,
@@ -604,64 +618,280 @@ class TestFactsAndSecurity:
         assert issubclass(DepositAlreadyCreditedError, DepositConflictError)
 
 
+# ── EGP frozen-snapshot helpers (automatic-rate policy) ──────────────
+
+
+def _seed_rate(
+    db_path: str, rate: str, *, age_seconds: float = 0.0
+) -> RateQuote:
+    """A fresh (or backdated) AUTOMATIC quote — the normal mode."""
+    captured = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    quote = RateQuote(Decimal(rate), PROVIDER_COINGECKO, captured)
+    rate_store.set_automatic_rate(quote, db_path=db_path)
+    return quote
+
+
+def _egp_request(db_path: str, *, rate: str | None = "48.5"):
+    """One PENDING EGP deposit; ``rate=None`` creates it with NO
+    quote present (legacy/missing-rate simulation at creation)."""
+    pm = _make_pm(
+        db_path,
+        category="cash",
+        asset="EGP",
+        network=None,
+        min_units=5000,            # 50.00 EGP at the 2-dp scale
+    )
+    if rate is not None:
+        _seed_rate(db_path, rate)
+    return deposit_store.create_deposit_request(
+        user_id=USER_A,
+        payment_method_id=pm.id,
+        amount="50",
+        db_path=db_path,
+    )
+
+
 class TestAssetCreditGate:
-    """The internal wallet is USDT-only (decision): a request whose
-    asset is not the wallet credit currency is rejected BEFORE any
-    wallet/ledger write — no credit, no ledger row, no partial
-    credit, no implicit conversion — while request CREATION keeps
-    working and USDT credit stays untouched."""
+    """The credit boundary's asset rules under the automatic-rate
+    policy: USDT stays byte-for-byte; EGP credits ONLY the frozen
+    snapshot captured at creation (exact units + full ledger
+    metadata); a request WITHOUT a valid snapshot — legacy or
+    corrupted — is rejected BEFORE any wallet/ledger write with zero
+    mutations; and an old request keeps its rate and amount even
+    after the market moves."""
 
-    @staticmethod
-    def _egp_request(db_path: str):
-        pm = _make_pm(
-            db_path,
-            category="cash",
-            asset="EGP",
-            network=None,
-            min_units=5000,            # 50.00 EGP at the 2-dp scale
-        )
-        return deposit_store.create_deposit_request(
-            user_id=USER_A,
-            payment_method_id=pm.id,
-            amount="50",
-            db_path=db_path,
-        )
+    # 50 EGP at 48.5 EGP/USDT = 1.030927835051546… USDT → ×1e8 →
+    # 103_092_783.505… atomic units → ROUND_CEILING (MT-ADMIN-17) →
+    # 103_092_784 — asserted as a literal, independent of the
+    # production Decimal code path.
+    FROZEN_UNITS = 103_092_784
+    FROZEN_RATE = "48.5"
+    NEW_RATE = "49.75"
+    # What 50 EGP would be worth at NEW_RATE (50/49.75×1e8 =
+    # 100_502_512.5… → ceil) — deliberately DIFFERENT from
+    # FROZEN_UNITS so any recalculation is detectable.
+    RECALCULATED_UNITS = 100_502_513
 
-    def test_egp_request_creation_still_works(self, env):
-        """EGP deposits can be REQUESTED — only crediting is gated."""
-        request = self._egp_request(env)
+    def test_egp_creation_freezes_conversion_snapshot(self, env):
+        """Creation freezes exact rate text, provider, capture instant
+        and the converted unit count — while the request amount stays
+        EGP cents."""
+        request = _egp_request(env, rate=self.FROZEN_RATE)
         assert request.pm_asset == "EGP"
-        assert request.amount_units == 5000      # EGP cents, exact
+        assert request.amount_units == 5000          # EGP cents, exact
         assert request.status == "pending"
+        assert request.wallet_rate_usdt_egp == self.FROZEN_RATE
+        assert request.rate_provider == PROVIDER_COINGECKO
+        assert request.rate_captured_at              # frozen instant
+        assert request.credited_usdt_units == self.FROZEN_UNITS
 
-    def test_egp_credit_rejected_with_zero_financial_mutation(
-        self, env
-    ):
+    def test_egp_credit_uses_frozen_snapshot_exactly(self, env):
+        """The credit lands as EXACT frozen USDT units with the full
+        conversion audit trail in the ledger — the EGP amount itself
+        never changes."""
         _fund()
-        request = self._egp_request(env)
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+
+        result = _verify(request.request_id, units=5000)
+        assert result.already_credited is False
+        assert result.amount_units == self.FROZEN_UNITS
+        assert result.status == "credited"
+
+        # Wallet: funded balance + exactly the frozen units.
+        assert _wallet_units(env) == (FUND + self.FROZEN_UNITS, 0)
+
+        # One ledger credit: converted units, frozen rate, metadata.
+        entries = _deposit_ledger(env, request.request_id)
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["entry_type"] == "credit"
+        assert entry["currency"] == "USDT"
+        assert entry["amount_units"] == self.FROZEN_UNITS
+        assert entry["rate_usdt_egp"] == self.FROZEN_RATE
+        meta = json.loads(entry["metadata"])
+        assert meta["conversion"] == "egp_to_usdt"
+        assert meta["source_asset"] == "EGP"
+        assert meta["source_amount_units"] == 5000
+        assert meta["rate_usdt_egp"] == self.FROZEN_RATE
+        assert meta["rate_provider"] == PROVIDER_COINGECKO
+        assert meta["credited_usdt_units"] == self.FROZEN_UNITS
+
+        # The request keeps its EGP amount and its frozen snapshot.
+        row = _row(env, request.request_id)
+        assert row["status"] == "credited"
+        assert row["amount_units"] == 5000
+        assert row["credited_usdt_units"] == self.FROZEN_UNITS
+        assert row["wallet_rate_usdt_egp"] == self.FROZEN_RATE
+
+    def test_old_request_keeps_its_rate_after_market_move(self, env):
+        """A market move NEVER rewrites an existing request: credit
+        uses the frozen rate/units, not the new quote."""
+        _fund()
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+        snapshot_before = (
+            request.wallet_rate_usdt_egp,
+            request.rate_captured_at,
+            request.credited_usdt_units,
+        )
+
+        # The market moves after creation.
+        _seed_rate(env, self.NEW_RATE)
+        current = rate_store.get_current_quote(db_path=env)
+        assert str(current.rate_usdt_egp) == self.NEW_RATE
+
+        result = _verify(request.request_id, units=5000)
+        assert result.amount_units == self.FROZEN_UNITS
+        assert result.amount_units != self.RECALCULATED_UNITS
+        assert _wallet_units(env) == (FUND + self.FROZEN_UNITS, 0)
+
+        # Row snapshot is byte-for-byte what creation froze.
+        row_after = _row(env, request.request_id)
+        assert (
+            row_after["wallet_rate_usdt_egp"],
+            row_after["rate_captured_at"],
+            row_after["credited_usdt_units"],
+        ) == snapshot_before
+        entries = _deposit_ledger(env, request.request_id)
+        assert len(entries) == 1
+        assert entries[0]["rate_usdt_egp"] == self.FROZEN_RATE
+        assert entries[0]["amount_units"] == self.FROZEN_UNITS
+
+    def test_credit_log_reports_credited_units_not_source_units(
+        self, env, caplog
+    ):
+        """The audit log must report the units ACTUALLY credited.
+
+        For an EGP request ``verified_units`` is the EGP amount that
+        was checked (5000 = 50.00 EGP) while ``credit_units`` is the
+        frozen USDT written to the wallet.  Logging the source amount
+        would publish EGP cents as if they were credited USDT atomic
+        units.  This test pins the log value itself — neither the
+        returned result nor the ledger, which were already correct.
+        """
+        _fund()
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+
+        with caplog.at_level(logging.INFO, logger="deposit_verification"):
+            result = _verify(request.request_id, units=5000)
+
+        assert result.amount_units == self.FROZEN_UNITS
+        records = [
+            r for r in caplog.records
+            if r.name == "deposit_verification" and "result=credited" in r.getMessage()
+        ]
+        assert records, "no credit log record was emitted"
+        # The logged unit count is the credited USDT, NOT the EGP 5000.
+        assert f"units={self.FROZEN_UNITS}" in records[-1].getMessage()
+        assert "units=5000" not in records[-1].getMessage()
+
+    def test_credit_log_reports_credited_units_for_usdt(self, env, caplog):
+        """USDT behaviour is unchanged: the logged units stay exactly
+        the verified/credited amount (no snapshot indirection)."""
+        _fund()
+        req = _request(env)
+
+        with caplog.at_level(logging.INFO, logger="deposit_verification"):
+            result = _verify(req.request_id)
+
+        assert result.amount_units == AMOUNT_UNITS
+        records = [
+            r for r in caplog.records
+            if r.name == "deposit_verification" and "result=credited" in r.getMessage()
+        ]
+        assert records, "no credit log record was emitted"
+        assert f"units={AMOUNT_UNITS}" in records[-1].getMessage()
+
+    def test_legacy_row_without_snapshot_rejected(self, env):
+        """A pre-migration row (NULL snapshot) can never be credited:
+        zero mutation and the wallet row is never even created."""
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+        _exec(
+            env,
+            "UPDATE deposit_requests SET wallet_rate_usdt_egp = NULL, "
+            "rate_provider = NULL, rate_captured_at = NULL, "
+            "credited_usdt_units = NULL WHERE request_id = ?",
+            (request.request_id,),
+        )
 
         with pytest.raises(DepositAssetNotCreditableError) as excinfo:
             _verify(request.request_id, units=5000)
         assert excinfo.value.code == "deposit_asset_not_creditable"
 
-        # ZERO mutation: wallet unchanged, no ledger row, still
-        # pending — the whole transaction rolled back.
-        assert _wallet_units(env) == (FUND, 0)
+        assert _wallet_units(env) is None
         assert _deposit_ledger(env, request.request_id) == []
         row = _row(env, request.request_id)
         assert row["status"] == "pending"
         assert row["external_tx_id"] is None
 
-    def test_egp_credit_rejected_without_creating_wallet_row(
-        self, env
+    @pytest.mark.parametrize(
+        "column, value",
+        [
+            ("wallet_rate_usdt_egp", "not-a-rate"),
+            ("rate_provider", "bogus-exchange"),
+            ("rate_captured_at", "not-a-timestamp"),
+            # credited_usdt_units=0 is impossible even by raw SQL:
+            # the column carries CHECK (IS NULL OR > 0).
+        ],
+    )
+    def test_corrupt_snapshot_rejected_with_zero_mutation(
+        self, env, column, value
     ):
-        """An unfunded user's wallet row is never even created by a
-        rejected EGP credit attempt."""
-        request = self._egp_request(env)
+        """A corrupted frozen snapshot is refused BEFORE any
+        wallet/ledger write — nothing is guessed, the current rate is
+        never substituted."""
+        _fund()
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+        _exec(
+            env,
+            f"UPDATE deposit_requests SET {column} = ? "
+            "WHERE request_id = ?",
+            (value, request.request_id),
+        )
 
         with pytest.raises(DepositAssetNotCreditableError):
             _verify(request.request_id, units=5000)
 
-        assert _wallet_units(env) is None
+        assert _wallet_units(env) == (FUND, 0)
         assert _deposit_ledger(env, request.request_id) == []
         assert _row(env, request.request_id)["status"] == "pending"
+
+    def test_egp_amount_check_stays_in_egp_units(self, env):
+        """The verified amount must equal the request's OWN units
+        (EGP cents) — a USDT-style unit count is a mismatch, with
+        zero mutation."""
+        _fund()
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+
+        with pytest.raises(DepositAmountMismatchError):
+            _verify(request.request_id, units=AMOUNT_UNITS)
+
+        assert _wallet_units(env) == (FUND, 0)
+        assert _deposit_ledger(env, request.request_id) == []
+        assert _row(env, request.request_id)["status"] == "pending"
+
+    def test_egp_credit_is_idempotent_exactly_once(self, env):
+        """A replayed verification with the SAME tx id reports the
+        SAME credited units without touching the wallet or ledger
+        again; a different tx id is a conflict — credited once, ever."""
+        _fund()
+        request = _egp_request(env, rate=self.FROZEN_RATE)
+
+        first = _verify(request.request_id, units=5000)
+        assert first.already_credited is False
+        assert first.amount_units == self.FROZEN_UNITS
+
+        replay = _verify(request.request_id, units=5000)
+        assert replay.already_credited is True
+        assert replay.amount_units == self.FROZEN_UNITS
+
+        assert _wallet_units(env) == (FUND + self.FROZEN_UNITS, 0)
+        assert len(_deposit_ledger(env, request.request_id)) == 1
+
+        with pytest.raises(DepositAlreadyCreditedError):
+            _verify(
+                request.request_id,
+                units=5000,
+                tx="0xfeedfacecafe0123456789abcdef",
+            )
+        assert _wallet_units(env) == (FUND + self.FROZEN_UNITS, 0)
+        assert len(_deposit_ledger(env, request.request_id)) == 1

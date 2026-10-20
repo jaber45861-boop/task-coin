@@ -722,8 +722,20 @@ class TestScopePolicy(WalletTestBase):
         receipt amount in the request's OWN asset (replacing the
         hardcoded USDT suffix) — presentation only, no wallet
         behaviour, no amount parsing client-side.
-        Every other Mini App file — wallet.js, wallet-data.js, the
-        rest — must stay byte-identical.
+        The approved balance-display fix binds the shared balance
+        source itself: ``miniapp/js/wallet-data.js`` now reads the
+        caller's REAL balance from the read-only ``GET /api/me``
+        (the same initData-authenticated source ``profile.js``
+        uses), with a loading state and an em-dash/error state on
+        failure — integer USDT/EGP units only, no float maths, no
+        invented values, no mutation.  Its two approved consumers
+        fill in when that read resolves: ``miniapp/js/home.js``
+        (welcome-card balance lines) and ``miniapp/js/wallet.js``
+        («رصيدك الحالي» card) both render the neutral «—» while the
+        read is in flight and replace it only with a
+        backend-confirmed value — no fetch of their own, no float
+        maths, no invented values.
+        Every other Mini App file must stay byte-identical.
         """
         repo_root = os.path.dirname(os.path.abspath(__file__))
         try:
@@ -747,6 +759,8 @@ class TestScopePolicy(WalletTestBase):
             "miniapp/index.html",       # task-request.js / guide.js / task-stats.js tags
             "miniapp/css/app.css",      # .taskreq-* / .guide-* overlay styles
             "miniapp/js/deposit.js",    # receipt amount in the request's asset
+            "miniapp/js/wallet-data.js",  # real balance from GET /api/me (approved fix)
+            "miniapp/js/wallet.js",     # «رصيدك الحالي» card fills on balance arrival
         }
         changed = {
             # porcelain line: 2 status chars + 1 space + path — parse

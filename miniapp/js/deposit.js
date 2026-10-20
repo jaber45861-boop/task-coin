@@ -100,10 +100,25 @@ const DepositUI = (() => {
         }
     }
 
+    /**
+     * The stored asset code when it is a real non-empty string —
+     * '' otherwise.  A missing asset must never render as
+     * "undefined"/"null" and NEVER falls back to a default currency
+     * (USDT or any other): the only currency ever shown is the
+     * server-provided one.
+     */
+    function _assetLabel(value) {
+        return (typeof value === 'string' && value.trim())
+            ? value.trim()
+            : '';
+    }
+
     function _composition(method) {
-        return method.network
-            ? `${method.asset} · ${method.network}`
-            : method.asset;
+        const asset = _assetLabel(method.asset);
+        if (method.network) {
+            return asset ? `${asset} · ${method.network}` : method.network;
+        }
+        return asset;
     }
 
     /* ── Overlay shell ──────────────────────────────────────────── */
@@ -260,7 +275,7 @@ const DepositUI = (() => {
                 <label class="withdrawal-field">
                     <span class="withdrawal-label">
                         المبلغ (<span data-testid="deposit-unit"
-                            >${_esc(first.asset)}</span>)
+                            >${_esc(_assetLabel(first.asset))}</span>)
                     </span>
                     <input class="withdrawal-input" type="text"
                            inputmode="decimal" autocomplete="off"
@@ -282,7 +297,7 @@ const DepositUI = (() => {
             overlay.querySelector('[data-testid="deposit-details"]')
                 .innerHTML = _renderMethodDetails(method);
             overlay.querySelector('[data-testid="deposit-unit"]')
-                .textContent = method.asset;
+                .textContent = _assetLabel(method.asset);
             _wireDetails(method);
         });
 
@@ -375,6 +390,12 @@ const DepositUI = (() => {
                 _formError(_messageFor(data));
                 return;
             }
+            // Release the lock BEFORE swapping to the created panel:
+            // that panel wires its OWN handlers (proof upload, done)
+            // and _uploadProof() guards on `busy` first.  Leaving it
+            // true here would make «إرسال إثبات الدفع» silently dead
+            // for this request — the exact production regression.
+            busy = false;
             _renderCreated(data.request, data.message);
         } catch (err) {
             busy = false;

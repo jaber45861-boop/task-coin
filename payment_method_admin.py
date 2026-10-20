@@ -53,12 +53,15 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import asset_units
+import db
 import payment_method_store as store
 from config import is_admin
 from payment_method_store import (
     CATEGORY_LABELS,
     EMPTY_FIELD,
     PaymentMethod,
+    PaymentMethodError,
+    PaymentMethodNotFoundError,
     PaymentMethodValidationError,
 )
 
@@ -121,6 +124,43 @@ PAGE_SIZE = 5
 MSG_ADMIN_ONLY = "⛔ هذا الأمر للمشرفين فقط."
 MSG_INVALID = "⛔ طلب غير صالح."
 MSG_NOT_FOUND = "⛔ الوسيلة غير موجودة."
+
+
+def _format_method(method: PaymentMethod) -> str:
+    """Stable one-line method summary used by preview and confirmation
+    messages.  Only stored facts are shown — never the destination.
+    """
+    return (
+        f"#{method.id} ({method.asset})"
+        + (f" · {method.network}" if method.network else "")
+        + f" — {_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
+    )
+
+
+def _min_deposit_display(fields: dict) -> str:
+    """Human-readable minimum for one method/state — the ONE shared
+    formatter.
+
+    ``None``/missing units render as not-configured.  If the asset has
+    no registered scale or the stored units are invalid, never present
+    the atomic integer as if it were an amount in the asset's currency.
+    Used by the preview/confirmation rendering, the wizard summary and
+    the /repairdepositminimums plan.
+    """
+    asset = fields.get("asset", "")
+    units = fields.get("min_deposit_units")
+    if units is None:
+        return "غير مضبوط"
+    try:
+        return (
+            str(asset_units.units_to_asset_decimal(units, asset))
+            + (f" {asset}" if asset else "")
+        )
+    except asset_units.UnknownAssetScaleError:
+        return "غير معروض (مقياس الأصل غير مسجل)"
+    except asset_units.AssetAmountError:
+        return "غير معروض (قيمة مخزنة غير صالحة)"
+
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 
 PANEL_HEADER = "💰 إدارة وسائل الدفع"
@@ -142,8 +182,16 @@ PAGE_PREV = "◀️ السابق"
 
 STATUS_ACTIVE = "🟢 نشطة"
 STATUS_INACTIVE = "🔴 متوقفة"
-DEPOSIT_ON = "الإيداع: 🟢 متاح"
-DEPOSIT_OFF = "الإيداع: 🔴 غير متاح"
+DEPOSIT_ON = "الإيداع: 🟢 مفعّل"
+DEPOSIT_OFF = "الإيداع: 🔴 غير مفعّل"
+DEPOSIT_UNAVAILABLE_HEADER = "⚠️ وسائل إيداع مفعّلة لا يمكنها استقبال الطلبات:"
+DEPOSIT_UNAVAILABLE_LABEL = "⚠️ لا يمكن استقبال الإيداعات:"
+DEPOSIT_UNAVAILABLE_REASONS = {
+    "inactive": "الوسيلة غير نشطة",
+    "asset": "مقياس الأصل غير مسجل",
+    "minimum_missing": "الحد الأدنى غير مضبوط",
+    "minimum_invalid": "الحد الأدنى غير صالح",
+}
 
 DEST_LABEL = {"crypto": "العنوان", "cash": "الحساب"}
 
@@ -197,7 +245,7 @@ WZ_PROMPT_DESTINATION = (
 )
 WZ_PROMPT_INSTRUCTIONS = "📝 أرسل ملاحظات أو اضغط \"تخطي\":"
 WZ_PROMPT_MIN_DEPOSIT = (
-    "💵 أرسل الحد الأدنى للإيداع بوحدة العملة الحالية (مثال: 50):\n\n"
+    "💵 أرسل الحد الأدنى للإيداع بوحدة العملة الحالية، لا بوحداتها الذرية.\n\n"
     "اكتب 0 لمسح الحد الأدنى (يُرفض الإيداع حتى تضبطه من جديد)."
 )
 WZ_PROMPT_MIN_DEPOSIT_NO_ASSET = (
@@ -318,13 +366,58 @@ def _field_or_dash(value: str | None) -> str:
 # ── Rendering (pure, deterministic, bounded) ──────────────────────────
 
 
+def _deposit_unavailable_reasons(method: PaymentMethod) -> tuple[str, ...]:
+    """Explain why an opted-in deposit method currently rejects requests.
+
+    This is a read-only diagnostic mirroring the fail-closed checks in
+    ``deposit_store.create_deposit_request``. Methods not opted in for
+    deposits are intentionally omitted from this warning.
+    """
+    if not method.deposits_enabled:
+        return ()
+
+    reasons: list[str] = []
+    if not method.is_active:
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["inactive"])
+    if not asset_units.is_supported(method.asset):
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["asset"])
+
+    minimum = method.min_deposit_units
+    if minimum is None:
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["minimum_missing"])
+    elif (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or minimum <= 0
+    ):
+        reasons.append(DEPOSIT_UNAVAILABLE_REASONS["minimum_invalid"])
+    return tuple(reasons)
+
+
 def build_panel_text(methods: list[PaymentMethod]) -> str:
     active = sum(1 for m in methods if m.is_active)
-    return (
+    text = (
         f"{PANEL_HEADER}\n"
         f"النشطة: {active} — الإجمالي: {len(methods)}\n\n"
         "استخدم ➕ لإظهار صيغة الإضافة، أو 📋 لعرض الوسائل."
     )
+    unavailable = [
+        (method, reasons)
+        for method in methods
+        if (reasons := _deposit_unavailable_reasons(method))
+    ]
+    if not unavailable:
+        return text
+
+    lines = ["", "", DEPOSIT_UNAVAILABLE_HEADER]
+    for method, reasons in unavailable[:PAGE_SIZE]:
+        lines.append(
+            f"• #{method.id} {method.display_name}: {'، '.join(reasons)}"
+        )
+    remaining = len(unavailable) - PAGE_SIZE
+    if remaining > 0:
+        lines.append(f"• و{remaining} وسيلة أخرى؛ راجع 📋 عرض الوسائل.")
+    return text + "\n".join(lines)
 
 
 def build_panel_keyboard() -> InlineKeyboardMarkup:
@@ -361,6 +454,12 @@ def _method_lines(
         lines.append(
             f"   {DEPOSIT_ON if method.deposits_enabled else DEPOSIT_OFF}"
         )
+        unavailable_reasons = _deposit_unavailable_reasons(method)
+        if unavailable_reasons:
+            lines.append(
+                f"   {DEPOSIT_UNAVAILABLE_LABEL} "
+                f"{'، '.join(unavailable_reasons)}"
+            )
         lines.append("")
     return lines
 
@@ -854,25 +953,6 @@ def build_wizard_summary(state: dict) -> str:
     )
 
 
-def _min_deposit_display(state: dict) -> str:
-    """Staged minimum in the staged asset's unit — never invented.
-
-    ``None`` renders as not-configured; an unregistered asset falls
-    back to the raw integer units so the review text never breaks.
-    """
-    units = state.get("min_deposit_units")
-    if units is None:
-        return "غير مضبوط"
-    try:
-        return str(
-            asset_units.units_to_asset_decimal(
-                units, state.get("asset")
-            )
-        )
-    except asset_units.AssetUnitsError:
-        return str(units)
-
-
 def build_review_text(state: dict) -> str:
     return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
 
@@ -1105,32 +1185,40 @@ async def add_pm_command(update, context) -> None:
         # stays byte-for-byte compatible for existing scripts.
         await _start_add_wizard(actor, message)
         return
-    form = parse_add_form(body)
-    if form is None:
-        await message.reply_text(MSG_USAGE_ADD)
-        return
-    category, name, asset, network, provider, destination, instructions = form
-    try:
-        created = store.create_payment_method(
-            category=category,
-            display_name=name,
-            asset=asset,
-            network=network,
-            provider=provider,
-            destination=destination,
-            instructions=instructions,
-            created_by=actor,
+
+    async def _run_add_pipe() -> bool:
+        form = parse_add_form(body)
+        if form is None:
+            await message.reply_text(MSG_USAGE_ADD)
+            return False
+        category, name, asset, network, provider, destination, instructions = form
+        try:
+            created = store.create_payment_method(
+                category=category,
+                display_name=name,
+                asset=asset,
+                network=network,
+                provider=provider,
+                destination=destination,
+                instructions=instructions,
+                created_by=actor,
+            )
+
+        except PaymentMethodValidationError as exc:
+            await message.reply_text(f"❌ {exc}")
+            return False
+        except Exception:
+            logger.exception("Payment method create failed: admin=%d", actor)
+            await message.reply_text(MSG_ERROR)
+            return False
+        await message.reply_text(
+            build_created_text(created), reply_markup=_list_again_button()
         )
-    except PaymentMethodValidationError as exc:
-        await message.reply_text(f"❌ {exc}")
+        return True
+
+    if not await _run_add_pipe():
         return
-    except Exception:
-        logger.exception("Payment method create failed: admin=%d", actor)
-        await message.reply_text(MSG_ERROR)
-        return
-    await message.reply_text(
-        build_created_text(created), reply_markup=_list_again_button()
-    )
+
 
 
 async def edit_pm_command(update, context) -> None:
@@ -1155,41 +1243,222 @@ async def edit_pm_command(update, context) -> None:
         # stays unchanged for existing scripts).
         await _start_edit_wizard(actor, int(body), message)
         return
-    parsed = parse_edit_form(body)
-    if parsed is None:
-        await message.reply_text(MSG_USAGE_EDIT)
-        return
-    method_id, form = parsed
-    category, name, asset, network, provider, destination, instructions = form
-    try:
-        updated = store.update_payment_method(
-            method_id,
-            category=category,
-            display_name=name,
-            asset=asset,
-            network=network,
-            provider=provider,
-            destination=destination,
-            instructions=instructions,
-            updated_by=actor,
+
+    async def _run_edit_pipe():
+        """Shared pipe-form path used by both /editpm and the repair
+        command so edits can run inside an existing transaction.
+        Ownership stays with the caller: the repair command supplies
+        its own live transaction connection explicitly, and a plain
+        invocation opens the standard self-contained write scope."""
+        parsed = parse_edit_form(body)
+        if parsed is None:
+            await message.reply_text(MSG_USAGE_EDIT)
+            return False
+        method_id, form = parsed
+        category, name, asset, network, provider, destination, instructions = form
+        try:
+            updated = store.update_payment_method(
+                method_id,
+                category=category,
+                display_name=name,
+                asset=asset,
+                network=network,
+                provider=provider,
+                destination=destination,
+                instructions=instructions,
+                updated_by=actor,
+            )
+        except PaymentMethodValidationError as exc:
+            await message.reply_text(f"❌ {exc}")
+            return False
+        except Exception:
+            logger.exception(
+                "Payment method update failed: id=%s admin=%d",
+                method_id, actor,
+            )
+            await message.reply_text(MSG_ERROR)
+            return False
+        if updated is None:
+            await message.reply_text(MSG_NOT_FOUND)
+            return False
+        await message.reply_text(
+            f"✅ تم تعديل الوسيلة #{updated.id}",
+            reply_markup=_list_again_button(),
         )
+        return True
+
+    if not await _run_edit_pipe():
+        return
+
+
+async def repair_deposit_minimums_command(update, context) -> None:
+    """Safely apply the approved minimums to payment methods #1 and #2.
+
+    The first invocation is read-only. A private, authorized admin must
+    explicitly repeat with ``APPLY``. Both target ids/assets and amounts
+    are checked before either write, and both existing store updates run
+    in one transaction so any failure rolls back the pair.
+    """
+    if _non_private_chat(update):
+        return
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    actor = _actor_id(getattr(getattr(update, "effective_user", None), "id", None))
+    if actor is None:
+        return
+    if not is_admin(actor):
+        await message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    body = _command_body(message)
+    if body not in ("", "APPLY"):
+        await message.reply_text(
+            "الاستخدام: /repairdepositminimums للمعاينة، ثم "
+            "/repairdepositminimums APPLY للتطبيق."
+        )
+        return
+
+    # Targets mirror the ACTIVE production deposit methods (ids + the
+    # asset each one really stores).  Both values are the operator's
+    # approved policy — not invented defaults — so a mismatched id or
+    # asset is refused before anything is written.
+    approved_targets = ((3, "EGP", "50"), (4, "USDT", "1"))
+
+    def _prepare(connection):
+        prepared = []
+        problems = []
+        for method_id, expected_asset, amount_text in approved_targets:
+            method = store.get_payment_method(
+                method_id, connection=connection
+            )
+            if method is None:
+                problems.append(f"الوسيلة #{method_id} غير موجودة")
+                continue
+            # Compare the asset case-insensitively: the stored label may
+            # be "usdt" / "USDT" while the scale (asset_units) is the
+            # same, so only a DIFFERENT currency is a mismatch.
+            if method.asset.casefold() != expected_asset.casefold():
+                problems.append(
+                    f"الوسيلة #{method_id}: الأصل الحالي {method.asset} "
+                    f"ولا يطابق الأصل المتوقع {expected_asset}"
+                )
+                continue
+            try:
+                units = store.validate_min_deposit_units(
+                    amount_text, expected_asset
+                )
+            except PaymentMethodValidationError as exc:
+                problems.append(f"الوسيلة #{method_id}: {exc}")
+                continue
+            if units is None:
+                problems.append(
+                    f"الوسيلة #{method_id}: الحد المعتمد غير صالح"
+                )
+                continue
+            prepared.append(
+                (method, expected_asset, amount_text, units)
+            )
+        return prepared, problems
+
+    async def _render_plan(prepared):
+        return "\n".join(
+            f"#{method.id} ({expected_asset}): "
+            f"{_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
+            f" ← {_min_deposit_display({'asset': expected_asset, 'min_deposit_units': units})}"
+            for method, expected_asset, _amount_text, units in prepared
+        )
+
+    if body != "APPLY":
+        with db.get_connection() as connection:
+            prepared, problems = _prepare(connection)
+        if problems:
+            await message.reply_text(
+                "❌ أُوقفت المعاينة دون أي تعديل:\n"
+                + "\n".join(problems)
+            )
+            return
+        await message.reply_text(
+            "معاينة فقط — لم يُحفظ أي تغيير:\n"
+            + await _render_plan(prepared)
+            + "\n\nللتطبيق بعد مراجعة المعرّفات والأصول أرسل "
+            "/repairdepositminimums APPLY"
+        )
+        return
+
+    async def _apply():
+        # One transaction owned HERE and passed explicitly to every
+        # store call below — a caller-owned connection is borrowed,
+        # never committed/rolled back/closed by the store itself.
+        # The success reply is sent ONLY after this ``with`` block
+        # exits (i.e. after COMMIT): a commit failure rolls back and
+        # raises, so no false "saved" message can be sent.
+        with db.transaction() as connection:
+            prepared, problems = _prepare(connection)
+            if problems:
+                await message.reply_text(
+                    "❌ أُوقف التطبيق قبل الكتابة:\n"
+                    + "\n".join(problems)
+                )
+                return None
+            for method, _expected_asset, amount_text, _units in prepared:
+                updated = store.update_payment_method(
+                    method.id,
+                    category=method.category,
+                    display_name=method.display_name,
+                    asset=method.asset,
+                    network=method.network,
+                    provider=method.provider,
+                    destination=method.destination,
+                    instructions=method.instructions,
+                    min_deposit_units=amount_text,
+                    updated_by=actor,
+                    connection=connection,
+                )
+                if updated is None:
+                    raise RuntimeError(
+                        f"Payment method #{method.id} disappeared during repair"
+                    )
+            saved = []
+            for method, expected_asset, _amount_text, units in prepared:
+                current = store.get_payment_method(
+                    method.id, connection=connection
+                )
+                if (
+                    current is None
+                    or current.asset.casefold() != expected_asset.casefold()
+                    or current.min_deposit_units != units
+                ):
+                    raise RuntimeError(
+                        f"Payment method #{method.id} did not verify after repair"
+                    )
+                saved.append(current)
+        # COMMIT has succeeded at this point — only now is success sent.
+        await message.reply_text(
+            "✅ تم حفظ الحدين والتحقق منهما:\n"
+            + "\n".join(
+                f"#{method.id} ({method.asset}): "
+                f"{_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
+                for method in saved
+            )
+        )
+        return True
+
+    try:
+        if not await _apply():
+            return
     except PaymentMethodValidationError as exc:
-        await message.reply_text(f"❌ {exc}")
+        await message.reply_text(f"❌ {exc} لم يُحفظ أي تغيير.")
         return
     except Exception:
         logger.exception(
-            "Payment method update failed: id=%s admin=%d",
-            method_id, actor,
+            "Approved deposit minimum repair failed: admin=%d", actor
         )
-        await message.reply_text(MSG_ERROR)
+        await message.reply_text(
+            "❌ تعذر تطبيق الإعداد. تم التراجع عن العملية؛ لم يُحفظ "
+            "أي تغيير."
+        )
         return
-    if updated is None:
-        await message.reply_text(MSG_NOT_FOUND)
-        return
-    await message.reply_text(
-        f"✅ تم تعديل الوسيلة #{updated.id}",
-        reply_markup=_list_again_button(),
-    )
 
 
 async def wizard_text_input(update, context) -> None:

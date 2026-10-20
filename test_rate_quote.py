@@ -247,10 +247,16 @@ class TestProviderBoundary(unittest.TestCase):
                 with self.assertRaises(UnknownRateProviderError):
                     validate_rate_provider(value)
 
-    def test_M_only_manual_accepted(self):
-        """M. Only ``"manual"`` is an approved source — no fake
-        providers, case-sensitively."""
-        self.assertEqual(APPROVED_RATE_PROVIDERS, frozenset({"manual"}))
+    def test_M_approved_providers(self):
+        """M. Only explicitly approved sources are accepted,
+        case-sensitively — ``"manual"`` (emergency), ``"coingecko"``
+        and ``"coinbase"`` (automatic), nothing else."""
+        self.assertEqual(
+            APPROVED_RATE_PROVIDERS,
+            frozenset({"manual", "coingecko", "coinbase"}),
+        )
+        self.assertEqual(validate_rate_provider("coingecko"), "coingecko")
+        self.assertEqual(validate_rate_provider("coinbase"), "coinbase")
         for value in ("api", "binance", "Manual", "MANUAL", "live", "auto"):
             with self.subTest(value=value):
                 with self.assertRaises(UnknownRateProviderError):
