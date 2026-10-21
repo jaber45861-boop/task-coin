@@ -12,6 +12,14 @@ mutations and no money logic of its own:
                           (a user without a wallet row reads
                           as a real zero — the wallet service
                           contract, never "unknown")
+    - EGP display equivalent
+                          ``rate_quote.usdt_units_to_egp_
+                          display()`` over the CURRENT fresh
+                          ``current_rate`` quote — an ESTIMATE
+                          at today's market rate, never a
+                          withdrawable EGP balance.  Absent
+                          (``None``) when no fresh, valid rate
+                          exists.
     - task counts         ``db.list_user_tasks()`` → the
                           caller's own ``user_tasks`` rows
     - lifetime earnings   ``LedgerService.list_user_entries()``
@@ -39,12 +47,47 @@ service only ever sees the already-verified ``user_id``.
 import db
 import wallet
 from ledger import LedgerService
+from rate_quote import usdt_units_to_egp_display
+from rate_store import (
+    get_current_quote,
+    InvalidPersistedRateError,
+    RateStaleError,
+    RateUnavailableError,
+)
 
 # The one earnings source: task-completion rewards.
 # task_reward.py writes exactly these ledger rows
 # (TASK_REFERENCE_TYPE = "task").
 _EARNINGS_ENTRY_TYPE = "credit"
 _EARNINGS_REFERENCE_TYPE = "task"
+
+
+def _egp_display_minor(available_units: int) -> int | None:
+    """The wallet's current EGP display value, in integer piastres.
+
+    Computed from the wallet's own integer USDT units and the
+    CURRENT fresh market quote (``EGP per 1 USDT``) using the
+    project's one-way display helper, whose rounding rule is the
+    established MT-ADMIN-17 contract:
+
+        ROUND_HALF_UP to 0.01 EGP
+
+    ``0`` → ``0`` (a real zero displays as a real zero).  ``None``
+    — never an invented number — when no rate has ever been set,
+    when the stored quote has aged past its TTL, or when the stored
+    row is not a valid, approved quote.
+
+    This is an ESTIMATE shown beside the balance. It is not a
+    withdrawable EGP balance, and it is never used for money.
+    """
+    if available_units == 0:
+        return 0
+    try:
+        quote = get_current_quote()
+    except (RateUnavailableError, RateStaleError, InvalidPersistedRateError):
+        return None
+    egp = usdt_units_to_egp_display(available_units, quote)
+    return int(egp * 100)
 
 
 def _user_has_wallet(user_id: int) -> bool:
@@ -66,7 +109,10 @@ def load_summary(user_id: int) -> dict:
 
     Returns:
         {
-            "wallet": {"available_units": int} | null,
+            "wallet": {
+                "available_units": int,
+                "egp_display_minor": int | null,
+            } | null,
             "stats": {
                 "completed_tasks": int,
                 "in_progress_tasks": int,
@@ -76,9 +122,13 @@ def load_summary(user_id: int) -> dict:
 
     ``wallet`` is ``null`` when the user has no wallet row at all
     (never had a wallet created).  When the user has a wallet —
-    even with a zero balance — ``wallet`` is
-    ``{"available_units": <int>}`` with the real available_units
-    from ``wallets.available_units``.
+    even with a zero balance — ``wallet`` carries the real
+    ``available_units`` from ``wallets.available_units`` plus
+    ``egp_display_minor``, the wallet's ESTIMATE at the current
+    market rate in integer piastres (``100`` piastres = 1 EGP).
+    ``egp_display_minor`` is ``null`` only when no fresh, valid
+    rate exists — never an invented figure.  It is a display
+    equivalent, NOT a withdrawable EGP balance.
 
     All money is integer USDT units (1 USDT = 100,000,000
     units).  A user with no wallet, no tasks and no earnings
@@ -89,9 +139,13 @@ def load_summary(user_id: int) -> dict:
             (the transport guarantees an existing user).
         InvalidLedgerEntryError: malformed user_id.
     """
-    wallet_data = None if not _user_has_wallet(user_id) else {
-        "available_units": wallet.wallet_units(user_id).available_units,
-    }
+    wallet_data = None
+    if _user_has_wallet(user_id):
+        available = wallet.wallet_units(user_id).available_units
+        wallet_data = {
+            "available_units": available,
+            "egp_display_minor": _egp_display_minor(available),
+        }
 
     rows = db.list_user_tasks(user_id)
     completed_tasks = sum(

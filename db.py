@@ -646,12 +646,20 @@ def init_db(db_path: str | None = None) -> None:
                 type TEXT NOT NULL,
                 reward INTEGER NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
+                paused INTEGER NOT NULL DEFAULT 0,
                 task_data TEXT,
                 repeat_policy TEXT NOT NULL DEFAULT 'one_time',
                 repeat_hours INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP,
                 reward_units INTEGER,
                 commission_units INTEGER,
+                -- MT-TASK-28: OPTIONAL execution limits.  NULL means "not
+                -- configured" and preserves the exact legacy behaviour
+                -- (unlimited executions / a start that never expires).
+                -- No default number is ever invented for a legacy row.
+                max_executions INTEGER,
+                reservation_minutes INTEGER,
                 CHECK (repeat_policy IN ('one_time', 'repeatable')),
                 CHECK (
                     (repeat_policy = 'one_time' AND repeat_hours IS NULL)
@@ -682,6 +690,39 @@ def init_db(db_path: str | None = None) -> None:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # ── Execution capacity columns (MT-TASK-28) ────────────────
+        # Additive and NULLable: a pre-existing row keeps NULL for
+        # both, i.e. unlimited executions and a start that never
+        # expires — the exact behaviour before these columns existed.
+        # No default number is ever invented for a legacy row.
+        try:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN max_executions INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN reservation_minutes INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # A value that is not a positive integer is not a policy — it is
+        # garbage.  Normalising it to NULL restores the legacy
+        # (unlimited / never expires) behaviour instead of letting a
+        # corrupt number silently shrink or block capacity.  Only
+        # strictly-positive integers survive; every other shape
+        # (0, negative) becomes NULL.
+        conn.execute(
+            "UPDATE tasks SET max_executions = NULL "
+            "WHERE max_executions IS NOT NULL AND max_executions <= 0"
+        )
+        conn.execute(
+            "UPDATE tasks SET reservation_minutes = NULL "
+            "WHERE reservation_minutes IS NOT NULL "
+            "AND reservation_minutes <= 0"
+        )
 
         # ── Authoritative atomic task reward (MT-ADMIN-13) ─────────
         # Additive migration: ``reward_units`` stores the reward in
@@ -737,6 +778,44 @@ def init_db(db_path: str | None = None) -> None:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # ── Pause / archive columns (MT-ADMIN-36) ────────────────
+        # ``paused`` lets an admin temporarily stop new assignments for a
+        # task while keeping existing claims, cycles and financial
+        # records untouched.  ``archived_at`` soft-deletes a task (hide
+        # it from lists) instead of hard-deleting when dependencies make
+        # a real delete unsafe.
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN archived_at TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # ── Admin audit log (MT-ADMIN-36) ────────────────────────
+        # Append-only record of admin task-management actions: who did
+        # what, when, on which target, and which fields changed.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                field_changes TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin
+            ON admin_audit_log (admin_id, id DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_target
+            ON admin_audit_log (target_type, target_id, id DESC)
+        """)
+
         # ── User task state table ────────────────────────────────
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_tasks (
@@ -745,11 +824,26 @@ def init_db(db_path: str | None = None) -> None:
                 status TEXT NOT NULL DEFAULT 'available',
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
+                -- MT-TASK-28: the deadline of the CURRENT reservation,
+                -- computed from the task's reservation_minutes policy
+                -- and the persisted start instant.  NULL means "no
+                -- deadline" (a legacy task, or a cycle that is not
+                -- holding a reservation).
+                reserved_until TIMESTAMP,
                 PRIMARY KEY (user_id, task_id),
                 FOREIGN KEY (user_id) REFERENCES users(user_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id)
             )
         """)
+        # Migration: the per-cycle reservation deadline (MT-TASK-28).
+        # Additive and NULLable — existing rows keep NULL, i.e. "never
+        # expires", exactly as before the column existed.
+        try:
+            conn.execute(
+                "ALTER TABLE user_tasks ADD COLUMN reserved_until TIMESTAMP"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # ── Task funding record (roadmap 4: advertiser funding) ────
         # One row per funded task — the immutable per-task funding
@@ -1815,6 +1909,32 @@ def validate_repeat_policy(repeat_policy, repeat_hours) -> tuple[str, int | None
     return repeat_policy, repeat_hours
 
 
+def _validate_execution_limit(value, field: str) -> int | None:
+    """Validate an OPTIONAL MT-TASK-28 execution limit.
+
+    Mirrors ``task_capacity.validate_max_executions`` /
+    ``validate_reservation_minutes`` exactly, but lives here because
+    ``task_capacity`` imports ``db`` — importing it back would create
+    a circular import.  Both sides must agree, so the rules are kept
+    identical:
+
+    - None            → None ("not configured" = legacy behaviour)
+    - a positive int  → returned unchanged
+    - anything else   → ValueError (0, negatives, bools, floats, text)
+
+    The ceiling is NOT checked here: it is an application-layer policy
+    (``task_capacity``) and the database layer only guarantees the
+    value is a sane positive integer.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
 def create_task(title: str, description: str, task_type: str, reward: int,
                 active: bool = True, db_path: str | None = None,
                 task_data: str | None = None,
@@ -1822,7 +1942,9 @@ def create_task(title: str, description: str, task_type: str, reward: int,
                 repeat_hours: int | None = None,
                 conn: sqlite3.Connection | None = None,
                 reward_units: int | None = None,
-                commission_units: int | None = None) -> int:
+                commission_units: int | None = None,
+                max_executions: int | None = None,
+                reservation_minutes: int | None = None) -> int:
     """Create a new task definition. Returns the new task ID.
 
     Args:
@@ -1846,6 +1968,15 @@ def create_task(title: str, description: str, task_type: str, reward: int,
             VERBATIM, never derived, never recomputed.  When None
             (legacy/direct callers, pre-MT-ADMIN-16 rows) the column
             stays NULL; nothing is invented.
+        max_executions: Optional total executions allowed over the task's
+            life (MT-TASK-28).  None (the default) means "not
+            configured" = unlimited executions = the exact legacy
+            behaviour.  When given, it must be a positive integer; the
+            ceiling is enforced by ``task_capacity``.
+        reservation_minutes: Optional minutes a user may hold an
+            unfinished start (MT-TASK-28).  None means "not configured"
+            = the start never expires = the exact legacy behaviour.
+            When given, it must be a positive integer.
     """
     if not title or not title.strip():
         raise ValueError("title cannot be empty")
@@ -1888,16 +2019,29 @@ def create_task(title: str, description: str, task_type: str, reward: int,
     repeat_policy, repeat_hours = validate_repeat_policy(
         repeat_policy, repeat_hours
     )
+    # MT-TASK-28: the OPTIONAL execution limits.  Validated here (the
+    # database layer is the last line of defence) with the SAME rules
+    # ``task_capacity`` uses, so a task row can never carry a
+    # non-positive or non-integer limit.  None stays None = unlimited
+    # executions / never expires = the exact legacy behaviour.
+    max_executions = _validate_execution_limit(
+        max_executions, "max_executions"
+    )
+    reservation_minutes = _validate_execution_limit(
+        reservation_minutes, "reservation_minutes"
+    )
 
     insert_sql = (
         "INSERT INTO tasks "
         "(title, description, type, reward, active, task_data, "
-        " repeat_policy, repeat_hours, reward_units, commission_units) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " repeat_policy, repeat_hours, reward_units, commission_units, "
+        " max_executions, reservation_minutes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     values = (title.strip(), description.strip(), task_type.strip(), reward,
               int(active), task_data, repeat_policy, repeat_hours,
-              reward_units, commission_units)
+              reward_units, commission_units, max_executions,
+              reservation_minutes)
 
     if conn is not None:
         cursor = conn.execute(insert_sql, values)
@@ -1917,8 +2061,9 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT id, title, description, type, reward, reward_units, "
-            "commission_units, active, task_data, repeat_policy, "
-            "repeat_hours, created_at "
+            "commission_units, active, paused, task_data, repeat_policy, "
+            "repeat_hours, created_at, archived_at, max_executions, "
+            "reservation_minutes "
             "FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
@@ -1932,28 +2077,48 @@ def get_task(task_id: int, db_path: str | None = None) -> dict | None:
                 "reward_units": row["reward_units"],
                 "commission_units": row["commission_units"],
                 "active": bool(row["active"]),
+                "paused": bool(row["paused"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],
                 "repeat_hours": row["repeat_hours"],
                 "created_at": row["created_at"],
+                "archived_at": row["archived_at"],
+                # MT-TASK-28: the OPTIONAL execution limits.  None means
+                # "not configured" = unlimited executions / a start that
+                # never expires = the exact legacy behaviour.
+                "max_executions": row["max_executions"],
+                "reservation_minutes": row["reservation_minutes"],
             }
         return None
 
 
-def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[dict]:
-    """List all tasks, optionally filtering to active only."""
+def list_tasks(
+    active_only: bool = False,
+    include_archived: bool = False,
+    db_path: str | None = None,
+) -> list[dict]:
+    """List all tasks, optionally filtering to active only.
+
+    Archived tasks (``archived_at IS NOT NULL``) are excluded by
+    default; pass ``include_archived=True`` to see them too.
+    """
     with get_connection(db_path) as conn:
         columns = (
             "id, title, description, type, reward, reward_units, "
-            "commission_units, active, "
-            "task_data, repeat_policy, repeat_hours, created_at"
+            "commission_units, active, paused, "
+            "task_data, repeat_policy, repeat_hours, created_at, "
+            "archived_at"
         )
+        where = []
+        params: list = []
         if active_only:
-            cursor = conn.execute(
-                f"SELECT {columns} FROM tasks WHERE active = 1"
-            )
-        else:
-            cursor = conn.execute(f"SELECT {columns} FROM tasks")
+            where.append("active = 1")
+        if not include_archived:
+            where.append("archived_at IS NULL")
+        sql = f"SELECT {columns} FROM tasks"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        cursor = conn.execute(sql, params)
         return [
             {
                 "id": row["id"],
@@ -1964,10 +2129,12 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
                 "reward_units": row["reward_units"],
                 "commission_units": row["commission_units"],
                 "active": bool(row["active"]),
+                "paused": bool(row["paused"]),
                 "task_data": row["task_data"],
                 "repeat_policy": row["repeat_policy"],
                 "repeat_hours": row["repeat_hours"],
                 "created_at": row["created_at"],
+                "archived_at": row["archived_at"],
             }
             for row in cursor.fetchall()
         ]
@@ -1975,7 +2142,8 @@ def list_tasks(active_only: bool = False, db_path: str | None = None) -> list[di
 
 def update_task(task_id: int, title: str | None = None, description: str | None = None,
                 task_type: str | None = None, reward: int | None = None,
-                active: bool | None = None, db_path: str | None = None,
+                active: bool | None = None, paused: bool | None = None,
+                db_path: str | None = None,
                 repeat_policy: str | None = None,
                 repeat_hours: int | None = None) -> bool:
     """Update a task. Returns True if the task existed and was updated.
@@ -2020,6 +2188,9 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
     if active is not None:
         fields.append("active = ?")
         values.append(int(active))
+    if paused is not None:
+        fields.append("paused = ?")
+        values.append(int(paused))
     if repeat_policy is not None or repeat_hours is not None:
         current = get_task(task_id, db_path)
         base_policy = (
@@ -2050,11 +2221,169 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
         return cursor.rowcount > 0
 
 
-def delete_task(task_id: int, db_path: str | None = None) -> bool:
-    """Delete a task. Returns True if the task existed."""
+def _task_dependency_count(conn: sqlite3.Connection, task_id: int) -> int:
+    """Count sensitive dependency rows referencing *task_id*.
+
+    Counts rows in ``user_tasks``, ``task_submissions``, ``task_funding``
+    and ledger entries whose ``reference_type='task'`` and
+    ``reference_id=task_id``.  admin_notifications about the task are
+    informational (kept, not deleted) and are not counted here.
+    """
+    total = 0
+    for table in ("user_tasks", "task_submissions", "task_funding"):
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {table} WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        total += row["c"]
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM ledger "
+        "WHERE reference_type = 'task' AND reference_id = ?",
+        (task_id,),
+    ).fetchone()
+    total += row["c"]
+    return total
+
+
+def get_task_dependencies(task_id: int, db_path: str | None = None) -> dict:
+    """Return dependency details for *task_id* before a delete decision.
+
+    Keys:
+      ``task_exists``    — whether the task row exists
+      ``user_tasks``     — count of user_task claims/cycles
+      ``submissions``    — count of task_submissions
+      ``funding``        — count of task_funding rows
+      ``ledger_entries`` — count of ledger entries referencing the task
+      ``total``          — total sensitive dependencies
+      ``safe_to_delete`` — True when total == 0
+    """
     with get_connection(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone() is not None
+        counts = {}
+        for table in ("user_tasks", "task_submissions", "task_funding"):
+            row = conn.execute(
+                f"SELECT COUNT(*) AS c FROM {table} WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            counts[table] = row["c"]
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM ledger "
+            "WHERE reference_type = 'task' AND reference_id = ?",
+            (task_id,),
+        ).fetchone()
+        counts["ledger"] = row["c"]
+        total = sum(counts.values())
+        return {
+            "task_exists": exists,
+            "user_tasks": counts["user_tasks"],
+            "submissions": counts["task_submissions"],
+            "funding": counts["task_funding"],
+            "ledger_entries": counts["ledger"],
+            "total": total,
+            "safe_to_delete": total == 0,
+        }
+
+
+def delete_task(task_id: int, force: bool = False,
+                db_path: str | None = None) -> bool:
+    """Delete a task. Returns True if the task existed and was deleted.
+
+    Sensitive dependencies (user_tasks, task_submissions, task_funding,
+    and ledger entries whose reference_type='task' and reference_id=task_id)
+    ALWAYS block deletion — ``force=True`` cannot bypass them.  This keeps
+    claims, cycles, funding rows and financial ledger entries intact even
+    when delete_task is called directly from code.
+
+    The dependency check and the DELETE run atomically inside one
+    ``BEGIN IMMEDIATE`` transaction (via ``db.transaction()``), so a
+    concurrent writer cannot insert a dependency between the check and
+    the delete.  If the task no longer exists by the time the delete
+    runs, the operation returns False.
+    """
+    with transaction(db_path) as conn:
+        # Existence check inside the transaction
+        exists = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone() is not None
+        if not exists:
+            return False
+
+        # Sensitive dependencies ALWAYS block deletion — force never bypasses
+        if _task_dependency_count(conn, task_id) > 0:
+            return False
+
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cursor.rowcount > 0
+
+
+# ── Task ownership & archive (MT-MINIAPP-USER-TASK-MANAGEMENT) ──────
+
+def get_task_advertiser(task_id: int,
+                        db_path: str | None = None) -> int | None:
+    """Return the advertiser (owner) user_id for *task_id*, or ``None``.
+
+    Ownership is established through the funding row
+    (``task_funding.advertiser_id``) — the authenticated actor who paid
+    the task's reward + commission at creation time.  This is the
+    server-side source of truth for "does this user own this task?".
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT advertiser_id FROM task_funding WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row["advertiser_id"]) if row is not None else None
+
+
+def archive_task(task_id: int,
+                 db_path: str | None = None) -> bool:
+    """Soft-archive a task: set ``archived_at = CURRENT_TIMESTAMP``.
+
+    Returns True if the task existed and was archived, False if it does
+    not exist or is already archived.  No rows are deleted — user_tasks,
+    task_submissions, task_funding, ledger entries and audit records all
+    stay intact.  Archived tasks are excluded from the public catalog
+    (``db.list_tasks`` excludes ``archived_at IS NOT NULL`` by default)
+    and cannot be started (``create_user_task`` / ``TaskStartGate`` both
+    reject them).
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT archived_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["archived_at"] is not None:
+            return False  # already archived — idempotent no-op
+        conn.execute(
+            "UPDATE tasks SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (task_id,),
+        )
+        return True
+
+
+def unarchive_task(task_id: int,
+                   db_path: str | None = None) -> bool:
+    """Clear ``archived_at`` on a task, returning it to the catalog.
+
+    Returns True if the task existed and was unarchived, False if it
+    does not exist or is not archived.  Idempotent no-op when already
+    unarchived.
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT archived_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["archived_at"] is None:
+            return False  # already unarchived — idempotent no-op
+        conn.execute(
+            "UPDATE tasks SET archived_at = NULL WHERE id = ?", (task_id,)
+        )
+        return True
 
 
 # ── User Task State ──────────────────────────────────────────────
@@ -2071,9 +2400,16 @@ def create_user_task(user_id: int, task_id: int, db_path: str | None = None) -> 
         # Validate user exists
         if not conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone():
             raise ValueError(f"user_id {user_id} does not exist")
-        # Validate task exists
-        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        # Validate task exists and is assignable (not paused / archived)
+        task_row = conn.execute(
+            "SELECT paused, archived_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None:
             raise ValueError(f"task_id {task_id} does not exist")
+        if bool(task_row["paused"]) or task_row["archived_at"] is not None:
+            raise ValueError(
+                f"task_id {task_id} is paused or archived and cannot be assigned"
+            )
 
         conn.execute(
             "INSERT INTO user_tasks (user_id, task_id, status) VALUES (?, ?, ?)",
@@ -2086,7 +2422,8 @@ def get_user_task(user_id: int, task_id: int, db_path: str | None = None) -> dic
     """Get a single user_task row."""
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT user_id, task_id, status, started_at, completed_at "
+            "SELECT user_id, task_id, status, started_at, completed_at, "
+            "reserved_until "
             "FROM user_tasks WHERE user_id = ? AND task_id = ?",
             (user_id, task_id)
         ).fetchone()
@@ -2097,6 +2434,9 @@ def get_user_task(user_id: int, task_id: int, db_path: str | None = None) -> dic
                 "status": row["status"],
                 "started_at": row["started_at"],
                 "completed_at": row["completed_at"],
+                # MT-TASK-28: the reservation deadline of the CURRENT
+                # cycle (NULL = no deadline = never expires).
+                "reserved_until": row["reserved_until"],
             }
         return None
 
@@ -2316,3 +2656,119 @@ def get_referral_count(user_id: int) -> int:
             (user_id,)
         ).fetchone()
         return row["count"]
+
+
+# ── Task pause / resume / archive (MT-ADMIN-36) ──────────────────
+
+
+def pause_task(task_id: int, db_path: str | None = None) -> bool:
+    """Pause a task: stop new assignments, keep claims/cycles/finance."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET paused = 1 WHERE id = ?", (task_id,)
+        )
+        return cursor.rowcount > 0
+
+
+def resume_task(task_id: int, db_path: str | None = None) -> bool:
+    """Resume a paused task: allow new assignments again."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET paused = 0 WHERE id = ?", (task_id,)
+        )
+        return cursor.rowcount > 0
+
+
+def archive_task(task_id: int, db_path: str | None = None) -> bool:
+    """Soft-delete a task: hide it from lists, keep all dependent rows.
+
+    Returns True if the task existed and was archived.  Safe to call
+    even when user_tasks / submissions / funding / ledger rows exist —
+    none of those are touched.
+    """
+    with get_connection(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone() is not None
+        if not exists:
+            return False
+        conn.execute(
+            "UPDATE tasks SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (task_id,),
+        )
+        return True
+
+
+def unarchive_task(task_id: int, db_path: str | None = None) -> bool:
+    """Restore a soft-deleted (archived) task back to lists."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET archived_at = NULL WHERE id = ?", (task_id,)
+        )
+        return cursor.rowcount > 0
+
+
+# ── Admin audit log (MT-ADMIN-36) ─────────────────────────────────
+
+
+def write_audit_log(
+    admin_id: int,
+    action: str,
+    target_type: str,
+    target_id: int,
+    field_changes: str | None = None,
+    db_path: str | None = None,
+) -> int:
+    """Append an audit-log row and return its new id."""
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO admin_audit_log
+                (admin_id, action, target_type, target_id, field_changes)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (admin_id, action, target_type, target_id, field_changes),
+        )
+        return cursor.lastrowid
+
+
+def get_audit_log(
+    target_type: str | None = None,
+    target_id: int | None = None,
+    admin_id: int | None = None,
+    limit: int = 50,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Read audit-log rows, newest first, with optional filters."""
+    with get_connection(db_path) as conn:
+        where = []
+        params: list = []
+        if target_type is not None:
+            where.append("target_type = ?")
+            params.append(target_type)
+        if target_id is not None:
+            where.append("target_id = ?")
+            params.append(target_id)
+        if admin_id is not None:
+            where.append("admin_id = ?")
+            params.append(admin_id)
+        sql = (
+            "SELECT id, admin_id, action, target_type, target_id, "
+            "field_changes, created_at FROM admin_audit_log"
+        )
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return [
+            {
+                "id": row["id"],
+                "admin_id": row["admin_id"],
+                "action": row["action"],
+                "target_type": row["target_type"],
+                "target_id": row["target_id"],
+                "field_changes": row["field_changes"],
+                "created_at": row["created_at"],
+            }
+            for row in conn.execute(sql, params).fetchall()
+        ]

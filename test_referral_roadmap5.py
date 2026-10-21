@@ -446,19 +446,50 @@ class TestFailedClaimZeroPartialMutation:
 
 class TestDeferredPaidSeatBoundary:
     def test_no_capacity_seat_or_reservation_columns_exist(self, env):
-        """Roadmap #5 seat reservation is deferred: the schema has NO
-        capacity vocabulary anywhere (superset check of the existing
-        quantity-only guard in test_referral_task)."""
-        forbidden = ("quantity", "seat", "capacit", "reserv", "quota")
+        """Roadmap #5 seat reservation shipped as MT-TASK-28.
+
+        The schema now carries the capacity vocabulary the old guard
+        forbade, and only there: execution limits on the task
+        definition and one deadline on the per-user cycle.  Any FURTHER
+        vocabulary (a seat table, a quota column, …) would still be
+        unbuilt, so keep the superset check and simply narrow it to the
+        two shipped names.
+        """
+        shipped = {
+            "tasks": {"max_executions", "reservation_minutes"},
+            "user_tasks": {"reserved_until"},
+            "task_submissions": set(),
+        }
         with db.get_connection() as conn:
-            for table in ("tasks", "user_tasks", "task_submissions"):
+            for table, allowed in shipped.items():
                 cols = [
                     r[1].lower()
                     for r in conn.execute(f"PRAGMA table_info({table})")
                 ]
-                for col in cols:
-                    for word in forbidden:
-                        assert word not in col, f"{table}.{col} ~ '{word}'"
+                found = set(cols) & {
+                    "quantity", "seat", "capacit", "reserv", "quota"
+                } | {
+                    c for c in cols
+                    if any(w in c for w in
+                           ("quantity", "seat", "capacit", "reserv", "quota"))
+                }
+                # only the shipped names may carry that vocabulary
+                unexpected = {
+                    c for c in found
+                    if not any(c.startswith(a) or a in c
+                               for a in allowed)
+                }
+                assert not unexpected, f"{table}: {sorted(unexpected)}"
+            # the shipped columns exist and are nullable (legacy default)
+            cols = [
+                r[1] for r in conn.execute("PRAGMA table_info(tasks)")
+            ]
+            assert "max_executions" in cols
+            assert "reservation_minutes" in cols
+            cols = [
+                r[1] for r in conn.execute("PRAGMA table_info(user_tasks)")
+            ]
+            assert "reserved_until" in cols
 
     def test_pending_claims_are_unbounded_no_seat_gate(self, env):
         """Behavioural proof of the DEFERRED state: no capacity gate

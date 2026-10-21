@@ -95,6 +95,7 @@ from telegram.ext import (
 import admin_control
 import admin_task_wizard
 import db
+import task_start
 import task_taxonomy
 
 from admin_control import (
@@ -498,17 +499,16 @@ class TestTasksCallbackSafety(TasksTestBase):
             self._assert_invalid(data)
 
     def test_13_unsupported_operations_rejected(self) -> None:
-        """9b. There is NO reward, delete, type or repeat surface —
-        those ops do not exist in the closed grammar."""
+        """9b. There is NO reward, type or repeat surface — those ops
+        do not exist in the closed grammar.  delete/archive/pause/
+        resume now exist (MT-ADMIN-36 extension) and are handled via
+        confirmation + dependency checks."""
         for data in (
             "ctl:tasks:confirm:reward:1",
-            "ctl:tasks:confirm:delete:1",
             "ctl:tasks:reward:1",
-            "ctl:tasks:delete:1",
             "ctl:tasks:type:1",
             "ctl:tasks:repeat:1",
             "ctl:tasks:confirm:create:1",
-            "ctl:tasks:archive:1",
         ):
             self._assert_invalid(data)
             self.assertIsNone(parse_callback(data), data)
@@ -618,12 +618,20 @@ class TestTasksMutations(TasksTestBase):
             self._view(f"ctl:tasks:confirm:disable:{task_id}")
         upd3.assert_called_once_with(task_id, active=False)
 
-        # No raw SQL exists in the admin module (existing guard),
-        # and it never calls the store's create/delete directly.
+        # No raw SQL exists in the admin module (existing guard).
         source = open(admin_control.__file__, encoding="utf-8").read()
         self.assertIsNone(_SQL_STATEMENT_RE.search(source))
+        # Creation still delegates exclusively to the wizard.
         self.assertNotIn("db.create_task(", source)
-        self.assertNotIn("db.delete_task(", source)
+        # delete/archive/pause/resume are now legitimate MT-ADMIN-36
+        # store calls, reached only through confirmation + dependency
+        # checks (never raw SQL, never direct create).
+        allowed = (
+            "db.pause_task(", "db.resume_task(", "db.archive_task(",
+            "db.delete_task(",
+        )
+        for fn in allowed:
+            self.assertIn(fn, source, f"{fn} must be present for MT-ADMIN-36")
 
     def test_19_confirmation_is_required(self) -> None:
         """17. Every pre-confirmation surface writes NOTHING — the
@@ -1524,6 +1532,35 @@ class TestTasksCallbackGrammar(unittest.TestCase):
             parse_callback("ctl:tasks:confirm:edit:009"),
             "tasks:confirm:edit:9",
         )
+        # New MT-ADMIN-36 ops canonicalize too.
+        self.assertEqual(
+            parse_callback("ctl:tasks:pause:009"), "tasks:pause:9"
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:resume:009"), "tasks:resume:9"
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:archive:009"), "tasks:archive:9"
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:delete:009"), "tasks:delete:9"
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:confirm:pause:009"),
+            "tasks:confirm:pause:9",
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:confirm:resume:009"),
+            "tasks:confirm:resume:9",
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:confirm:archive:009"),
+            "tasks:confirm:archive:9",
+        )
+        self.assertEqual(
+            parse_callback("ctl:tasks:confirm:delete:009"),
+            "tasks:confirm:delete:9",
+        )
         # Out-of-grammar payloads fail safely.
         for bad in (
             "ctl:tasks:",
@@ -1535,7 +1572,6 @@ class TestTasksCallbackGrammar(unittest.TestCase):
             "ctl:tasks:v:abc",
             "ctl:tasks:field:reward:1",
             "ctl:tasks:confirm:reward:1",
-            "ctl:tasks:confirm:delete:1",
             "ctl:tasks:new:1",
             "ctl:tasks;v:1",
             "ctl:tasksp:1",
@@ -1561,5 +1597,256 @@ class TestTasksCallbackGrammar(unittest.TestCase):
             self.assertIsNone(parse_callback(data), data)
 
 
+# ═════════════════════════════════════════════════════════════════════
+# Z. MT-ADMIN-36 EXTENSION — pause / resume / archive / delete / audit
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestTaskPauseResumeArchiveDelete(TasksTestBase):
+    """Pause / resume / archive / delete + audit-log coverage."""
+
+    def test_pause_then_resume_task(self) -> None:
+        task_id = self._seed_task(active=True)
+        task = db.get_task(task_id, db_path=self.db_path)
+        self.assertFalse(task["paused"])
+        # Pause
+        self.assertTrue(db.pause_task(task_id, db_path=self.db_path))
+        self.assertTrue(db.get_task(task_id, db_path=self.db_path)["paused"])
+        # Resume
+        self.assertTrue(db.resume_task(task_id, db_path=self.db_path))
+        self.assertFalse(db.get_task(task_id, db_path=self.db_path)["paused"])
+
+    def test_pause_resume_nonexistent_task(self) -> None:
+        self.assertFalse(db.pause_task(999999, db_path=self.db_path))
+        self.assertFalse(db.resume_task(999999, db_path=self.db_path))
+
+    def test_archive_excludes_from_lists_keeps_dependencies(self) -> None:
+        task_id = self._seed_task(active=True)
+        # Archive (soft delete)
+        self.assertTrue(db.archive_task(task_id, db_path=self.db_path))
+        task = db.get_task(task_id, db_path=self.db_path)
+        self.assertIsNotNone(task["archived_at"])
+        # Hidden from default list
+        self.assertEqual(len(db.list_tasks(db_path=self.db_path)), 0)
+        # Still visible with include_archived
+        self.assertEqual(
+            len(db.list_tasks(include_archived=True, db_path=self.db_path)), 1
+        )
+        # Unarchive restores
+        self.assertTrue(db.unarchive_task(task_id, db_path=self.db_path))
+        self.assertIsNone(db.get_task(task_id, db_path=self.db_path)["archived_at"])
+        self.assertEqual(len(db.list_tasks(db_path=self.db_path)), 1)
+
+    def test_archive_nonexistent_task(self) -> None:
+        self.assertFalse(db.archive_task(999999, db_path=self.db_path))
+        self.assertFalse(db.unarchive_task(999999, db_path=self.db_path))
+
+    def test_delete_blocked_when_dependencies_exist(self) -> None:
+        task_id = self._seed_task(active=True)
+        # Add a dependent user_task row to simulate a claim
+        with db.get_connection(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, language) VALUES (1, 'ar')"
+            )
+            conn.execute(
+                "INSERT INTO user_tasks (user_id, task_id, status) "
+                "VALUES (1, ?, 'available')",
+                (task_id,),
+            )
+        deps = db.get_task_dependencies(task_id, db_path=self.db_path)
+        self.assertTrue(deps["task_exists"])
+        self.assertEqual(deps["user_tasks"], 1)
+        self.assertFalse(deps["safe_to_delete"])
+        # Hard delete must be refused
+        self.assertFalse(db.delete_task(task_id, db_path=self.db_path))
+        # Task still exists
+        self.assertIsNotNone(db.get_task(task_id, db_path=self.db_path))
+        # Archive is still allowed
+        self.assertTrue(db.archive_task(task_id, db_path=self.db_path))
+
+    def test_delete_allowed_when_no_dependencies(self) -> None:
+        task_id = self._seed_task(active=True)
+        deps = db.get_task_dependencies(task_id, db_path=self.db_path)
+        self.assertTrue(deps["safe_to_delete"])
+        self.assertTrue(db.delete_task(task_id, db_path=self.db_path))
+        self.assertIsNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_nonexistent_task(self) -> None:
+        self.assertFalse(db.delete_task(999999, db_path=self.db_path))
+
+    def test_write_and_read_audit_log(self) -> None:
+        aid = db.write_audit_log(
+            ADMIN_ID, "task_pause", "task", 1, '{"paused": true}',
+            db_path=self.db_path,
+        )
+        self.assertIsInstance(aid, int)
+        logs = db.get_audit_log(
+            target_type="task", target_id=1, limit=5, db_path=self.db_path
+        )
+        self.assertGreaterEqual(len(logs), 1)
+        self.assertEqual(logs[0]["admin_id"], ADMIN_ID)
+        self.assertEqual(logs[0]["action"], "task_pause")
+        self.assertEqual(logs[0]["target_type"], "task")
+        self.assertEqual(logs[0]["target_id"], 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MT-ADMIN-36S: paused/archived assignment guard (create_user_task +
+# TaskStartGate) and delete_task force-protection
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _seed_user(db_path: str, user_id: int = 12345) -> None:
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, language) VALUES (?, 'ar')",
+            (user_id,),
+        )
+
+
+class TestTaskAssignmentPauseGuard(TasksTestBase):
+    """create_user_task and TaskStartGate must reject paused / archived
+    tasks, and resume must restore normal assignment."""
+
+    def test_create_user_task_rejects_paused(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(db.pause_task(task_id, db_path=self.db_path))
+        _seed_user(self.db_path)
+        with self.assertRaises(ValueError):
+            db.create_user_task(12345, task_id, db_path=self.db_path)
+        self.assertIsNone(
+            db.get_user_task(12345, task_id, db_path=self.db_path)
+        )
+
+    def test_create_user_task_rejects_archived(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(db.archive_task(task_id, db_path=self.db_path))
+        _seed_user(self.db_path)
+        with self.assertRaises(ValueError):
+            db.create_user_task(12345, task_id, db_path=self.db_path)
+        self.assertIsNone(
+            db.get_user_task(12345, task_id, db_path=self.db_path)
+        )
+
+    def test_create_user_task_allows_normal(self) -> None:
+        task_id = self._seed_task(active=True)
+        _seed_user(self.db_path)
+        self.assertTrue(
+            db.create_user_task(12345, task_id, db_path=self.db_path)
+        )
+        self.assertIsNotNone(
+            db.get_user_task(12345, task_id, db_path=self.db_path)
+        )
+
+    def test_task_start_gate_rejects_paused(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(db.pause_task(task_id, db_path=self.db_path))
+        _seed_user(self.db_path)
+        gate = task_start.TaskStartGate()
+        with self.assertRaises(task_start.StartGateError):
+            gate.start(12345, task_id)
+
+    def test_task_start_gate_rejects_archived(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(db.archive_task(task_id, db_path=self.db_path))
+        _seed_user(self.db_path)
+        gate = task_start.TaskStartGate()
+        with self.assertRaises(task_start.StartGateError):
+            gate.start(12345, task_id)
+
+    def test_task_start_gate_allows_after_resume(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(db.pause_task(task_id, db_path=self.db_path))
+        self.assertTrue(db.resume_task(task_id, db_path=self.db_path))
+        _seed_user(self.db_path)
+        gate = task_start.TaskStartGate()
+        result = gate.start(12345, task_id)
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, db.USER_TASK_STATUS_STARTED)
+        self.assertIsNotNone(
+            db.get_user_task(12345, task_id, db_path=self.db_path)
+        )
+
+
+class TestTaskDeleteForceProtection(TasksTestBase):
+    """delete_task(force=True) must NEVER bypass sensitive dependency
+    checks — ledger rows (no FK to tasks), user_tasks, submissions,
+    and funding rows all block deletion even when force=True."""
+
+    def test_delete_force_blocked_by_user_tasks(self) -> None:
+        task_id = self._seed_task(active=True)
+        _seed_user(self.db_path)
+        with db.get_connection(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO user_tasks (user_id, task_id, status) "
+                "VALUES (12345, ?, 'available')",
+                (task_id,),
+            )
+        self.assertFalse(
+            db.delete_task(task_id, force=True, db_path=self.db_path)
+        )
+        self.assertIsNotNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_force_blocked_by_task_submissions(self) -> None:
+        task_id = self._seed_task(active=True)
+        _seed_user(self.db_path)
+        with db.get_connection(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO task_submissions "
+                "(user_id, task_id, attempt_number, status, idempotency_key) "
+                "VALUES (12345, ?, 1, 'submitted', 'dep-sub-1')",
+                (task_id,),
+            )
+        self.assertFalse(
+            db.delete_task(task_id, force=True, db_path=self.db_path)
+        )
+        self.assertIsNotNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_force_blocked_by_task_funding(self) -> None:
+        task_id = self._seed_task(active=True)
+        _seed_user(self.db_path)
+        with db.get_connection(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO task_funding "
+                "(task_id, advertiser_id, reward_units, commission_units, total_units) "
+                "VALUES (?, 12345, 100, 0, 100)",
+                (task_id,),
+            )
+        self.assertFalse(
+            db.delete_task(task_id, force=True, db_path=self.db_path)
+        )
+        self.assertIsNotNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_force_blocked_by_ledger_no_fk(self) -> None:
+        """ledger rows reference task_id without an FK — must still block."""
+        task_id = self._seed_task(active=True)
+        _seed_user(self.db_path)
+        with db.get_connection(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO ledger "
+                "(user_id, entry_type, amount_units, available_delta, held_delta, "
+                "currency, reference_type, reference_id, idempotency_key, actor_user_id) "
+                "VALUES (12345, 'credit', 50, 50, 0, 'USDT', 'task', ?, 'dep-ledger-1', 12345)",
+                (str(task_id),),
+            )
+        self.assertFalse(
+            db.delete_task(task_id, force=True, db_path=self.db_path)
+        )
+        self.assertIsNotNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_force_allowed_when_no_dependencies(self) -> None:
+        task_id = self._seed_task(active=True)
+        self.assertTrue(
+            db.delete_task(task_id, force=True, db_path=self.db_path)
+        )
+        self.assertIsNone(db.get_task(task_id, db_path=self.db_path))
+
+    def test_delete_force_nonexistent_returns_false(self) -> None:
+        self.assertFalse(
+            db.delete_task(999999, force=True, db_path=self.db_path)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+

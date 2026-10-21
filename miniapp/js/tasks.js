@@ -14,7 +14,10 @@
  * - the channel join link (join_url) comes from the server response;
  *   no channel URL is hardcoded in JavaScript and clicking "join"
  *   never marks a task complete — only the verify call can do that
- * - manual tasks (MT-TASK-17) submit the bounded text/URL proof_ref
+ * - manual tasks (MT-TASK-17) expose the task's own validated
+ *   external destination (`task_url`) and submit the bounded
+ *   text/URL proof_ref — opening that link and sending the proof are
+ *   two separate, explicit user actions
  *   through the existing submit endpoint; only the server response
  *   (awaiting_decision / status) decides the card's next state
  * - business rules stay in the backend; this file only maps the
@@ -45,11 +48,22 @@ const Tasks = (() => {
         network: 'تعذر الاتصال بالخادم، حاول مرة أخرى'
     };
 
-    // Exactly the three statuses the backend supports.
+    // Statuses the backend supports — including owner-managed states.
     const STATUS_LABELS = {
         available: 'متاحة',
         started: 'بدأت',
-        completed: 'مكتملة'
+        completed: 'مكتملة',
+        paused: 'متوقفة مؤقتاً',
+        archived: 'مؤرشفة'
+    };
+
+    // Status CSS class suffixes for paused / archived cards.
+    const STATUS_CLASSES = {
+        available: 'available',
+        started: 'started',
+        completed: 'completed',
+        paused: 'paused',
+        archived: 'archived'
     };
 
     const TYPE_LABELS = {
@@ -112,6 +126,87 @@ const Tasks = (() => {
             .replace(/\r/g, '\\r')
             .replace(/\t/g, '\\t');
         return '{"proof_ref":"' + escaped + '"}';
+    }
+
+    /**
+     * True only for a well-formed absolute https URL with a non-empty
+     * host.  The value comes from the server, which already validates
+     * it — this is a defensive second check so a bad value can never
+     * become a clickable href.  http:, javascript: and data: are all
+     * refused by this check.
+     */
+    function _isSafeHttpsUrl(value) {
+        if (typeof value !== 'string' || !value) {
+            return false;
+        }
+        const trimmed = value.trim();
+        if (!trimmed.toLowerCase().startsWith('https://')) {
+            return false;
+        }
+        try {
+            const parsed = new URL(trimmed);
+            return parsed.protocol === 'https:' && parsed.hostname.length > 0;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function _hasOwn(object, key) {
+        return Object.prototype.hasOwnProperty.call(object, key);
+    }
+
+    /** Drop a chosen screenshot and reset every related control. */
+    function _clearImage(preview, removeBtn, statusEl, fileInput) {
+        if (preview) {
+            preview.removeAttribute('src');
+            preview.hidden = true;
+        }
+        if (removeBtn) {
+            removeBtn.hidden = true;
+        }
+        if (statusEl) {
+            statusEl.textContent = '';
+            statusEl.hidden = true;
+        }
+        if (fileInput) {
+            fileInput.value = '';   // allow re-picking the SAME file
+        }
+    }
+
+    /**
+     * Upload the chosen screenshot and return its server reference.
+     *
+     * The image is validated and stored SERVER-SIDE (magic bytes,
+     * bounded size and dimensions) under a server-generated key.  This
+     * never submits the proof: it only stages the evidence.  Returns
+     * null on any failure so the caller shows an error and the
+     * existing text/URL proof path is left untouched.
+     */
+    async function _uploadScreenshot(task, fileInput, statusEl) {
+        if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+            return null;
+        }
+        const payload = new FormData();
+        payload.append('file', fileInput.files[0]);
+        statusEl.textContent = 'جارٍ رفع الصورة…';
+        statusEl.hidden = false;
+        try {
+            const response = await fetch(`/api/tasks/${task.id}/proof-image`, {
+                method: 'POST',
+                headers: _headers(),
+                body: payload
+            });
+            const data = await response.json().catch(() => null);
+            if (!response.ok || !data || data.ok !== true || !data.proof_ref) {
+                statusEl.textContent = (data && data.message) || 'تعذر رفع الصورة';
+                return null;
+            }
+            statusEl.textContent = data.message || 'تم تجهيز الصورة';
+            return data.proof_ref;
+        } catch (error) {
+            statusEl.textContent = 'تعذر الاتصال بالخادم';
+            return null;
+        }
     }
 
     function _node(testid) {
@@ -254,14 +349,20 @@ const Tasks = (() => {
         card.setAttribute('data-status', task.status);
         card.setAttribute('data-type', task.type);
 
-        const statusKey = STATUS_LABELS[task.status] ? task.status : 'available';
-        const statusLabel = STATUS_LABELS[statusKey];
+        let statusKey = task.status;
+        if (task.archived_at) {
+            statusKey = 'archived';
+        } else if (task.paused) {
+            statusKey = 'paused';
+        }
+        const statusLabel = STATUS_LABELS[statusKey] || STATUS_LABELS.available;
+        const statusClass = STATUS_CLASSES[statusKey] || 'available';
         const typeLabel = TYPE_LABELS[task.type] || task.type;
 
         card.innerHTML = `
             <div class="task-card-top">
                 <span class="task-title" data-testid="task-title"></span>
-                <span class="task-status task-status-${statusKey}" data-testid="task-status"></span>
+                <span class="task-status task-status-${statusClass}" data-testid="task-status"></span>
             </div>
             <p class="task-description" data-testid="task-description"></p>
             <div class="task-meta">
@@ -341,6 +442,27 @@ const Tasks = (() => {
             }
 
             if (task.type === 'manual') {
+                // The task's own external destination, when the server
+                // sent one.  A SEPARATE control: it opens the link and
+                // never submits anything — the proof stays an explicit
+                // later step by the user.  Same secure link pattern the
+                // channel join link already uses.
+                if (_isSafeHttpsUrl(task.task_url)) {
+                    const openLink = document.createElement('a');
+                    openLink.className = 'task-action-btn task-open-btn';
+                    openLink.setAttribute('data-testid', 'task-open-url');
+                    openLink.href = task.task_url;
+                    openLink.target = '_blank';
+                    openLink.rel = 'noopener';
+                    openLink.textContent = 'فتح رابط المهمة';
+                    actions.appendChild(openLink);
+                } else if (_hasOwn(task, 'task_url')) {
+                    // The server DID advertise a destination but it
+                    // failed validation — say so instead of silently
+                    // offering nothing.
+                    _showNotice('رابط المهمة غير صالح، تواصل مع الإدارة', 'error');
+                }
+
                 // Manual proof (MT-TASK-17): one bounded text/URL
                 // reference posted to the existing submit endpoint
                 // as proof_ref — the server validates and reviews it.
@@ -356,9 +478,77 @@ const Tasks = (() => {
                 proofBtn.className = 'task-action-btn';
                 proofBtn.setAttribute('data-testid', 'task-proof-submit');
                 proofBtn.textContent = 'إرسال الإثبات';
-                proofBtn.addEventListener('click', () => submitProof(task, proofInput, proofBtn));
+                proofBtn.addEventListener('click', () =>
+                    submitProof(task, proofInput, proofBtn, fileInput, uploadStatus));
+
+                // ── Screenshot evidence (MT-ADMIN-34) ──────────────
+                // A SEPARATE, explicit upload control: the image is
+                // validated and stored server-side, and the returned
+                // reference lands in the text field above so the
+                // EXISTING submit path carries it.  Nothing is sent
+                // until the user presses «إرسال الإثبات».
+                const fileInput = document.createElement('input');
+                fileInput.type = 'file';
+                fileInput.accept = 'image/png,image/jpeg,image/gif';
+                fileInput.className = 'task-proof-file';
+                fileInput.setAttribute('data-testid', 'task-proof-file');
+                // Only set capture on devices that expose it — desktop
+                // browsers must keep the normal gallery picker.
+                if ('capture' in fileInput) {
+                    fileInput.capture = 'environment';
+                }
+
+                const preview = document.createElement('img');
+                preview.className = 'task-proof-preview';
+                preview.setAttribute('data-testid', 'task-proof-preview');
+                preview.alt = '';
+                preview.hidden = true;
+
+                const removeBtn = document.createElement('button');
+                removeBtn.type = 'button';
+                removeBtn.className = 'task-proof-remove';
+                removeBtn.setAttribute('data-testid', 'task-proof-remove');
+                removeBtn.textContent = '✕ إزالة الصورة';
+                removeBtn.hidden = true;
+
+                const uploadStatus = document.createElement('span');
+                uploadStatus.className = 'task-proof-upload-status';
+                uploadStatus.setAttribute('data-testid', 'task-proof-upload-status');
+                uploadStatus.hidden = true;
+
+                // Replace/remove before sending: choosing a new file
+                // clears the previous selection entirely.
+                fileInput.addEventListener('change', () => {
+                    const file = fileInput.files && fileInput.files[0];
+                    if (!file) {
+                        _clearImage(preview, removeBtn, uploadStatus, fileInput);
+                        return;
+                    }
+                    // Local preview only — the bytes are not sent yet.
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        preview.src = String(reader.result);
+                        preview.hidden = false;
+                        removeBtn.hidden = false;
+                        uploadStatus.textContent = 'تم اختيار الصورة، اضغط إرسال الإثبات';
+                        uploadStatus.hidden = false;
+                    };
+                    reader.onerror = () => {
+                        _clearImage(preview, removeBtn, uploadStatus, fileInput);
+                        _showNotice('تعذر قراءة الصورة المختارة', 'error');
+                    };
+                    reader.readAsDataURL(file);
+                });
+                removeBtn.addEventListener('click', () => {
+                    _clearImage(preview, removeBtn, uploadStatus, fileInput);
+                });
+
                 actions.appendChild(proofInput);
                 actions.appendChild(proofBtn);
+                actions.appendChild(fileInput);
+                actions.appendChild(preview);
+                actions.appendChild(removeBtn);
+                actions.appendChild(uploadStatus);
                 return;
             }
 
@@ -417,8 +607,22 @@ const Tasks = (() => {
         busy = false;
 
         if (ok) {
+            // Only the status changes.  NO link is opened here and NO
+            // proof is submitted: the task's external destination and
+            // the proof are both explicit, separate user actions after
+            // the card re-renders in its `started` state.
             _replaceTask(Object.assign({}, task, { status: 'started' }));
             _showNotice(data.message || 'تم بدء المهمة', 'success');
+            // Tell the user the next step, so an empty-looking card is
+            // never confusing.  Wording depends only on whether the
+            // server advertised a usable destination.
+            if (_hasOwn(task, 'task_url') && !_isSafeHttpsUrl(task.task_url)) {
+                _showNotice('رابط المهمة غير صالح، تواصل مع الإدارة', 'error');
+            } else if (_isSafeHttpsUrl(task.task_url)) {
+                _showNotice('افتح رابط المهمة، ثم أرسل الإثبات', 'success');
+            } else {
+                _showNotice('أرسل الإثبات بعد تنفيذ المهمة', 'success');
+            }
             return;
         }
 
@@ -485,7 +689,7 @@ const Tasks = (() => {
      * validation, waiting state, review decision — comes from the
      * server response; this function only renders it.
      */
-    async function submitProof(task, input, button) {
+    async function submitProof(task, input, button, fileInput, statusEl) {
         if (busy) {
             return;
         }
@@ -494,6 +698,24 @@ const Tasks = (() => {
         _hideNotice();
         if (button) {
             button.disabled = true;
+        }
+
+        // Stage the chosen screenshot first (server-side validation and
+        // storage).  A failure aborts the submission: the user fixes
+        // the image or falls back to a text/URL proof — but a broken
+        // upload must never silently submit an empty proof.
+        if (fileInput && fileInput.files && fileInput.files[0]) {
+            const reference = await _uploadScreenshot(task, fileInput, statusEl);
+            if (reference) {
+                input.value = reference;   // carried by the EXISTING path
+            } else {
+                busy = false;
+                if (button) {
+                    button.disabled = false;
+                }
+                _showNotice('تعذر رفع الصورة، أعد المحاولة أو أرسل رابطاً', 'error');
+                return;
+            }
         }
 
         let data = null;

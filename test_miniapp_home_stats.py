@@ -645,7 +645,9 @@ class TestEndToEndBackendToCards:
 
         payload = _get_payload(client)
         statuses = {t["id"]: t["status"] for t in payload["tasks"]}
-        assert statuses[ids["channel"]] == "completed"
+        # MT-TASK-29: the approved (completed) task leaves the payload
+        # entirely — the Home cards read only what the server returns.
+        assert ids["channel"] not in statuses
 
         out = _run(payload)
         count, units = _expected(payload)

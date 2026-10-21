@@ -288,12 +288,16 @@ class TestBalance:
 
     def test_wallet_with_zero_balance_reads_as_zero(self, client):
         """A wallet row that exists with a real zero balance is a
-        real zero — {"availableUnits": 0}, never null."""
+        real zero — {"availableUnits": 0}, never null.  The EGP
+        estimate is likewise a real 0, not an unknown."""
         wallet.ensure_wallet(USER_A)
         response = client.get("/api/me", headers=_auth())
         assert response.status_code == 200
         data = response.get_json()
-        assert data["wallet"] == {"availableUnits": 0}
+        assert data["wallet"] == {
+            "availableUnits": 0,
+            "egpDisplayMinor": 0,
+        }
 
     def test_available_balance_is_exact(self, client):
         wallet.ensure_wallet(USER_A)
@@ -478,7 +482,9 @@ class TestResponseShape:
         assert data["ok"] is True
         assert set(data.keys()) == {"ok", "user", "wallet", "stats"}
         assert set(data["user"].keys()) == {"id", "username", "firstName"}
-        assert set(data["wallet"].keys()) == {"availableUnits"}
+        assert set(data["wallet"].keys()) == {
+            "availableUnits", "egpDisplayMinor",
+        }
         assert set(data["stats"].keys()) == {
             "completedTasks", "inProgressTasks", "earnedUnits",
         }

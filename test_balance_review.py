@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
@@ -328,3 +329,194 @@ class TestDuplicateDepositCreditPrevention:
                 reference_id="deposit:tx-2",
                 idempotency_key=key,
             )
+
+
+# ══════════════════════════════════════════════════════════════════
+# EGP display equivalent (the «≈ EGP» figure beside the balance)
+#
+# Direction: rate_usdt_egp is EGP per 1 USDT.
+#     USDT = availableUnits / 100_000_000
+#     EGP  = USDT × rate            → ROUND_HALF_UP to 0.01 EGP
+#     egp_display_minor = int(EGP × 100)
+# The estimate comes from the CURRENT fresh market quote, never from a
+# historical deposit rate, and is absent (None) rather than invented.
+# ══════════════════════════════════════════════════════════════════
+
+_QUOTE_RATE = "53.002141823"          # EGP per 1 USDT
+_BALANCE_UNITS = 188_660_953          # 1.88660953 USDT
+
+
+def _seed_quote(db_path, *, rate=_QUOTE_RATE, provider="coinbase", at=None):
+    from datetime import datetime, timezone
+    import rate_store
+    from rate_quote import RateQuote
+    captured = at or datetime.now(timezone.utc)
+    return rate_store.set_automatic_rate(
+        RateQuote(rate, provider, captured), db_path=db_path
+    )
+
+
+def _set_captured_at(db_path, when):
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE current_rate SET captured_at = ? WHERE id = 1",
+            (when.isoformat(),),
+        )
+
+
+class TestEgpDisplayEquivalent:
+    """The «≈ EGP» figure beside the wallet balance."""
+
+    def test_positive_balance_with_valid_rate(self, env):
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        _seed_quote(env)
+
+        summary = load_summary(USER_WITH_POSITIVE_BALANCE)
+        wallet_data = summary["wallet"]
+
+        assert wallet_data["available_units"] == _BALANCE_UNITS
+        # 1.88660953 USDT × 53.002141823 = 99.99434587… → 99.99 EGP.
+        assert wallet_data["egp_display_minor"] == 9999
+
+    def test_zero_balance_with_valid_rate_shows_zero_not_none(self, env):
+        wallet.ensure_wallet(USER_WITH_ZERO_BALANCE)
+        _seed_quote(env)
+
+        summary = load_summary(USER_WITH_ZERO_BALANCE)
+        wallet_data = summary["wallet"]
+
+        assert wallet_data["available_units"] == 0
+        # A real zero balance is a real zero estimate — never "unknown".
+        assert wallet_data["egp_display_minor"] == 0
+
+    def test_no_wallet_invents_neither_balance_nor_egp(self, env):
+        _seed_quote(env)
+
+        summary = load_summary(USER_WITHOUT_WALLET)
+
+        assert summary["wallet"] is None
+
+    def test_rounding_is_half_up_to_the_piastre(self, env):
+        """The documented rule: ROUND_HALF_UP to 0.01 EGP."""
+        from decimal import Decimal
+        from rate_quote import (
+            usdt_units_to_egp_display,
+            RateQuote,
+        )
+        from datetime import datetime, timezone
+
+        quote = RateQuote(
+            Decimal("50"), "coinbase", datetime.now(timezone.utc)
+        )
+        # 0.025 EGP rounds up to 0.03 (half-up), 0.0249 down to 0.02.
+        assert usdt_units_to_egp_display(50_000, quote) == Decimal("0.03")
+        assert usdt_units_to_egp_display(49_800, quote) == Decimal("0.02")
+        # 1 USDT at 50 EGP/USDT is exactly 50.00.
+        assert usdt_units_to_egp_display(100_000_000, quote) == Decimal("50.00")
+
+    def test_no_rate_at_all_yields_null_not_an_invented_amount(self, env):
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        # NO quote is ever set.
+
+        summary = load_summary(USER_WITH_POSITIVE_BALANCE)
+
+        assert summary["wallet"]["available_units"] == _BALANCE_UNITS
+        assert summary["wallet"]["egp_display_minor"] is None
+
+    def test_stale_rate_is_never_used(self, env):
+        import rate_store
+
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        _seed_quote(env)
+        # Age the stored quote past the freshness boundary.
+        _set_captured_at(
+            env,
+            datetime.now(timezone.utc)
+            - timedelta(seconds=rate_store.RATE_TTL_SECONDS + 1),
+        )
+
+        summary = load_summary(USER_WITH_POSITIVE_BALANCE)
+
+        assert summary["wallet"]["egp_display_minor"] is None
+
+    def test_invalid_stored_rate_yields_null(self, env):
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        _seed_quote(env)
+        _set_captured_at(
+            env, datetime.now(timezone.utc) + timedelta(hours=1)
+        )  # a FUTURE timestamp is invalid data
+
+        summary = load_summary(USER_WITH_POSITIVE_BALANCE)
+
+        assert summary["wallet"]["egp_display_minor"] is None
+
+    def test_historical_deposit_rate_is_not_reused(self, env):
+        """The estimate uses the CURRENT quote, not any deposit's frozen
+        historical rate — a later market move must change the estimate."""
+        
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        _seed_quote(env)
+        first = load_summary(USER_WITH_POSITIVE_BALANCE)["wallet"]
+
+        # The market moves: a NEW current quote replaces the old one.
+        _seed_quote(env, rate="100.0")
+        second = load_summary(USER_WITH_POSITIVE_BALANCE)["wallet"]
+
+        assert first["egp_display_minor"] == 9999          # ≈99.99 EGP
+        assert second["egp_display_minor"] == 18866        # ≈188.66 EGP
+        assert first["available_units"] == second["available_units"]
+
+
+class TestApiMeEgpField:
+    """The field reaches the client exactly as the JS reads it."""
+
+    def test_api_me_exposes_egp_display_minor(self, client, env):
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+        _seed_quote(env)
+
+        response = client.get(
+            "/api/me", headers=_auth(USER_WITH_POSITIVE_BALANCE)
+        )
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body["wallet"]["availableUnits"] == _BALANCE_UNITS
+        assert body["wallet"]["egpDisplayMinor"] == 9999
+
+    def test_api_me_egp_minor_is_null_without_a_rate(self, client, env):
+        wallet.ensure_wallet(USER_WITH_POSITIVE_BALANCE)
+        wallet.credit_units(USER_WITH_POSITIVE_BALANCE, _BALANCE_UNITS)
+
+        response = client.get(
+            "/api/me", headers=_auth(USER_WITH_POSITIVE_BALANCE)
+        )
+        body = response.get_json()
+        assert body["wallet"]["availableUnits"] == _BALANCE_UNITS
+        assert body["wallet"]["egpDisplayMinor"] is None
+
+    def test_api_me_zero_balance_reports_zero(self, client, env):
+        wallet.ensure_wallet(USER_WITH_ZERO_BALANCE)
+        _seed_quote(env)
+
+        response = client.get(
+            "/api/me", headers=_auth(USER_WITH_ZERO_BALANCE)
+        )
+        body = response.get_json()
+        assert body["wallet"] == {
+            "availableUnits": 0,
+            "egpDisplayMinor": 0,
+        }
+
+    def test_api_me_without_wallet_stays_null(self, client, env):
+        _seed_quote(env)
+
+        response = client.get(
+            "/api/me", headers=_auth(USER_WITHOUT_WALLET)
+        )
+        assert response.get_json()["wallet"] is None

@@ -38,9 +38,12 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 from typing import Awaitable, Callable, Optional, Sequence
 
 from config import ADMINS, is_admin
+
+logger = logging.getLogger(__name__)
 
 # Async transport: deliver *text* to the private chat *chat_id*.
 SendFunc = Callable[[int, str], Awaitable[None]]
@@ -48,6 +51,13 @@ SendFunc = Callable[[int, str], Awaitable[None]]
 # keyboard and return the Telegram message id (MT-ADMIN-03) so the
 # caller can persist an operation → message linkage.
 MarkupSendFunc = Callable[[int, str, Optional[object]], Awaitable[Optional[int]]]
+# Async photo transport: deliver *text* + *image bytes* with an
+# optional inline keyboard and return the Telegram message id
+# (MT-ADMIN-34).  Used ONLY by notify_system_photo, and only for
+# admins — the same recipient constraint as every other path.
+PhotoSendFunc = Callable[
+    [int, str, bytes, Optional[object]], Awaitable[Optional[int]]
+]
 
 
 class AdminNotifierError(Exception):
@@ -75,6 +85,7 @@ class AdminNotifier:
         self,
         send: SendFunc,
         markup_send: Optional[MarkupSendFunc] = None,
+        photo_send: Optional[PhotoSendFunc] = None,
     ) -> None:
         if not callable(send):
             raise AdminNotifierError(
@@ -85,8 +96,15 @@ class AdminNotifier:
                 "markup_send must be a callable with signature "
                 "(chat_id, text, reply_markup) returning a message id"
             )
+        if photo_send is not None and not callable(photo_send):
+            raise AdminNotifierError(
+                "photo_send must be a callable with signature "
+                "(chat_id, text, image_bytes, reply_markup) returning "
+                "a message id"
+            )
         self._send = send
         self._markup_send = markup_send
+        self._photo_send = photo_send
 
     @property
     def admin_ids(self) -> tuple[int, ...]:
@@ -176,6 +194,95 @@ class AdminNotifier:
         delivered: list[tuple[int, Optional[int]]] = []
         for chat_id in recipients:
             message_id = await self._markup_send(chat_id, text, reply_markup)
+            delivered.append((chat_id, message_id))
+        return delivered
+
+    async def notify_system_photo(
+        self,
+        text: str,
+        image: bytes,
+        *,
+        reply_markup: Optional[object] = None,
+        targets: Optional[Sequence[int]] = None,
+    ) -> list[tuple[int, Optional[int]]]:
+        """Deliver a server-originated notification WITH an image.
+
+        A strictly ADDITIVE sibling of :meth:`notify_system`: the
+        existing text path is untouched, so every current caller keeps
+        its exact behaviour.  Use it only where the evidence itself
+        must reach the reviewer (manual task proof screenshots).
+
+        Same authorization contract as ``notify_system``:
+
+        - there is no acting admin; this is a server event;
+        - delivery is refused outside ``config.ADMINS``
+          (:meth:`_resolve_recipients` is reused, so a worker, a
+          channel or a group can never receive an evidence image);
+        - the text stays the authoritative body — the image is
+          evidence, never a payload that grants anything.
+
+        The image is sent through ``_photo_send``.  When no photo
+        transport is configured, or a photo send FAILS, this method
+        FALLS BACK to the plain text notification so the operational
+        event is never lost — the caller still receives the delivered
+        message ids it needs to link buttons to messages.  It never
+        raises for a transport problem, and it never logs image bytes.
+
+        Args:
+            text: Non-empty notification body (same as notify_system).
+            image: Raw image bytes, already validated by the storage
+                layer (magic bytes, bounded size and dimensions).
+            reply_markup: Optional inline keyboard (Telegram object).
+            targets: Optional subset of admin IDs; anything outside
+                ``config.ADMINS`` raises ``AdminNotifierTargetError``
+                before anything is sent.
+
+        Returns:
+            ``(chat_id, message_id)`` per delivered chat.
+        """
+        if not isinstance(image, (bytes, bytearray)) or not image:
+            # No usable image — deliver the text event unchanged.
+            logger.info(
+                "notify_system_photo called without image bytes; "
+                "falling back to text-only delivery"
+            )
+            return await self.notify_system(
+                text, reply_markup=reply_markup, targets=targets
+            )
+        # Reuse the SAME authorization + text validation.  A target
+        # error must still surface to the caller (and abort delivery).
+        self._validate_text(text)
+        recipients = self._resolve_recipients(targets)
+
+        if self._photo_send is None:
+            logger.info(
+                "photo transport not configured; falling back to "
+                "text-only delivery"
+            )
+            return await self.notify_system(
+                text, reply_markup=reply_markup, targets=targets
+            )
+
+        delivered: list[tuple[int, Optional[int]]] = []
+        for chat_id in recipients:
+            message_id: Optional[int] = None
+            try:
+                message_id = await self._photo_send(
+                    chat_id, text, bytes(image), reply_markup
+                )
+            except Exception:
+                logger.exception(
+                    "Evidence photo delivery failed for chat=%s; "
+                    "falling back to text",
+                    chat_id,
+                )
+                message_id = None
+            if message_id is None:
+                # The evidence did not arrive — still surface the event.
+                text_ids = await self.notify_system(
+                    text, reply_markup=reply_markup, targets=(chat_id,)
+                )
+                message_id = text_ids[0][1] if text_ids else None
             delivered.append((chat_id, message_id))
         return delivered
 

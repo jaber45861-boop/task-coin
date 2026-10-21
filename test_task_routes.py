@@ -46,6 +46,8 @@ Run:
 """
 
 import json
+import re
+import sqlite3
 
 import pytest
 
@@ -291,8 +293,95 @@ class TestCatalog:
         assert set(seen) <= {"available", "started", "completed"}
         by_id = {t["id"]: t["status"]
                  for t in response.get_json()["tasks"]}
-        assert by_id[task_id] == "completed"
+        # MT-TASK-29: the approved cycle leaves the ACTIVE list, so a
+        # completed task can never be observed in this vocabulary any
+        # more — the remaining statuses are exactly available/started.
+        assert task_id not in by_id
         assert by_id[plain_id] == "available"
+        assert set(seen) <= {"available", "started"}
+
+
+class TestCompletedHiddenFromActiveList:
+    """MT-TASK-29: approved tasks leave the user's ACTIVE list."""
+
+    def test_completed_task_excluded_from_list(self, client):
+        task_id = _create_channel_task()
+        client.post(f"/api/tasks/{task_id}/start", headers=_auth())
+        members_status = _Members()
+        members_status.statuses[USER_A] = "member"
+        register_channel_task_verifier(
+            ChannelTaskVerifier(membership_checker=members_status)
+        )
+        client.post(f"/api/tasks/{task_id}/submit", headers=_auth())
+        assert _status(USER_A, task_id) == "completed"
+
+        response = client.get("/api/tasks", headers=_auth())
+        assert response.status_code == 200
+        ids = [t["id"] for t in response.get_json()["tasks"]]
+        assert task_id not in ids
+
+    def test_completed_task_stays_hidden_on_reload(self, client):
+        """A fresh list read (page reload) never brings it back."""
+        task_id = _create_channel_task()
+        client.post(f"/api/tasks/{task_id}/start", headers=_auth())
+        members_status = _Members()
+        members_status.statuses[USER_A] = "member"
+        register_channel_task_verifier(
+            ChannelTaskVerifier(membership_checker=members_status)
+        )
+        client.post(f"/api/tasks/{task_id}/submit", headers=_auth())
+
+        for _ in range(2):
+            response = client.get("/api/tasks", headers=_auth())
+            ids = [t["id"] for t in response.get_json()["tasks"]]
+            assert task_id not in ids
+
+    def test_started_and_available_tasks_still_listed(self, client):
+        """Pending (started) and untouched tasks keep their behaviour."""
+        done_id = _create_channel_task()
+        started_id = _create_plain_task()
+        client.post(f"/api/tasks/{done_id}/start", headers=_auth())
+        members_status = _Members()
+        members_status.statuses[USER_A] = "member"
+        register_channel_task_verifier(
+            ChannelTaskVerifier(membership_checker=members_status)
+        )
+        client.post(f"/api/tasks/{done_id}/submit", headers=_auth())
+        client.post(f"/api/tasks/{started_id}/start", headers=_auth())
+
+        response = client.get("/api/tasks", headers=_auth())
+        by_id = {t["id"]: t["status"]
+                 for t in response.get_json()["tasks"]}
+        assert done_id not in by_id
+        assert by_id[started_id] == "started"
+
+    def test_filtering_touches_no_records_or_money(self, client):
+        """The list read mutates nothing: row intact, no ledger."""
+        import sqlite3
+
+        task_id = _create_channel_task()
+        client.post(f"/api/tasks/{task_id}/start", headers=_auth())
+        members_status = _Members()
+        members_status.statuses[USER_A] = "member"
+        register_channel_task_verifier(
+            ChannelTaskVerifier(membership_checker=members_status)
+        )
+        client.post(f"/api/tasks/{task_id}/submit", headers=_auth())
+
+        before = _status(USER_A, task_id)
+        client.get("/api/tasks", headers=_auth())
+        client.get("/api/tasks", headers=_auth())
+
+        # user_tasks row still completed — the approval is untouched.
+        assert _status(USER_A, task_id) == before == "completed"
+        with sqlite3.connect(db.DB_PATH) as conn:
+            ledger = conn.execute(
+                "SELECT COUNT(*) FROM ledger WHERE user_id = ?",
+                (USER_A,),
+            ).fetchone()[0]
+        # The completion credit is still there (exactly one), never
+        # created or removed by the list read itself.
+        assert ledger == 1
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -651,3 +740,295 @@ class TestRewardCredit:
             ).fetchone()
         assert row["available_units"] == reward_units
         assert row["held_units"] == 0
+
+
+# ════════════════════════════════════════════════════════════════════
+# Manual task external destination (MT-TASK-17)
+#
+# The task's own link (``task_data["target"]["ref"]``) is exposed to
+# the Mini App as ONE validated field so the user can open it before
+# sending a proof.  The raw ``task_data`` — in particular the
+# ``approver`` block — stays server-side, and anything that is not a
+# well-formed https URL never becomes a clickable link.
+# ════════════════════════════════════════════════════════════════════
+
+_REF = "https://www.facebook.com/share/1dLE7nuoMQ/"
+_APPROVER_ID = 999            # a distinct id, never the acting user
+
+
+def _create_manual_task(task_data=None, active: bool = True) -> int:
+    return db.create_task(
+        title="متابعه حساب فيسبوك",
+        description="متابعه الحساب وارسال لقطه شاشه",
+        task_type="manual",
+        reward=50,
+        active=active,
+        task_data=json.dumps(
+            task_data
+            if task_data is not None
+            else {
+                "provider": "other",
+                "action": "follow",
+                "approver": {"telegram_user_id": _APPROVER_ID},
+                "target": {"ref": _REF},
+            }
+        ),
+    )
+
+
+def _set_task_data(task_id: int, task_data) -> None:
+    with sqlite3.connect(db.DB_PATH) as conn:
+        conn.execute(
+            "UPDATE tasks SET task_data = ? WHERE id = ?",
+            (json.dumps(task_data), task_id),
+        )
+
+
+def _submissions(user_id, task_id):
+    from task_submission_store import TaskSubmissionStore
+    return TaskSubmissionStore().list_user_task_submissions(
+        user_id, task_id
+    )
+
+
+def _manual_task_of(client, task_id):
+    body = client.get("/api/tasks", headers=_auth()).get_json()
+    for entry in body["tasks"]:
+        if entry["id"] == task_id:
+            return entry
+    return None
+
+
+class TestManualTaskUrl:
+    """The validated `task_url` field for manual tasks."""
+
+    def test_valid_https_ref_becomes_task_url(self, client):
+        task_id = _create_manual_task()
+
+        entry = _manual_task_of(client, task_id)
+
+        assert entry["task_url"] == _REF
+        # The field is present alongside the existing ones.
+        assert "task_url" in entry
+
+    def test_task_data_and_approver_are_never_exposed(self, client):
+        task_id = _create_manual_task()
+
+        body = client.get("/api/tasks", headers=_auth())
+        payload = body.get_data(as_text=True)
+
+        assert body.status_code == 200
+        assert "task_data" not in payload
+        assert "approver" not in payload
+        assert "telegram_user_id" not in payload
+        # The ONE advertised field is the destination itself.
+        assert _REF in payload
+
+    def test_non_manual_task_never_gets_task_url(self, client):
+        plain = _create_plain_task()
+        channel = _create_channel_task()
+
+        for task_id in (plain, channel):
+            entry = _manual_task_of(client, task_id)
+            assert "task_url" not in entry
+
+    def test_channel_task_keeps_its_join_url(self, client):
+        channel = _create_channel_task()
+
+        entry = _manual_task_of(client, channel)
+
+        assert entry["join_url"] == "https://t.me/" + CHANNEL_USERNAME
+        assert "task_url" not in entry
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "http://example.com/x",        # insecure scheme
+            "javascript:alert(1)",         # script
+            "data:text/html,hi",           # data URI
+            "",                            # empty
+            "   ",                         # whitespace only
+            "https://",                    # no host
+            "https://user:pass@host.io/",  # embedded credentials
+            "https://bob@example.com/",    # userinfo only
+            12345,                         # non-string
+            None,                          # missing
+            "example.com",                 # scheme-less
+        ],
+    )
+    def test_unusable_refs_yield_no_task_url(self, client, ref):
+        task_id = _create_manual_task()
+        _set_task_data(task_id, {"target": {"ref": ref}})
+
+        entry = _manual_task_of(client, task_id)
+
+        assert "task_url" not in entry
+
+    def test_target_missing_entirely(self, client):
+        task_id = _create_manual_task()
+        _set_task_data(task_id, {"provider": "other"})
+
+        entry = _manual_task_of(client, task_id)
+
+        assert "task_url" not in entry
+
+    def test_target_not_an_object(self, client):
+        task_id = _create_manual_task()
+        _set_task_data(task_id, {"target": _REF})
+
+        entry = _manual_task_of(client, task_id)
+
+        assert "task_url" not in entry
+
+    def test_malformed_task_data_json(self, client):
+        task_id = _create_manual_task()
+        with sqlite3.connect(db.DB_PATH) as conn:
+            conn.execute(
+                "UPDATE tasks SET task_data = ? WHERE id = ?",
+                ("{not json", task_id),
+            )
+
+        entry = _manual_task_of(client, task_id)
+
+        assert "task_url" not in entry
+
+
+class TestStartDoesNotSubmitOrReward:
+    """Starting a task changes status only — never money, never proof."""
+
+    def test_start_records_no_submission_and_no_ledger(self, client):
+        task_id = _create_manual_task()
+        before_wallet = db.get_user(USER_A)
+
+        response = client.post(
+            f"/api/tasks/{task_id}/start", headers=_auth()
+        )
+
+        assert response.status_code == 200
+        # 1. the task is merely started
+        assert _status(USER_A, task_id) == "started"
+        # 2. NO proof submission was created
+        submissions = _submissions(USER_A, task_id)
+        assert submissions == []
+        # 3. no ledger entry / balance movement
+        with sqlite3.connect(db.DB_PATH) as conn:
+            ledger = conn.execute(
+                "SELECT COUNT(*) FROM ledger WHERE user_id = ?", (USER_A,)
+            ).fetchone()[0]
+            wallets = conn.execute(
+                "SELECT COUNT(*) FROM wallets WHERE user_id = ?", (USER_A,)
+            ).fetchone()[0]
+        assert ledger == 0
+        assert wallets == 0
+        assert before_wallet is not None
+
+    def test_failed_start_does_not_render_a_started_task(self, client):
+        task_id = _create_manual_task()
+        # Exhaust the one-time repeat policy so the next start fails.
+        client.post(f"/api/tasks/{task_id}/start", headers=_auth())
+        db.update_user_task_status(
+            USER_A, task_id, "completed", _allow_completion=True
+        )
+
+        response = client.post(
+            f"/api/tasks/{task_id}/start", headers=_auth()
+        )
+
+        assert response.status_code != 200
+        assert _status(USER_A, task_id) == "completed"
+
+
+class TestProofStaysBoundToItsTask:
+    """The proof is submitted for the SAME task, by id."""
+
+    def test_proof_targets_the_started_task_only(self, client):
+        task_id = _create_manual_task()
+        client.post(f"/api/tasks/{task_id}/start", headers=_auth())
+
+        response = client.post(
+            f"/api/tasks/{task_id}/submit",
+            headers={**_auth(), "Content-Type": "application/json"},
+            data=json.dumps({"proof_ref": "https://proof.example/x"}),
+        )
+
+        body = response.get_json()
+        assert response.status_code == 200
+        submissions = _submissions(USER_A, task_id)
+        assert len(submissions) == 1
+        assert submissions[0].proof_ref == "https://proof.example/x"
+        assert body["ok"] is True
+
+
+class TestTaskUrlUiContract:
+    """Source-level guards for the Mini App task-link behaviour.
+
+    These read ``tasks.js`` the same way the Wallet page tests read
+    ``wallet-data.js``: the file is the contract.  They assert the
+    control is a link (never a submit) and that starting a task never
+    navigates or submits automatically.
+    """
+
+    def _tasks_js(self) -> str:
+        with open("miniapp/js/tasks.js", "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def _start_body(self) -> str:
+        source = self._tasks_js()
+        start = source.index("async function startTask")
+        # the next top-level function ends the body
+        end = source.index("async function submitTask", start)
+        return source[start:end]
+
+    def test_open_link_is_a_secure_anchor_not_a_submit(self):
+        source = self._tasks_js()
+
+        # A separate, server-provided link control.
+        assert "task-open-url" in source
+        assert "فتح رابط المهمة" in source
+        # The secure link pattern the channel join link already uses.
+        assert "rel = 'noopener'" in source
+        assert "target = '_blank'" in source
+        # Only https can ever become the href.
+        assert "_isSafeHttpsUrl(task.task_url)" in source
+
+    def test_start_never_submits_proof_or_opens_a_link(self):
+        body = self._start_body()
+
+        # Starting a task must NOT call either submit path …
+        assert "submitProof" not in body
+        assert "submitTask" not in body
+        # … nor navigate anywhere …
+        assert "window.location" not in body
+        assert ".click()" not in body
+        # … it only flips the status and shows a notice.
+        assert "status: 'started'" in body
+        assert "_showNotice" in body
+
+    def test_the_open_control_is_not_wired_to_the_proof_handler(self):
+        source = self._tasks_js()
+
+        # The open control is a plain anchor created with no click
+        # listener at all — it navigates by its href, so it can never
+        # reach a submit path.
+        anchor_start = source.index("const openLink")
+        anchor_end = source.index("actions.appendChild(openLink)", anchor_start)
+        anchor_block = source[anchor_start:anchor_end]
+        assert "addEventListener" not in anchor_block
+        assert 'setAttribute(\'data-testid\', \'task-open-url\')' in anchor_block
+        assert "openLink.href = task.task_url" in anchor_block
+
+        # the proof button is the ONLY control wired to submitProof,
+        # and it always receives ITS OWN task object — never a stale or
+        # foreign id.  (The control now also carries the file input.)
+        assert re.search(
+            r"submitProof\(\s*task, proofInput, proofBtn, fileInput, uploadStatus\)",
+            source,
+        ), "the proof button must pass its own task and its file input"
+
+    def test_proof_button_binds_to_its_own_task_id(self):
+        source = self._tasks_js()
+
+        assert re.search(
+            r"submitProof\(\s*task, proofInput, proofBtn",
+            source,
+        ), "the proof button must pass its own task object"

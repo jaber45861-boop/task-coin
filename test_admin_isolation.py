@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -147,6 +148,42 @@ def _make_application_mock() -> MagicMock:
     return application
 
 
+# ── Database isolation (MT-TASK-28 regression guard) ─────────────────
+# This module used to call bot_mod.db.init_db() with no path, so every
+# run applied the CURRENT migrations to the production database.  Each
+# test now gets its own temp SQLite file, and teardown asserts the
+# production file was left byte-identical.
+
+
+class _TempDbMixin:
+    def setUp(self):
+        super().setUp()
+        self._orig_db_path = bot_mod.db.DB_PATH
+        self._prod_path = self._orig_db_path
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        handle.close()
+        bot_mod.db.DB_PATH = handle.name
+        bot_mod.db.init_db(handle.name)
+        try:
+            st = os.stat(self._prod_path)
+            self._prod_before = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            self._prod_before = (None, None)
+        self.addCleanup(self._restore_db)
+
+    def _restore_db(self):
+        bot_mod.db.DB_PATH = self._orig_db_path
+        try:
+            st = os.stat(self._prod_path)
+            after = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            after = (None, None)
+        assert after == self._prod_before, (
+            "test_admin_isolation wrote to the PRODUCTION database "
+            f"({self._prod_path}); every test must use a temp DB_PATH"
+        )
+
+
 # ── 1. /start in private chat works ──────────────────────────────────
 
 
@@ -154,7 +191,7 @@ class TestStartPrivateChat(unittest.IsolatedAsyncioTestCase):
     """/start runs the onboarding flow in private chats."""
 
     def setUp(self) -> None:
-        bot_mod.db.init_db()
+        super().setUp()
         bot_mod.db.register_user(_TEST_USER_ID, "tester", "Tester")
         bot_mod.db.set_user_language(_TEST_USER_ID, "ar")
         unlock_user(_TEST_USER_ID)
@@ -193,7 +230,7 @@ class TestStartGroupChat(unittest.IsolatedAsyncioTestCase):
     """/start must never start the private onboarding flow in groups."""
 
     def setUp(self) -> None:
-        bot_mod.db.init_db()
+        super().setUp()
         bot_mod.db.register_user(_TEST_USER_ID, "tester", "Tester")
         bot_mod.db.set_user_language(_TEST_USER_ID, "ar")
         unlock_user(_TEST_USER_ID)
