@@ -446,9 +446,19 @@ class TestFailedClaimZeroPartialMutation:
 
 class TestDeferredPaidSeatBoundary:
     def test_no_capacity_seat_or_reservation_columns_exist(self, env):
-        """Roadmap #5 seat reservation is deferred: the schema has NO
-        capacity vocabulary anywhere (superset check of the existing
-        quantity-only guard in test_referral_task)."""
+        """Roadmap #5 seat reservation is still deferred: beyond the
+        MT-TASK-28 execution-capacity / reservation columns (an
+        unrelated, explicitly-shaped feature), the schema has NO
+        seat/quantity/quota vocabulary anywhere (superset check of the
+        existing quantity-only guard in test_referral_task)."""
+        # MT-TASK-28 is the ONLY source of capacity/reservation
+        # vocabulary allowed in the schema — any other column
+        # containing the forbidden words still fails the guard.
+        allowed_mt28 = {
+            "tasks": {"max_executions", "reservation_minutes"},
+            "user_tasks": {"reserved_until"},
+            "task_submissions": set(),
+        }
         forbidden = ("quantity", "seat", "capacit", "reserv", "quota")
         with db.get_connection() as conn:
             for table in ("tasks", "user_tasks", "task_submissions"):
@@ -457,6 +467,8 @@ class TestDeferredPaidSeatBoundary:
                     for r in conn.execute(f"PRAGMA table_info({table})")
                 ]
                 for col in cols:
+                    if col in allowed_mt28[table]:
+                        continue
                     for word in forbidden:
                         assert word not in col, f"{table}.{col} ~ '{word}'"
 

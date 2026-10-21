@@ -312,6 +312,12 @@ class TaskSpec:
     repeat_policy: str = db.REPEAT_POLICY_ONE_TIME
     repeat_hours: int | None = None
     reward_units: int | None = None
+    # MT-TASK-28: optional execution capacity.  None keeps the exact
+    # legacy behaviour (unlimited executions / a start never
+    # expires); a positive int is validated by db.create_task — the
+    # last line of defence — before it reaches the row.
+    max_executions: int | None = None
+    reservation_minutes: int | None = None
 
 
 def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
@@ -546,6 +552,8 @@ def _insert_and_fund(
         conn=conn,
         reward_units=spec.reward_units,
         commission_units=commission_units,
+        max_executions=spec.max_executions,
+        reservation_minutes=spec.reservation_minutes,
     )
     if advertiser_id is not None:
         _fund_created_task(conn, task_id, advertiser_id)

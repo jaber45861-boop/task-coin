@@ -106,9 +106,11 @@ class TestSubmissionsTable:
             }
         for table in ("users", "tasks", "user_tasks", "wallets", "ledger"):
             assert table in tables, f"existing table missing: {table}"
-        # user_tasks gains nothing: still exactly the MT-TASK-02 shape.
+        # user_tasks gains only the MT-TASK-28 reserved_until column —
+        # still exactly the MT-TASK-02 shape plus that one deadline.
         assert ut_cols == {
             "user_id", "task_id", "status", "started_at", "completed_at",
+            "reserved_until",
         }
 
     def test_user_task_status_vocabulary_unchanged(self):

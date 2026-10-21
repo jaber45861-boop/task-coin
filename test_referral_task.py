@@ -709,6 +709,9 @@ class TestSecurity:
             }
         assert cols == {
             "user_id", "task_id", "status", "started_at", "completed_at",
+            # MT-TASK-28: per-start reservation deadline — the ONLY
+            # additive column this feature introduces to user_tasks.
+            "reserved_until",
         }
         assert db.ALLOWED_USER_TASK_STATUSES == {
             db.USER_TASK_STATUS_AVAILABLE,
