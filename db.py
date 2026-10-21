@@ -599,6 +599,27 @@ def cancel_open_broadcast(
         return cursor.rowcount >= 1
 
 
+def _has_column(
+    conn: sqlite3.Connection, table: str, column: str
+) -> bool:
+    """True when ``table`` already has ``column`` (MT-TASK-28 guards).
+
+    Column presence is read from the schema via ``PRAGMA table_info``
+    instead of catching ``sqlite3.OperationalError`` from a failed
+    ``ALTER TABLE``: swallowing *every* OperationalError would also
+    hide real failures (locked database, corrupt schema, …) and leave
+    a half-migrated DB silently broken.  Reading the schema cannot
+    mask those errors — if the PRAGMA itself fails, it propagates.
+
+    ``table`` / ``column`` are internal constant strings only (never
+    user input), so interpolating the table name into the PRAGMA is
+    safe; SQLite PRAGMA does not accept bound parameters for
+    identifiers.  Column index 1 of ``table_info`` is the column name.
+    """
+    rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    return any(row[1] == column for row in rows)
+
+
 def init_db(db_path: str | None = None) -> None:
     """Initialize all database tables (channels + users)."""
     with get_connection(db_path) as conn:
@@ -844,6 +865,14 @@ def init_db(db_path: str | None = None) -> None:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # MT-TASK-28: per-start reservation deadline (NULL = a legacy
+        # start never expires).  Additive and idempotent; existing rows
+        # keep NULL — nothing is rewritten.
+        if not _has_column(conn, "user_tasks", "reserved_until"):
+            conn.execute(
+                "ALTER TABLE user_tasks ADD COLUMN reserved_until TIMESTAMP"
+            )
 
         # ── Task funding record (roadmap 4: advertiser funding) ────
         # One row per funded task — the immutable per-task funding
@@ -1597,6 +1626,36 @@ def init_db(db_path: str | None = None) -> None:
             WHERE external_tx_id IS NOT NULL
         """)
 
+        # ── Deposit rate snapshots + precomputed credit ─────────────
+        # Additive, idempotent migration (the deposit store's contract
+        # test test_60_init_db_migrates_a_preexisting_database pins
+        # this exact shape).  For an EGP method the creation-time
+        # validated quote is FROZEN into the row (wallet_rate_usdt_egp
+        # canonical TEXT — never REAL, rate_provider from the approved
+        # allowlist, rate_captured_at a tz-aware ISO instant) together
+        # with credited_usdt_units (exact USDT atomic INTEGER,
+        # Decimal/ROUND_CEILING).  All four are NULLABLE and stay NULL
+        # for USDT methods and for every LEGACY row: a legacy row is
+        # NEVER assigned a fabricated or current rate here — the
+        # verification boundary refuses it fail-closed instead, and no
+        # amount is ever recomputed or backfilled.  Column presence is
+        # checked via PRAGMA before ALTER, one column at a time, so a
+        # real failure surfaces instead of being swallowed.
+        for _deposit_snapshot_column in (
+            "wallet_rate_usdt_egp TEXT",
+            "rate_provider TEXT",
+            "rate_captured_at TIMESTAMP",
+            "credited_usdt_units INTEGER",
+        ):
+            if not _has_column(
+                conn, "deposit_requests",
+                _deposit_snapshot_column.split()[0],
+            ):
+                conn.execute(
+                    "ALTER TABLE deposit_requests ADD COLUMN "
+                    + _deposit_snapshot_column
+                )
+
         # ── Manual deposit proof evidence (MT-ADMIN-31) ──────────────
         # Additive migration only: a brand-new EVIDENCE table — no
         # existing table, column, row, financial CHECK constraint or
@@ -1909,7 +1968,7 @@ def validate_repeat_policy(repeat_policy, repeat_hours) -> tuple[str, int | None
     return repeat_policy, repeat_hours
 
 
-def _validate_execution_limit(value, field: str) -> int | None:
+def _validate_execution_limit(value: object, field: str) -> int | None:
     """Validate an OPTIONAL MT-TASK-28 execution limit.
 
     Mirrors ``task_capacity.validate_max_executions`` /

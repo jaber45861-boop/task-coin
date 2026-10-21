@@ -460,18 +460,19 @@ class TestDeferredPaidSeatBoundary:
             "user_tasks": {"reserved_until"},
             "task_submissions": set(),
         }
+        # MT-TASK-28 is the ONLY source of capacity/reservation
+        # vocabulary allowed in the schema — any other column
+        # containing the forbidden words still fails the guard.
+        forbidden = ("quantity", "seat", "capacit", "reserv", "quota")
         with db.get_connection() as conn:
             for table, allowed in shipped.items():
                 cols = [
                     r[1].lower()
                     for r in conn.execute(f"PRAGMA table_info({table})")
                 ]
-                found = set(cols) & {
-                    "quantity", "seat", "capacit", "reserv", "quota"
-                } | {
+                found = {
                     c for c in cols
-                    if any(w in c for w in
-                           ("quantity", "seat", "capacit", "reserv", "quota"))
+                    if any(w in c for w in forbidden)
                 }
                 # only the shipped names may carry that vocabulary
                 unexpected = {
