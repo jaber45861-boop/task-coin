@@ -120,6 +120,19 @@ class TaskRequest:
         """Whole-USDT compatibility/display value (int math only)."""
         return whole_usdt_reward(self.reward_units)
 
+    @property
+    def funding_advertiser_id(self) -> int:
+        """The advertiser a published request-task was funded against.
+
+        The approval flow always funds the task from the REQUESTING
+        user's wallet (``task_request_admin`` passes the claiming
+        owner's id), so the funding advertiser is — by construction —
+        the request owner.  Exposed as a read-only view property for
+        owner-management surfaces; it is never client-supplied and
+        never written from it.
+        """
+        return self.user_id
+
 
 def _row_to_request(row: sqlite3.Row | None) -> TaskRequest | None:
     """Convert a row; a corrupt payload/history fails safe (missing)."""
@@ -491,6 +504,135 @@ def admin_edit_field(
     return _row_to_request(row)
 
 
+def owner_edit_payload(
+    conn: sqlite3.Connection,
+    request_id: int,
+    user_id: int,
+    payload: dict,
+) -> TaskRequest | None:
+    """Owner edits the stored payload of their OWN approved request.
+
+    Phase 17 (owner management): unlike ``admin_edit_field`` (which
+    only ever touches a PENDING request), this updates the payload of
+    an already-approved request in place — the request row, its
+    funding, ledger, claim and published-task rows are never duplicated
+    or deleted.  The write is guarded by ``user_id`` (ownership) and
+    ``status = approved`` (CAS), and the previous payload is appended
+    to ``history_json`` for auditability.
+
+    Returns the fresh :class:`TaskRequest`, or ``None`` when the guard
+    lost the race (request missing, no longer owned, or no longer
+    approved) — the caller treats that as "not found".
+    """
+    history = list(_load_history(conn, request_id)) + [
+        _event(
+            "owner_edit",
+            actor=user_id,
+            fields=sorted(payload),
+            previous_payload=_load_payload(conn, request_id) or {},
+        )
+    ]
+    cursor = conn.execute(
+        "UPDATE user_task_requests "
+        "SET payload_json = ?, history_json = ?, "
+        "    updated_at = CURRENT_TIMESTAMP "
+        "WHERE request_id = ? AND user_id = ? AND status = ?",
+        (
+            json.dumps(payload, ensure_ascii=False),
+            json.dumps(history, ensure_ascii=False),
+            request_id,
+            user_id,
+            STATUS_APPROVED,
+        ),
+    )
+    if cursor.rowcount == 0:
+        return None
+    row = conn.execute(
+        f"SELECT {_COLUMNS} FROM user_task_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    logger.info(
+        "Task request edited by owner: request_id=%s user=%s fields=%s",
+        request_id, user_id, ",".join(sorted(payload)),
+    )
+    return _row_to_request(row)
+
+
+def owner_append_history_event(
+    conn: sqlite3.Connection,
+    request_id: int,
+    user_id: int,
+    event: str,
+    *,
+    only_if_status: str | None = STATUS_APPROVED,
+) -> TaskRequest | None:
+    """Append an owner-driven audit event to an OWN request's history.
+
+    Phase 17: pause / resume / archive are owner operational markers
+    recorded as append-only history events — the request ``status``
+    column keeps its schema-constrained value (``approved``), no
+    migration is involved and no task / funding / ledger / claim row
+    is touched.
+
+    ``only_if_status`` CAS-guards the write (``None`` = any status).
+    Returns the fresh :class:`TaskRequest` or ``None`` when the guard
+    did not match (missing, not owned, or status changed concurrently).
+    """
+    current = _load_row(conn, request_id)
+    if current is None or current["user_id"] != user_id:
+        return None
+    history = list(_load_history(conn, request_id)) + [
+        _event(event, actor=user_id)
+    ]
+    sql = (
+        "UPDATE user_task_requests "
+        "SET history_json = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE request_id = ? AND user_id = ?"
+    )
+    params: list[object] = [
+        json.dumps(history, ensure_ascii=False),
+        request_id,
+        user_id,
+    ]
+    if only_if_status is not None:
+        sql += " AND status = ?"
+        params.append(only_if_status)
+    cursor = conn.execute(sql, params)
+    if cursor.rowcount == 0:
+        return None
+    row = conn.execute(
+        f"SELECT {_COLUMNS} FROM user_task_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    return _row_to_request(row)
+
+
+def _load_row(conn: sqlite3.Connection, request_id: int):
+    return conn.execute(
+        f"SELECT {_COLUMNS} FROM user_task_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+
+
+def _load_payload(conn: sqlite3.Connection, request_id: int) -> dict | None:
+    row = _load_row(conn, request_id)
+    if row is None:
+        return None
+    request = _row_to_request(row)
+    return None if request is None else dict(request.payload)
+
+
+def _load_history(conn: sqlite3.Connection, request_id: int) -> list:
+    row = _load_row(conn, request_id)
+    if row is None:
+        return []
+    request = _row_to_request(row)
+    return [] if request is None else list(request.history)
+
+
 def admin_return_request(
     request_id: object, admin_id: object, note: object
 ) -> TaskRequest:
@@ -666,6 +808,31 @@ def read_published_task_id(
     if row is None:
         return None
     return row["published_task_id"]
+
+
+def get_request_by_published_task(
+    task_id: int,
+) -> TaskRequest | None:
+    """The approved request that published this task, or None.
+
+    Reverse of :func:`read_published_task_id` — lifecycle lookups that
+    start from a task id (catalog filtering, participation gates in
+    ``task_routes``).  Ownership is irrelevant here: this read only
+    resolves which request row (if any) owns the published task;
+    every mutating owner endpoint still verifies the caller against
+    ``user_id`` separately.  Pending/changes_requested requests have
+    a NULL ``published_task_id`` so they can never match.
+    """
+    if isinstance(task_id, bool) or not isinstance(task_id, int):
+        return None
+    with db.get_connection() as conn:
+        row = conn.execute(
+            f"SELECT {_COLUMNS} FROM user_task_requests "
+            "WHERE published_task_id = ? "
+            "ORDER BY request_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    return _row_to_request(row)
 
 
 def spec_from_request(request: TaskRequest, approver_id: int):

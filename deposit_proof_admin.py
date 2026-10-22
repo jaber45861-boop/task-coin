@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
 import asset_units
@@ -538,9 +538,9 @@ async def _send_detail(update, context, proof: DepositProof, deposit) -> None:
     be an edit of the text queue)."""
     text = build_detail_text(proof, deposit)
     markup = build_detail_keyboard(proof)
-    image = None
+    image_bytes = None
     try:
-        image = deposit_proof_storage.read_image(proof.storage_key)
+        image_bytes = deposit_proof_storage.read_image(proof.storage_key)
     except Exception:
         logger.warning(
             "Deposit proof image unavailable: proof=%s request=%s",
@@ -548,11 +548,11 @@ async def _send_detail(update, context, proof: DepositProof, deposit) -> None:
         )
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
     try:
-        if image is not None:
+        if image_bytes is not None:
             ext = proof.storage_key.rsplit(".", 1)[-1]
             await context.bot.send_photo(
                 chat_id=chat_id,
-                photo=InputFile(image, filename=f"proof.{ext}"),
+                photo=image_bytes,
                 caption=text,
                 reply_markup=markup,
             )

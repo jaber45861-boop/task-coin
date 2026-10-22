@@ -64,7 +64,6 @@ from payment_method_store import (
     PaymentMethodNotFoundError,
     PaymentMethodValidationError,
 )
-from unittest import mock as _mock
 
 logger = logging.getLogger(__name__)
 
@@ -137,14 +136,6 @@ def _format_method(method: PaymentMethod) -> str:
         + f" — {_min_deposit_display({'asset': method.asset, 'min_deposit_units': method.min_deposit_units})}"
     )
 
-
-def _min_deposit_display(fields: dict) -> str:
-    """Human-readable current or proposed minimum for one method."""
-    asset = fields.get("asset", "")
-    units = fields.get("min_deposit_units")
-    if units is None:
-        return "لا يوجد حد أدنى"
-    return f"{asset_units.units_to_asset_decimal(units, asset)} {asset}"
 
 MSG_ERROR = "⛔ حدث خطأ، حاول مرة أخرى."
 
@@ -259,6 +250,7 @@ MSG_WIZARD_STALE = (
     "⌛ انتهت جلسة المساعدة أو لم تكن هناك جلسة نشطة.\n"
     "أرسل /addpm للإضافة أو /editpm <رقم> للتعديل."
 )
+
 MSG_WIZARD_CANCELED = "❌ تم الإلغاء. لم يُحفظ أي شيء."
 MSG_WIZARD_INVALID_OPTION = (
     "❌ البيانات غير صحيحة.\n"
@@ -349,6 +341,26 @@ def _field_or_dash(value: str | None) -> str:
 
 
 # ── Rendering (pure, deterministic, bounded) ──────────────────────────
+
+
+def _min_deposit_display(fields: dict) -> str:
+    """Human-readable current or proposed minimum for one method.
+
+    ``fields`` is ``{'asset': <asset>, 'min_deposit_units': <units|None>}``.
+    When the asset has no registered scale or the stored units are
+    invalid, never present the atomic integer as if it were an amount
+    in the asset's currency.
+    """
+    asset = fields.get("asset", "")
+    units = fields.get("min_deposit_units")
+    if units is None:
+        return "لا يوجد حد أدنى"
+    try:
+        return f"{asset_units.units_to_asset_decimal(units, asset)} {asset}"
+    except asset_units.UnknownAssetScaleError:
+        return "غير معروض (مقياس الأصل غير مسجل)"
+    except asset_units.AssetAmountError:
+        return "غير معروض (قيمة مخزنة غير صالحة)"
 
 
 def _deposit_unavailable_reasons(method: PaymentMethod) -> tuple[str, ...]:
@@ -938,28 +950,6 @@ def build_wizard_summary(state: dict) -> str:
     )
 
 
-def _min_deposit_display(state: dict) -> str:
-    """Staged minimum in the staged asset's unit — never invented.
-
-    ``None`` renders as not-configured. If the asset has no registered
-    scale or the stored units are invalid, never present the atomic
-    integer as if it were an amount in the asset's currency.
-    """
-    units = state.get("min_deposit_units")
-    if units is None:
-        return "غير مضبوط"
-    try:
-        return str(
-            asset_units.units_to_asset_decimal(
-                units, state.get("asset")
-            )
-        )
-    except asset_units.UnknownAssetScaleError:
-        return "غير معروض (مقياس الأصل غير مسجل)"
-    except asset_units.AssetAmountError:
-        return "غير معروض (قيمة مخزنة غير صالحة)"
-
-
 def build_review_text(state: dict) -> str:
     return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
 
@@ -1191,10 +1181,12 @@ async def add_pm_command(update, context) -> None:
         # The interactive wizard (requested UX).  The pipe form below
         # stays byte-for-byte compatible for existing scripts.
         await _start_add_wizard(actor, message)
-        return    # Allow a single ``connection=`` to flow from admin commands that
+        return
+
+    # Allow a single ``connection=`` to flow from admin commands that
     # already own a transaction (for example /repairdepositminimums).
     connection = getattr(context, "_repair_connection", None)
-    if isinstance(connection, _mock.Mock):
+    if connection is not None and not isinstance(connection, db.ConnectionLike):
         connection = None
 
     async def _run_add_pipe() -> bool:
@@ -1232,7 +1224,6 @@ async def add_pm_command(update, context) -> None:
         return
 
 
-
 async def edit_pm_command(update, context) -> None:
     """``/editpm <id>`` → interactive field menu; ``<id> | <form>`` →
     legacy full replace (unchanged); the id stays stable either way.
@@ -1266,6 +1257,8 @@ async def edit_pm_command(update, context) -> None:
         method_id, form = parsed
         category, name, asset, network, provider, destination, instructions = form
         connection = getattr(context, "_repair_connection", None)
+        if connection is not None and not isinstance(connection, db.ConnectionLike):
+            connection = None
         try:
             updated = store.update_payment_method(
                 method_id,
@@ -1277,6 +1270,7 @@ async def edit_pm_command(update, context) -> None:
                 destination=destination,
                 instructions=instructions,
                 updated_by=actor,
+                connection=connection,
             )
         except PaymentMethodValidationError as exc:
             await message.reply_text(f"❌ {exc}")

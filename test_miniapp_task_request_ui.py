@@ -59,13 +59,17 @@ def _fn_body(name: str) -> str:
 # escaped or consciously added here (a visible review decision).
 _SAFE_INTERPOLATIONS = {
     "_cardStart('إضافة مهمة')",  # helper escapes its title argument
-    "justSubmittedBlock",         # literal block — no server data, no ${}
+    "successBlock",               # composed from _esc(statusMessage) + pendingChip
+    "pendingChip",                # literal block — no server data, no ${}
     "chipClass",                  # built from _esc(r.status)
     "reason",                     # built only from _esc(r.reason)
     "testid",                     # code-supplied selector, never server data
+    "id",                         # code-supplied selector fragment, never server data
     "request.reason",             # assigned to textContent, never HTML
     "LIST_URL",                   # fetch URL, not an HTML sink
     "editRequestId",              # fetch URL, not an HTML sink
+    "publishedTaskId",            # escaped task id interpolated into data-published-task-id
+    "ownerActions",               # owner button group injected as HTML via _ownerActionsHtml
 }
 
 
@@ -111,14 +115,31 @@ class TestStaticEscapingAudit:
         # _renderMessage receives server error messages.
         assert "_esc(message)" in _fn_body("_renderMessage")
 
-    def test_just_submitted_block_contains_no_interpolation(self):
+    def test_success_block_interpolations_are_escaped_or_safe(self):
+        """The success banner renders the SERVER's own message for the
+        last confirmed action — the only dynamic values inside the
+        block must be the escaped message or a whitelisted literal."""
         match = re.search(
-            r"const justSubmittedBlock = justSubmitted \? `(.*?)` :",
+            r"const successBlock = statusMessage \? `(.*?)` :",
             _src(),
             re.DOTALL,
         )
-        assert match, "justSubmittedBlock template not found"
-        assert "${" not in match.group(1)
+        assert match, "successBlock template not found"
+        block = match.group(1)
+        bodies = re.findall(r"\$\{([^{}]*)\}", block)
+        assert bodies, (
+            "no interpolations found — the audit pattern needs updating"
+        )
+        unescaped = [
+            b for b in bodies
+            if "_esc(" not in b and b not in _SAFE_INTERPOLATIONS
+        ]
+        assert unescaped == [], (
+            f"interpolations reaching the success block without _esc(): "
+            f"{unescaped}"
+        )
+        # The server message itself is escaped at the injection point.
+        assert "${_esc(statusMessage)}" in block
 
     def test_dynamic_text_uses_text_content_and_never_raw_sinks(self):
         source = _src()
@@ -170,7 +191,8 @@ function makeElement(tag) {
         querySelector(sel) {
             if (!nodes.has(sel)) nodes.set(sel, makeElement('div'));
             return nodes.get(sel);
-        }
+        },
+        querySelectorAll(sel) { return [this.querySelector(sel)]; }
     };
 }
 

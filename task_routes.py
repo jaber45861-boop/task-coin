@@ -161,6 +161,9 @@ _MSG_SERVER = "حدث خطأ غير متوقع، حاول مرة أخرى"
 _MSG_INVALID_REQUEST = "الطلب غير صالح"
 _MSG_TASK_NOT_FOUND = "المهمة غير موجودة"
 _MSG_TASK_INACTIVE = "المهمة غير متاحة حالياً"
+# Phase 17 owner lifecycle gate (paused / archived published tasks).
+_MSG_TASK_PAUSED = "هذه المهمة متوقفة مؤقتاً من صاحبها"
+_MSG_TASK_ARCHIVED = "هذه المهمة لم تعد متاحة"
 _MSG_NOT_AVAILABLE = "هذه المهمة غير متاحة لك"
 _MSG_ALREADY_STARTED = "بدأت هذه المهمة مسبقاً"
 _MSG_ALREADY_COMPLETED = "لقد أكملت هذه المهمة مسبقاً"
@@ -267,6 +270,32 @@ def _unauthenticated():
 
 def _server_error():
     return _error("server_error", _MSG_SERVER, 500)
+
+
+def _owner_block_response(task_id: int):
+    """Phase 17 lifecycle gate for NEW participation on owner tasks.
+
+    Returns a Flask error response when the published task is
+    owner-paused (409) or owner-archived (404), else ``None``.
+    Consulted by the discovery surface (catalog) and the worker entry
+    points (start / submit) only — reviewer surfaces (claim listings,
+    review decisions, settlement) deliberately keep working so
+    existing claims and pending reviews stay accessible while a task
+    is paused or archived.  The predicate is ownership-blind: a
+    worker learns only the state, never who owns the task.
+    """
+    try:
+        block = owner_management.participation_block(task_id)
+    except Exception:
+        logger.exception(
+            "Lifecycle gate failed: task=%s", task_id
+        )
+        return _server_error()
+    if block == "paused":
+        return _error("task_paused", _MSG_TASK_PAUSED, 409)
+    if block == "archived":
+        return _error("task_archived", _MSG_TASK_ARCHIVED, 404)
+    return None
 
 
 def _current_status(user_id: int, task_id: int) -> str:
@@ -524,6 +553,11 @@ def list_tasks():
         summaries = TaskCatalog().list_available_tasks()
         tasks = []
         for summary in summaries:
+            # Phase 17 lifecycle gate: an owner-paused or owner-archived
+            # published task leaves the discovery surface entirely.
+            # Discovery only — existing claims and reviews are untouched.
+            if owner_management.participation_block(summary.id) is not None:
+                continue
             row = db.get_user_task(user_id, summary.id)
             status = row["status"] if row is not None else _STATUS_AVAILABLE
             entry = {
@@ -640,6 +674,10 @@ def start_task(task_id: int):
         return _unauthenticated()
     user_id = _ensure_user(user)
 
+    blocked = _owner_block_response(task_id)
+    if blocked is not None:
+        return blocked
+
     body = request.get_json(silent=True)
     if body is not None and not isinstance(body, dict):
         return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
@@ -690,6 +728,10 @@ def submit_task(task_id: int):
     if user is None:
         return _unauthenticated()
     user_id = _ensure_user(user)
+
+    blocked = _owner_block_response(task_id)
+    if blocked is not None:
+        return blocked
 
     body = request.get_json(silent=True)
     if body is None:
@@ -1006,6 +1048,12 @@ def _trq_safe(req) -> dict:
         "task_id": req.published_task_id,
         "created_at": req.created_at,
         "updated_at": req.updated_at,
+        # Owner lifecycle flags (Phase 17): read-only views of the
+        # append-only history log, so the Mini App renders pause /
+        # resume / archive state from the same list fetch. Never
+        # client-writable.
+        "paused": owner_management.request_is_paused(req),
+        "archived": owner_management.request_is_archived(req),
     }
 
 
@@ -1120,10 +1168,18 @@ def list_task_requests():
             "Task request list failed: user=%s", user_id
         )
         return _server_error()
+    # Logical archive hides the request from the owner's mini-app list;
+    # the request row, funding, ledger and claim data all stay intact
+    # (Phase 17).  The PATCH resubmit path only ever targets returned
+    # changes_requested rows, which can never be archived.
+    visible = [
+        r for r in requests
+        if not owner_management.request_is_archived(r)
+    ]
     return jsonify(
         {
             "ok": True,
-            "requests": [_trq_safe(r) for r in requests],
+            "requests": [_trq_safe(r) for r in visible],
         }
     ), 200
 
@@ -1199,5 +1255,262 @@ def resubmit_task_request(request_id: int):
             "ok": True,
             "request": _trq_safe(updated),
             "message": _MSG_TRQ_SUBMITTED,
+        }
+    ), 200
+
+
+# ── Owner management messages ───────────────────────────────────────────
+
+_MSG_OWNER_ONLY = "يمكنك إدارة المهام التي تملكها أنت فقط"
+_MSG_OWNER_NO_PUBLISHED = "ليس لديك مهمة منشورة لإدارتها"
+_MSG_OWNER_NOT_FOUND = "المهمة غير موجودة أو لا تملكها"
+_MSG_OWNER_EDIT_OK = "تم تعديل المهمة"
+_MSG_OWNER_PAUSED = "تم إيقاف المهمة"
+_MSG_OWNER_RESUMED = "تم استئناف المهمة"
+_MSG_OWNER_ARCHIVED = "تم إخفاء المهمة من عرضك"
+_MSG_OWNER_CANNOT_EDIT_PAUSED = "عدّل المهمة فقط أثناء تشغيلها"
+_MSG_OWNER_INVALID_FIELD = "إحدى الحقول المرفوعة غير مسموح بها"
+_MSG_OWNER_INVALID_PAYLOAD = "بيانات التعديل غير صالحة"
+
+
+def _owner_trq_safe(req) -> dict:
+    """Safe presentation fields for a request when used as owner-management
+    context.  This is the same safe shape as ``_trq_safe`` but explicit so
+    owner management never accidentally starts leaking internals.
+    """
+    return _trq_safe(req)
+
+
+def _owner_task_not_found(user_id: int, published_task_id: int):
+    """Best-effort ownership+relationship miss -> 404-like response.
+
+    We never leak whether the task exists but belongs to someone else.
+    """
+    return _error(
+        "owner_task_not_found", _MSG_OWNER_NOT_FOUND, 404
+    )
+
+
+def _owner_invalid_payload(message: str):
+    return _error("invalid_payload", message, 400)
+
+
+def _owner_invalid_status(message: str):
+    return _error("invalid_status", message, 409)
+
+
+def _owner_no_published(user_id: int):
+    return _error(
+        "owner_no_published", _MSG_OWNER_NO_PUBLISHED, 404
+    )
+
+
+# ── Owner management endpoints ────────────────────────────────────────────
+# These live on the already-registered ``tasks_bp`` and reuse the existing
+# auth/ownership/error helpers.
+
+import task_owner_management as owner_management
+
+
+@tasks_bp.get("/api/owner/tasks/<int:published_task_id>")
+def owner_get_task(published_task_id: int):
+    """Return the verified caller's own published task by published_task_id.
+
+    This is the server-side ownership check used by the owner management
+    endpoints and the Mini App owner view.  A foreign or missing task is
+    indistinguishable from "not found" for this caller.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        with db.get_connection() as conn:
+            request, task_id = owner_management._owner_published_pair(
+                conn, user_id, published_task_id
+            )
+    except Exception:
+        logger.exception(
+            "Owner task lookup failed: user=%s task=%s",
+            user_id, published_task_id,
+        )
+        return _server_error()
+
+    if request is None or task_id is None:
+        return _owner_task_not_found(user_id, published_task_id)
+
+    return jsonify(
+        {
+            "ok": True,
+            "request": _owner_trq_safe(request),
+            "published_task_id": task_id,
+        }
+    ), 200
+
+
+@tasks_bp.post("/api/owner/tasks/<int:published_task_id>/edit")
+def owner_edit_task(published_task_id: int):
+    """Owner edit of a published task.
+
+    Currently the ONLY allowed edits are title and description.  Provider,
+    action and target_ref edits remain an admin review decision via the
+    existing task_request_admin workflow, so the owner cannot change the
+    execution semantics of a published task without that review.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _owner_invalid_payload(_MSG_OWNER_INVALID_PAYLOAD)
+
+    try:
+        with db.get_connection() as conn:
+            updated = owner_management.apply_edit(
+                conn, user_id, published_task_id, body
+            )
+    except owner_management.TaskRequestError as exc:
+        message = str(exc)
+        if message == owner_management.MSG_NOT_OWNER_ENGLISH:
+            return _owner_task_not_found(user_id, published_task_id)
+        if message == owner_management.MSG_CANNOT_EDIT_PAUSED_ENGLISH:
+            # The mini-app surfaces this next to the edit form, so it is
+            # a 400-class payload error, not a state conflict.
+            return _owner_invalid_payload(_MSG_OWNER_CANNOT_EDIT_PAUSED)
+        if message == owner_management.MSG_INVALID_FIELD_ENGLISH:
+            # Pass the module's bilingual message through — it names the
+            # rejected field class in both languages.
+            return _owner_invalid_payload(message)
+        if message == owner_management.MSG_INVALID_PAYLOAD_ENGLISH:
+            return _owner_invalid_payload(_MSG_OWNER_INVALID_PAYLOAD)
+        return _owner_invalid_payload(message)
+    except Exception:
+        logger.exception(
+            "Owner task edit failed: user=%s task=%s",
+            user_id, published_task_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "request": _owner_trq_safe(updated),
+            "published_task_id": published_task_id,
+            "message": _MSG_OWNER_EDIT_OK,
+        }
+    ), 200
+
+
+@tasks_bp.post("/api/owner/tasks/<int:published_task_id>/pause")
+def owner_pause_task(published_task_id: int):
+    """Owner pause of a published task.
+
+    Idempotent: pausing an already-paused task returns success.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        with db.get_connection() as conn:
+            result = owner_management.apply_pause(
+                conn, user_id, published_task_id
+            )
+    except owner_management.TaskRequestError as exc:
+        message = str(exc)
+        if message == owner_management.MSG_NOT_OWNER_ENGLISH:
+            return _owner_task_not_found(user_id, published_task_id)
+        return _owner_no_published(user_id)
+    except Exception:
+        logger.exception(
+            "Owner task pause failed: user=%s task=%s",
+            user_id, published_task_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "published_task_id": published_task_id,
+            "message": _MSG_OWNER_PAUSED,
+        }
+    ), 200
+
+
+@tasks_bp.post("/api/owner/tasks/<int:published_task_id>/resume")
+def owner_resume_task(published_task_id: int):
+    """Owner resume of a paused published task.
+
+    Idempotent: resuming a running task returns success.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        with db.get_connection() as conn:
+            result = owner_management.apply_resume(
+                conn, user_id, published_task_id
+            )
+    except owner_management.TaskRequestError as exc:
+        message = str(exc)
+        if message == owner_management.MSG_NOT_OWNER_ENGLISH:
+            return _owner_task_not_found(user_id, published_task_id)
+        return _owner_no_published(user_id)
+    except Exception:
+        logger.exception(
+            "Owner task resume failed: user=%s task=%s",
+            user_id, published_task_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "published_task_id": published_task_id,
+            "message": _MSG_OWNER_RESUMED,
+        }
+    ), 200
+
+
+@tasks_bp.post("/api/owner/tasks/<int:published_task_id>/archive")
+def owner_archive_task(published_task_id: int):
+    """Owner logical archive of a published task.
+
+    Logical hide only. No delete, no migration, no financial mutation.
+    The Mini App owner view filters this request out.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    try:
+        with db.get_connection() as conn:
+            result = owner_management.apply_archive(
+                conn, user_id, published_task_id
+            )
+    except owner_management.TaskRequestError as exc:
+        message = str(exc)
+        if message == owner_management.MSG_NOT_OWNER_ENGLISH:
+            return _owner_task_not_found(user_id, published_task_id)
+        return _owner_no_published(user_id)
+    except Exception:
+        logger.exception(
+            "Owner task archive failed: user=%s task=%s",
+            user_id, published_task_id,
+        )
+        return _server_error()
+
+    return jsonify(
+        {
+            "ok": True,
+            "published_task_id": published_task_id,
+            "message": _MSG_OWNER_ARCHIVED,
         }
     ), 200

@@ -283,6 +283,8 @@ class TestCreateValidation:
             "request_id", "status", "title", "description", "provider",
             "action", "target_ref", "reward", "reward_units", "reason",
             "task_id", "created_at", "updated_at",
+            # Phase 17: read-only lifecycle flags (never client-writable).
+            "paused", "archived",
         }
 
 
