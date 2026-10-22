@@ -319,7 +319,12 @@ const TaskRequestUI = (() => {
             busy = false;
             if (btn) {
                 btn.disabled = false;
-                btn.textContent = '💾 حفظ التعديلات';
+                // On success the render already restored the create-mode
+                // label (owner-edit mode is over); only a FAILED save
+                // goes back to the edit-mode label.
+                btn.textContent = ownerEditTaskId
+                    ? '💾 حفظ التعديلات'
+                    : 'إرسال للمراجعة';
             }
         }
     }

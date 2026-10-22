@@ -2048,6 +2048,43 @@ a.review-proof {
     display: none;
 }
 
+/* ── Owner actions on one approved, published request ─────────────
+   Edit (✏️) / pause (⏸️) / resume (▶️) / archive (📁) row controls.
+   The edit button opens the SAME dialog in owner-edit mode: title
+   and description stay editable while the execution fields above
+   are locked — this group is the only UI entry for that mode. */
+.taskreq-owner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+    width: 100%;
+}
+
+.taskreq-owner-btn {
+    flex: 1 1 auto;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background-color: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.taskreq-owner-btn:hover,
+.taskreq-owner-btn:focus-visible {
+    color: var(--accent-color);
+    border-color: var(--accent-color);
+}
+
+.taskreq-owner-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
 /* ══════════════════════════════════════════════════════════════
    Official Guide («الدليل الرسمي 📖»)
    Pressable Home card + full-screen guide dialog.
