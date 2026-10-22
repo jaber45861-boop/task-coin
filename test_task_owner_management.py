@@ -426,6 +426,21 @@ class TestOwnerEditRules:
         assert _count("SELECT COUNT(*) AS n FROM ledger") == ledger_before
         assert store.get_request(_request_id).reward_units == reward_before
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="KNOWN GAP (documented in Phase 2): an owner edit "
+        "rewrites the request payload_json only — the published tasks "
+        "row keeps the approved-time title/description, so workers "
+        "still see the old strings.  Propagation belongs to the "
+        "integration phase; flip this to a plain assertion there.",
+    )
+    def test_edit_propagation_to_published_task_row(self, client):
+        _request_id, task_id = _publish(client)
+        assert _op(
+            client, task_id, "edit", VALID_BODY, user=OWNER
+        ).status_code == 200
+        assert db.get_task(task_id)["title"] == VALID_BODY["title"]
+
 
 # ════════════════════════════════════════════════════════════════════════
 # Task states — pause / resume / archive (append-only history)
@@ -547,6 +562,200 @@ class TestTaskStates:
             assert _op(client, task_id, op, {}, user=OWNER).status_code == 200, op
         assert _wallet_units(OWNER) == wallet_before
         assert _count("SELECT COUNT(*) AS n FROM ledger") == ledger_before
+
+    def test_pause_then_archive_last_marker_wins(self, client):
+        """Cross-transitions: the LAST lifecycle event decides the
+        gate, and a resume clears any marker entirely."""
+        request_id, task_id = _publish(client)
+        assert _op(client, task_id, "pause", {}, user=OWNER).status_code == 200
+        assert (
+            _op(client, task_id, "archive", {}, user=OWNER).status_code
+            == 200
+        )
+        assert owner.participation_block(task_id) == "archived"
+        events = _events(request_id)
+        assert events.count("owner_pause") == 1
+        assert events.count("owner_archive") == 1
+
+        assert (
+            _op(client, task_id, "resume", {}, user=OWNER).status_code == 200
+        )
+        assert owner.participation_block(task_id) is None
+        assert task_id in _catalog_ids(client)
+
+    def test_lifecycle_ops_on_unpublished_request_are_404(self, client):
+        """An owner request that never published a task has no owner
+        surface: every lifecycle op misses the same 404."""
+        response = client.post(
+            "/api/task-requests",
+            headers=_auth(OWNER),
+            json={
+                "title": "طلب معلق",
+                "description": "وصف طلب معلق",
+                "provider": "instagram",
+                "action": "follow",
+                "target_ref": "https://instagram.com/x",
+                "reward": "0.5",
+            },
+        )
+        assert response.status_code == 200
+        pending_id = response.get_json()["request"]["request_id"]
+        for op in ("pause", "resume", "archive"):
+            result = _op(client, pending_id, op, {}, user=OWNER)
+            assert result.status_code == 404, op
+            assert result.get_json()["error"] == "owner_task_not_found"
+        assert store.get_request(pending_id).history == [
+            {"event": "submitted"}
+        ]
+
+
+# ══════════════════════════════════════════════════════════════════
+# Participation gates — behavioral (real HTTP, real services)
+# ══════════════════════════════════════════════════════════════════
+
+
+def _submit_proof(client, task_id, user=STRANGER, proof=None):
+    """A worker's manual-proof participation attempt (MT-TASK-15)."""
+    return client.post(
+        f"/api/tasks/{task_id}/submit",
+        headers=_auth(user),
+        json={"proof_ref": proof or "https://proof.example/img1"},
+    )
+
+
+def _start(client, task_id, user=STRANGER):
+    return client.post(f"/api/tasks/{task_id}/start", headers=_auth(user))
+
+
+class TestParticipationGates:
+    def test_paused_task_rejects_new_proof_claims(self, client):
+        _request_id, task_id = _publish(client)
+        _op(client, task_id, "pause", {}, user=OWNER)
+        response = _submit_proof(client, task_id)
+        assert response.status_code == 409
+        assert response.get_json()["error"] == "task_paused"
+
+    def test_archived_task_rejects_new_proof_claims(self, client):
+        _request_id, task_id = _publish(client)
+        _op(client, task_id, "archive", {}, user=OWNER)
+        response = _submit_proof(client, task_id)
+        assert response.status_code == 404
+        assert response.get_json()["error"] == "task_archived"
+
+    def test_prestarted_worker_blocked_while_paused_then_restored(
+        self, client
+    ):
+        """A worker who started BEFORE the pause is blocked while it
+        lasts, and can submit again once the owner resumes."""
+        _request_id, task_id = _publish(client)
+        assert _start(client, task_id).status_code == 200
+        _op(client, task_id, "pause", {}, user=OWNER)
+        assert _submit_proof(client, task_id).status_code == 409
+        _op(client, task_id, "resume", {}, user=OWNER)
+        restored = _submit_proof(client, task_id)
+        assert restored.status_code == 200
+        assert restored.get_json()["approval"] == "pending"
+
+    def test_reviewer_decision_settles_while_paused(self, client):
+        """Old participation stays reviewable: a claim opened BEFORE
+        the pause is still listed and decided by the authorized
+        reviewer while the task is paused — and the worker is paid."""
+        _request_id, task_id = _publish(client)
+        assert _start(client, task_id).status_code == 200
+        claim = _submit_proof(client, task_id)
+        assert claim.status_code == 200
+        assert claim.get_json()["approval"] == "pending"
+
+        _op(client, task_id, "pause", {}, user=OWNER)
+        # NEW participation is refused while the old claim survives.
+        assert (
+            _submit_proof(
+                client, task_id, proof="https://proof.example/second"
+            ).status_code
+            == 409
+        )
+        assert task_id not in _catalog_ids(client)
+
+        claims = client.get(
+            f"/api/tasks/{task_id}/claims", headers=_auth(ADMIN_ID)
+        )
+        assert claims.status_code == 200
+        items = claims.get_json()["claims"]
+        assert len(items) == 1
+        assert items[0]["task_id"] == task_id
+
+        credits_before = _count(
+            "SELECT COUNT(*) AS n FROM ledger "
+            "WHERE user_id = ? AND entry_type = 'credit'",
+            (STRANGER,),
+        )
+        decision = client.post(
+            f"/api/tasks/{task_id}/claims/{items[0]['claim_id']}/decision",
+            headers=_auth(ADMIN_ID),
+            json={"decision": "approve"},
+        )
+        assert decision.status_code == 200
+        assert decision.get_json()["approval"] == "approved"
+        # The pre-existing claim still settles through the ledger.
+        assert (
+            _count(
+                "SELECT COUNT(*) AS n FROM ledger "
+                "WHERE user_id = ? AND entry_type = 'credit'",
+                (STRANGER,),
+            )
+            == credits_before + 1
+        )
+
+    def test_reviewer_decision_works_while_archived(self, client):
+        """Archive is a logical hide: the reviewer still decides a
+        pre-existing claim (reject path), with zero money moved."""
+        _request_id, task_id = _publish(client)
+        assert _start(client, task_id).status_code == 200
+        assert _submit_proof(client, task_id).status_code == 200
+        _op(client, task_id, "archive", {}, user=OWNER)
+        assert _submit_proof(client, task_id).status_code == 404
+
+        claims = client.get(
+            f"/api/tasks/{task_id}/claims", headers=_auth(ADMIN_ID)
+        ).get_json()["claims"]
+        assert len(claims) == 1
+        credits_before = _count(
+            "SELECT COUNT(*) AS n FROM ledger "
+            "WHERE user_id = ? AND entry_type = 'credit'",
+            (STRANGER,),
+        )
+        decision = client.post(
+            f"/api/tasks/{task_id}/claims/{claims[0]['claim_id']}/decision",
+            headers=_auth(ADMIN_ID),
+            json={"decision": "reject"},
+        )
+        assert decision.status_code == 200
+        assert decision.get_json()["approval"] == "rejected"
+        assert (
+            _count(
+                "SELECT COUNT(*) AS n FROM ledger "
+                "WHERE user_id = ? AND entry_type = 'credit'",
+                (STRANGER,),
+            )
+            == credits_before
+        )
+
+    def test_catalog_filter_survives_a_gate_failure(self, client, monkeypatch):
+        """A failing lifecycle gate degrades to a safe 500 (never an
+        open catalog and never a traceback to the worker)."""
+        _request_id, task_id = _publish(client)
+
+        def _boom(tid):
+            raise RuntimeError("lifecycle store unavailable")
+
+        monkeypatch.setattr(
+            store, "get_request_by_published_task", _boom
+        )
+        response = _start(client, task_id)
+        assert response.status_code == 500
+        assert response.get_json()["error"] == "server_error"
+        catalog = client.get("/api/tasks", headers=_auth(STRANGER))
+        assert catalog.status_code == 500
 
 
 # ════════════════════════════════════════════════════════════════════════

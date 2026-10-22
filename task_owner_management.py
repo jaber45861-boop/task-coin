@@ -228,6 +228,15 @@ def apply_edit(
     the payload write path at all.  The store write re-guards
     ownership + ``status = approved`` (CAS), so a raced request can
     never write a foreign row.
+
+    KNOWN GAP (documented in Phase 2, deliberately NOT fixed here):
+    this rewrites the request's ``payload_json`` ONLY — the published
+    ``tasks`` row keeps the approved-time title/description, so the
+    worker-facing catalog still shows the old strings after an owner
+    edit.  Closing the gap means writing the published task row
+    (``db.update_task``) and belongs to the integration phase before
+    the edit UI is declared complete; the regression is pinned by the
+    strict-xfail test in ``test_task_owner_management.py``.
     """
     store = _store
     if store is None:
