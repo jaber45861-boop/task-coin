@@ -609,6 +609,33 @@ def owner_append_history_event(
     return _row_to_request(row)
 
 
+def owner_publish_text_update(
+    conn: sqlite3.Connection,
+    task_id: int,
+    title: str,
+    description: str,
+) -> bool:
+    """Owner-edit propagation: mirror title/description onto the
+    PUBLISHED ``tasks`` row — the worker-facing source the catalog
+    reads (``db.list_tasks`` → ``TaskCatalog`` → ``GET /api/tasks``).
+
+    Runs on the CALLER's connection, so it commits (or rolls back)
+    in the SAME transaction as the payload write that triggered it.
+    Exactly two columns are set — ``reward``, ``reward_units``, the
+    commission snapshot, ``active`` and ``task_data`` (provider /
+    action / target_ref) are never touched, and the caller has
+    already verified ownership + approved status.  Returns True when
+    the published row was updated.
+    """
+    if isinstance(task_id, bool) or not isinstance(task_id, int):
+        return False
+    cursor = conn.execute(
+        "UPDATE tasks SET title = ?, description = ? WHERE id = ?",
+        (title, description, task_id),
+    )
+    return cursor.rowcount > 0
+
+
 def _load_row(conn: sqlite3.Connection, request_id: int):
     return conn.execute(
         f"SELECT {_COLUMNS} FROM user_task_requests "

@@ -229,14 +229,18 @@ def apply_edit(
     ownership + ``status = approved`` (CAS), so a raced request can
     never write a foreign row.
 
-    KNOWN GAP (documented in Phase 2, deliberately NOT fixed here):
-    this rewrites the request's ``payload_json`` ONLY — the published
-    ``tasks`` row keeps the approved-time title/description, so the
-    worker-facing catalog still shows the old strings after an owner
-    edit.  Closing the gap means writing the published task row
-    (``db.update_task``) and belongs to the integration phase before
-    the edit UI is declared complete; the regression is pinned by the
-    strict-xfail test in ``test_task_owner_management.py``.
+    PROPAGATION (Phase: edit completion): the worker-facing catalog
+    reads the PUBLISHED ``tasks`` row (``db.list_tasks`` →
+    ``TaskCatalog`` → ``GET /api/tasks``), so the payload write is
+    followed — on the SAME connection, i.e. in the SAME transaction —
+    by ``task_request_store.owner_publish_text_update``, which
+    rewrites exactly that row's ``title`` / ``description``.  ``reward``
+    and ``reward_units`` keep their approved values, ``task_data``
+    (provider/action/target_ref) is untouched, and the write is only
+    reachable for an APPROVED request (the CAS above), so no edit can
+    bypass the admin-approval requirement.  Payload and propagation
+    commit or roll back TOGETHER — a failed propagation rolls the
+    edit back instead of leaving a half-applied state.
     """
     store = _store
     if store is None:
@@ -281,6 +285,24 @@ def apply_edit(
     )
     if result is None:
         raise TaskRequestError(MSG_INVALID_PAYLOAD_ENGLISH)
+    # Propagation: mirror the approved edit onto the PUBLISHED task row
+    # that workers actually read through the catalog — on the SAME
+    # connection, so payload + catalog text commit (or roll back)
+    # together.  Title and description only — reward / reward_units /
+    # commission / task_data are never passed, and a vanished row is
+    # logged (the payload stays the authoritative record).
+    publish_update = getattr(store, "owner_publish_text_update", None)
+    if publish_update is None:  # pragma: no cover - defensive
+        raise TaskRequestError(MSG_INVALID_PAYLOAD_ENGLISH)
+    propagated = publish_update(
+        conn, task_id, payload["title"], payload["description"]
+    )
+    if not propagated:
+        logger.warning(
+            "owner_edit propagation missed published task: "
+            "user=%s task=%s",
+            user_id, task_id,
+        )
     return result
 
 

@@ -44,6 +44,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest import mock
 
 import pytest
@@ -426,20 +427,74 @@ class TestOwnerEditRules:
         assert _count("SELECT COUNT(*) AS n FROM ledger") == ledger_before
         assert store.get_request(_request_id).reward_units == reward_before
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="KNOWN GAP (documented in Phase 2): an owner edit "
-        "rewrites the request payload_json only — the published tasks "
-        "row keeps the approved-time title/description, so workers "
-        "still see the old strings.  Propagation belongs to the "
-        "integration phase; flip this to a plain assertion there.",
-    )
-    def test_edit_propagation_to_published_task_row(self, client):
+    def test_edit_propagates_to_every_worker_facing_source(self, client):
+        """A saved owner edit reaches EVERY source a worker reads:
+        the published ``tasks`` row and the live catalog entry
+        (``GET /api/tasks`` → ``TaskCatalog`` → ``db.list_tasks``).
+
+        (Was the Phase-2 strict-xfail propagation-gap marker.)
+        """
         _request_id, task_id = _publish(client)
+        assert task_id in _catalog_ids(client)  # baseline: discoverable
         assert _op(
             client, task_id, "edit", VALID_BODY, user=OWNER
         ).status_code == 200
-        assert db.get_task(task_id)["title"] == VALID_BODY["title"]
+
+        # 1. The published task row carries the new strings.
+        task = db.get_task(task_id)
+        assert task["title"] == VALID_BODY["title"]
+        assert task["description"] == VALID_BODY["description"]
+
+        # 2. The worker's actual read path agrees — a STRANGER's
+        #    catalog response shows the edited title/description.
+        response = client.get("/api/tasks", headers=_auth(STRANGER))
+        assert response.status_code == 200
+        entry = next(
+            t for t in response.get_json()["tasks"] if t["id"] == task_id
+        )
+        assert entry["title"] == VALID_BODY["title"]
+        assert entry["description"] == VALID_BODY["description"]
+
+    def test_propagation_changes_no_financial_or_review_field(
+        self, client
+    ):
+        """Propagation is title/description-only: reward, atomic
+        reward units, commission snapshot, active flag and the
+        admin-review ``task_data`` (provider/action/target_ref) keep
+        their approved values — and no wallet/ledger row moves."""
+        _request_id, task_id = _publish(client)
+        before = db.get_task(task_id)
+        wallet_before = _wallet_units(OWNER)
+        ledger_before = _count("SELECT COUNT(*) AS n FROM ledger")
+
+        assert _op(
+            client, task_id, "edit", VALID_BODY, user=OWNER
+        ).status_code == 200
+
+        after = db.get_task(task_id)
+        for column in (
+            "reward",
+            "reward_units",
+            "commission_units",
+            "active",
+            "type",
+            "task_data",
+        ):
+            assert after[column] == before[column], column
+        task_data = json.loads(after["task_data"])
+        assert task_data["provider"] == "instagram"
+        assert task_data["action"] == "follow"
+        assert _wallet_units(OWNER) == wallet_before
+        assert _count("SELECT COUNT(*) AS n FROM ledger") == ledger_before
+
+    def test_paused_task_propagates_nothing(self, client):
+        """Continuity with the Phase-2 gate: a paused task refuses the
+        edit AND its worker-facing strings stay untouched."""
+        _request_id, task_id = _publish(client)
+        _op(client, task_id, "pause", {}, user=OWNER)
+        response = _op(client, task_id, "edit", VALID_BODY, user=OWNER)
+        assert response.status_code == 400
+        assert db.get_task(task_id)["title"] != VALID_BODY["title"]
 
 
 # ════════════════════════════════════════════════════════════════════════
