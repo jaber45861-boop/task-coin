@@ -953,6 +953,7 @@ def build_wizard_summary(state: dict) -> str:
     )
 
 
+
 def build_review_text(state: dict) -> str:
     return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
 

@@ -77,10 +77,10 @@ class TestTasksModuleWiring:
 
     def test_tasks_script_loaded_before_app(self):
         html = _html()
-        tasks_pos = html.find('src="js/tasks.js"')
+        assert 'src="js/tasks.js' in html, "tasks.js must be loaded in index.html"
+        assert 'src="js/app.js"' in html, "app.js must be loaded in index.html"
+        tasks_pos = html.find('src="js/tasks.js')
         app_pos = html.find('src="js/app.js"')
-        assert tasks_pos >= 0, "tasks.js must be loaded in index.html"
-        assert app_pos >= 0, "app.js must be loaded in index.html"
         assert tasks_pos < app_pos, \
             "tasks.js must load before app.js (module dependency)"
 
@@ -246,6 +246,64 @@ class TestStatusActions:
     def test_haptic_convention_preserved(self):
         content = _tasks_js()
         assert "HapticFeedback" in content
+
+
+# ════════════════════════════════════════════════════════════════════
+# 4b. Owner controls — is_owner flag rendered for task creators
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestOwnerControls:
+    def test_build_actions_checks_is_owner(self):
+        """_buildActions must check task.is_owner === true before rendering owner controls."""
+        content = _tasks_js()
+        assert "task.is_owner === true" in content
+
+    def test_owner_label_rendered_when_is_owner_true(self):
+        """Owner label span must be created when is_owner is true."""
+        content = _tasks_js()
+        assert "task-owner-label" in content
+        assert "setAttribute('data-testid', 'task-owner')" in content
+        assert "ownerLabel.textContent = 'owner'" in content
+
+    def test_owner_controls_only_for_owner(self):
+        """Owner controls must be guarded by is_owner === true (not unconditional)."""
+        content = _tasks_js()
+        owner_block = content[
+            content.find("if (task.is_owner === true)"):
+        ]
+        assert "actions.appendChild(ownerLabel)" in owner_block
+
+    def test_is_owner_set_in_api_response(self):
+        """Backend must always set is_owner in the task entry."""
+        routes = _read("task_routes.py")
+        assert 'entry["is_owner"] = is_owner' in routes
+
+    def test_is_owner_fallback_uses_advertiser_id(self):
+        """is_owner fallback must use tasks.advertiser_id column."""
+        routes = _read("task_routes.py")
+        assert 'task_row.get("advertiser_id") == user_id' in routes
+
+    def test_is_owner_fallback_uses_task_data_approver(self):
+        """is_owner fallback must ALSO use task_data.approver.telegram_user_id
+        (the verified buyer/creator identity per MT-TASK-15 / MT-TASK-06).
+        Root cause of missing owner buttons: owner buttons depend on
+        task_funding.advertiser_id == user_id; when those IDs diverge
+        (e.g. task 32: advertiser_id=1402515781 but approver=6175354851),
+        is_owner is false and no owner buttons render."""
+        routes = _read("task_routes.py")
+        assert 'approver.get("telegram_user_id") == user_id' in routes
+
+    def test_no_owner_controls_when_is_owner_false(self):
+        """When is_owner is false/missing, owner label must not be rendered."""
+        content = _tasks_js()
+        # The is_owner guard is the ONLY place ownerLabel is created
+        owner_creations = content.count("ownerLabel = document.createElement")
+        assert owner_creations == 1
+        # The guard must precede the creation
+        guard_pos = content.find("if (task.is_owner === true)")
+        create_pos = content.find("ownerLabel = document.createElement")
+        assert create_pos > guard_pos
 
 
 # ════════════════════════════════════════════════════════════════════
