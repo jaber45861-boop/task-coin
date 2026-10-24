@@ -42,7 +42,16 @@ const Tasks = (() => {
         verification_error: 'تعذر التحقق حالياً، حاول مرة أخرى لاحقاً',
         submission_in_progress: 'جارٍ التحقق من محاولة سابقة، حاول بعد قليل',
         server_error: 'حدث خطأ غير متوقع، حاول مرة أخرى',
-        network: 'تعذر الاتصال بالخادم، حاول مرة أخرى'
+        network: 'تعذر الاتصال بالخادم، حاول مرة أخرى',
+        task_modify_error: 'فشل في تعديل المهمة، حاول مرة أخرى',
+        task_pause_error: 'فشل في إيقاف المهمة، حاول مرة أخرى',
+        task_resume_error: 'فشل في استئناف المهمة، حاول مرة أخرى',
+        task_delete_error: 'فشل في حذف المهمة، حاول مرة أخرى',
+        task_confirm_delete: 'هل أنت متأكد أنك تريد حذف هذه المهمة؟',
+        task_modified_ok: 'تم تعديل المهمة بنجاح',
+        task_paused_ok: 'تم إيقاف المهمة مؤقتاً',
+        task_resumed_ok: 'تم استئناف المهمة',
+        task_deleted_ok: 'تم إلغاء المهمة بنجاح'
     };
 
     // Exactly the three statuses the backend supports.
@@ -300,17 +309,66 @@ const Tasks = (() => {
             return;
         }
 
-        // Owner indicator: rendered ONLY from the server's own
-        // boolean (the funding advertiser of record) — the page
-        // never derives ownership locally.  Display only: no task
-        // management controls are offered here because the backend
-        // exposes no owner task administration endpoint yet.
+        // Owner indicator — rendered ONLY from the server's own boolean
+        // (the funding advertiser of record). Display only: no task
+        // management controls are offered here.
         if (task.is_owner === true) {
             const ownerTag = document.createElement('span');
             ownerTag.className = 'task-owner-badge';
             ownerTag.setAttribute('data-testid', 'task-owner-badge');
             ownerTag.textContent = 'أنت مالك هذه المهمة';
             actions.appendChild(ownerTag);
+
+            // Management buttons for task owner
+            const mgmtBtns = document.createElement('div');
+            mgmtBtns.className = 'task-mgmt-buttons';
+
+            // Pause button: show for tasks that can be paused
+            if (task.status !== 'available' || !task.paused) {
+                const pauseBtn = document.createElement('button');
+                pauseBtn.type = 'button';
+                pauseBtn.className = 'task-mgmt-btn task-mgmt-pause';
+                pauseBtn.setAttribute('data-testid', 'task-mgmt-pause');
+                pauseBtn.textContent = 'إيقاف مؤقت';
+                pauseBtn.addEventListener('click', () => pauseTask(task, pauseBtn));
+                mgmtBtns.appendChild(pauseBtn);
+            }
+
+            // Resume button: show only for paused tasks
+            if (task.paused) {
+                const resumeBtn = document.createElement('button');
+                resumeBtn.type = 'button';
+                resumeBtn.className = 'task-mgmt-btn task-mgmt-resume';
+                resumeBtn.setAttribute('data-testid', 'task-mgmt-resume');
+                resumeBtn.textContent = 'استئناف';
+                resumeBtn.addEventListener('click', () => resumeTask(task, resumeBtn));
+                mgmtBtns.appendChild(resumeBtn);
+            }
+
+            // Delete button: show for non-archived tasks
+            if (!task.archived_at) {
+                const deleteBtn = document.createElement('button');
+                deleteBtn.type = 'button';
+                deleteBtn.className = 'task-mgmt-btn task-mgmt-delete';
+                deleteBtn.setAttribute('data-testid', 'task-mgmt-delete');
+                deleteBtn.textContent = 'حذف المهمة';
+                deleteBtn.addEventListener('click', () => confirmDeleteTask(task, deleteBtn));
+                mgmtBtns.appendChild(deleteBtn);
+            }
+
+            // Modify button: show for non-archived tasks
+            if (!task.archived_at) {
+                const modifyBtn = document.createElement('button');
+                modifyBtn.type = 'button';
+                modifyBtn.className = 'task-mgmt-btn task-mgmt-modify';
+                modifyBtn.setAttribute('data-testid', 'task-mgmt-modify');
+                modifyBtn.textContent = ' تعديل';
+                modifyBtn.addEventListener('click', () => modifyTask(task, modifyBtn));
+                mgmtBtns.appendChild(modifyBtn);
+            }
+
+            // Store reference for later use - will be appended after awaiting_decision check
+            window.__taskOwnerManagement = mgmtBtns;
         }
 
         // A referral claim or manual proof is already awaiting its

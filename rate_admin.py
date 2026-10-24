@@ -11,6 +11,9 @@ plain-text rendering — no parse modes).
 Workflow (admin's private chat only)::
 
     /setrate 48.5   → validate + atomically persist the current rate
+                      (EMERGENCY path only: rejected while a fresh
+                      automatic quote exists — see rate_store's
+                      ManualRateBlockedError / MSG_EMERGENCY_ONLY)
 
 Security:
 
@@ -48,6 +51,12 @@ MSG_USAGE = (
     "/setrate 48.5\n\n"
     "السعر بالجنيه المصري لكل 1 USDT — أرقام عشرية عادية فقط\n"
     "(بدون scientific notation، بدون إشارة، بدون صفر)."
+)
+MSG_EMERGENCY_ONLY = (
+    "⛔ السعر التلقائي حاليًا يعمل بشكل سليم، لذلك التحديث اليدوي "
+    "معطّل.\n"
+    "هذا المسار للطوارئ فقط: يفتح تلقائيًا فور تعطّل مزود التحديث "
+    "وامتناع السعر التلقائي عن التحديث."
 )
 
 
@@ -128,6 +137,11 @@ async def setrate_command(update, context) -> None:
 
     try:
         quote = rate_store.set_rate(body, admin_user_id=actor)
+    except rate_store.ManualRateBlockedError:
+        # Normal mode: the automatic source is healthy — this is an
+        # operator-facing policy refusal, not a generic failure.
+        await message.reply_text(MSG_EMERGENCY_ONLY)
+        return
     except (RateQuoteError, RateStoreError) as exc:
         await message.reply_text(f"❌ {exc}")
         return

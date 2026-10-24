@@ -54,4 +54,10 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     host = "0.0.0.0"
     print(f"Starting Mini App server on {host}:{port}")
+    # The web process also runs the automatic rate refresh so EGP
+    # deposits keep working when this server runs without bot.py
+    # (start() is idempotent; a provider outage fails closed in
+    # rate_store.get_current_quote — never a stale trusted quote).
+    import rate_worker
+    rate_worker.start()
     app.run(host=host, port=port, debug=False)

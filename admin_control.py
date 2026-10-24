@@ -174,6 +174,18 @@ TOAST_ENABLED = "✅ تم التفعيل"
 TOAST_DISABLED = "✅ تم التعطيل"
 TOAST_EDITED = "✅ تم التعديل"
 TOAST_CANCELLED = "❌ تم الإلغاء"
+# MT-ADMIN-36: pause / resume / archive toasts
+TOAST_PAUSED = "⏸️ تم الإيقاف المؤقت"
+TOAST_RESUMED = "▶️ تم الاستئناف"
+TOAST_ARCHIVED = "🗄️ تم أرشفة المهمة"
+TOAST_DELETE_BLOCKED = "❌ لا يمكن الحذف: توجد تبعيات"
+MSG_DELETE_BLOCKED = "⚠️ لا يمكن حذف هذه المهمة مباشرة."
+MSG_DELETE_CONFIRM_TITLE = "⚠️ تأكيد حذف المهمة"
+MSG_DEPENDENCIES_BLOCK_DELETE = (
+    "⚠️ لا يمكن حذف المهمة نهائيًا لأنها تمتلك تبعيات:\n"
+    "{deps}\n"
+    "يمكنك أرشفتها بدلًا من ذلك (تُخفى من القوائم وتُحتفظ بكل السجلات)."
+)
 # MT-ADMIN-37 admin-management messages — stable Arabic answers,
 # never a traceback, SQL, token or environment detail.
 MSG_ADMIN_NOT_FOUND = "⚠️ المشرف غير موجود."
@@ -354,6 +366,13 @@ _TASKS_CONFIRM_RE = re.compile(
     r"tasks:confirm:(enable|disable|edit):([0-9]{1,15})"
 )
 _TASKS_CANCEL_RE = re.compile(r"tasks:cancel:([0-9]{1,15})")
+_TASKS_PAUSE_RE = re.compile(r"tasks:pause:([0-9]{1,15})")
+_TASKS_RESUME_RE = re.compile(r"tasks:resume:([0-9]{1,15})")
+_TASKS_DELETE_RE = re.compile(r"tasks:delete:([0-9]{1,15})")
+_TASKS_ARCHIVE_RE = re.compile(r"tasks:archive:([0-9]{1,15})")
+_TASKS_CONFIRM_RE = re.compile(
+    r"tasks:confirm:(enable|disable|edit|pause|resume|delete|archive):([0-9]{1,15})"
+)
 
 # MT-ADMIN-37: the in-place admins module owns its own closed
 # sub-grammar under the SAME ctl: namespace — fixed operation tokens
@@ -723,7 +742,11 @@ def parse_callback(data: object) -> str | None:
         (_TASKS_VIEW_RE, f"{OP_TASKS}:v:%d"),
         (_TASKS_ENABLE_RE, f"{OP_TASKS}:enable:%d"),
         (_TASKS_DISABLE_RE, f"{OP_TASKS}:disable:%d"),
+        (_TASKS_PAUSE_RE, f"{OP_TASKS}:pause:%d"),
+        (_TASKS_RESUME_RE, f"{OP_TASKS}:resume:%d"),
         (_TASKS_EDIT_RE, f"{OP_TASKS}:edit:%d"),
+        (_TASKS_DELETE_RE, f"{OP_TASKS}:delete:%d"),
+        (_TASKS_ARCHIVE_RE, f"{OP_TASKS}:archive:%d"),
         (_TASKS_CANCEL_RE, f"{OP_TASKS}:cancel:%d"),
     ):
         match = pattern.fullmatch(op)
@@ -1981,6 +2004,10 @@ def build_task_detail_text(task: dict | None) -> str:
         else NA
     )
     state = "🟢 مفعّلة" if task.get("active") else "🔴 معطلة"
+    if task.get("paused"):
+        state += " / ⏸️ متوقفة مؤقتًا"
+    if task.get("archived_at"):
+        state += " / 🗄️ مؤرشة"
     policy = task.get("repeat_policy")
     hours = task.get("repeat_hours")
     if policy == "repeatable" and isinstance(hours, int):
@@ -2010,10 +2037,12 @@ def build_task_detail_text(task: dict | None) -> str:
 
 def build_task_detail_keyboard(task_id: int, task: dict | None):
     """Only mutations the repository can safely perform: the state
-    toggle (existing ``db.update_task(active=...)``) and the bounded
-    title/description edit menu.  No reward, no type, no delete."""
+    toggle (existing ``db.update_task(active=...)``), pause/resume,
+    title/description edit menu, and archive/delete.  No reward,
+    no type, no hard delete when dependencies exist."""
     rows = []
     if task is not None:
+        # ── active toggle (enable/disable) ──
         if task.get("active"):
             rows.append(
                 [
@@ -2038,6 +2067,31 @@ def build_task_detail_keyboard(task_id: int, task: dict | None):
                     )
                 ]
             )
+        # ── pause / resume ──
+        if task.get("paused"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "▶️ استئناف",
+                        callback_data=(
+                            f"{CALLBACK_PREFIX}{OP_TASKS}"
+                            f":resume:{task_id}"
+                        ),
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "⏸️ إيقاف مؤقت",
+                        callback_data=(
+                            f"{CALLBACK_PREFIX}{OP_TASKS}"
+                            f":pause:{task_id}"
+                        ),
+                    )
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -2048,11 +2102,120 @@ def build_task_detail_keyboard(task_id: int, task: dict | None):
                 )
             ]
         )
+        # ── archive / delete ──
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🗄️ أرشفة",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:archive:{task_id}"
+                    ),
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🗑️ حذف",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:delete:{task_id}"
+                    ),
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
                 "⬅️ رجوع",
                 callback_data=f"{CALLBACK_PREFIX}{TASKS_BACK_OP}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_task_pause_resume_text(task: dict, kind: str) -> str:
+    """Confirmation text for pause / resume."""
+    action = "إيقاف مؤقت" if kind == "pause" else "استئناف"
+    return "\n".join(
+        [
+            f"⚠️ تأكيد {action} المهمة",
+            "",
+            f"المهمة: {_task_ref(task)}",
+            f"العملية: {action}",
+            "",
+            "سيُمنع إسناد المهمة لمستخدمين جدد أثناء الإيقاف، "
+            "مع الاحتفاظ بالمطالبات والدورات والسجلات المالية كما هي.",
+            "",
+            "هل تريد المتابعة؟",
+        ]
+    )
+
+
+def build_task_delete_confirm_text(task: dict, deps: dict) -> str:
+    """Confirmation text for delete — shows task name/id and dependencies."""
+    lines = [
+        MSG_DELETE_CONFIRM_TITLE,
+        "",
+        f"المهمة: {_task_ref(task)}",
+        f"المعرّف: #{task.get('id')}",
+        "",
+        "سيتم إخفاء المهمة من القوائم وإيقاف إسنادها للمستخدمين.",
+        "",
+    ]
+    if deps["total"] > 0:
+        lines += [
+            "⚠️ توجد تبعيات، لذا لا يمكن الحذف النهائي:",
+        ]
+        for label, key in (
+            ("مطالبات المستخدمين", "user_tasks"),
+            ("مطالبات التسليم", "submissions"),
+            ("سجلات التمويل", "funding"),
+            ("سجلات الأستاذ المالي", "ledger_entries"),
+        ):
+            if deps[key]:
+                lines.append(f"  • {label}: {deps[key]}")
+        lines += [
+            "",
+            "اختر \"أرشفة\" لإخفاء المهمة مع الاحتفاظ بكل السجلات،",
+            "أو \"حذف نهائي\" فقط إذا كنت متأكدًا من أن التبعيات آمنة للحذف.",
+        ]
+    else:
+        lines += [
+            "لا توجد تبعيات حساسة. يمكن الحذف النهائي بأمان.",
+        ]
+    lines += ["", "هل تريد المتابعة؟"]
+    return "\n".join(lines)
+
+
+def build_task_delete_confirm_keyboard(task_id: int, deps: dict) -> InlineKeyboardMarkup:
+    """Keyboard for the delete confirmation card."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                "🗄️ أرشفة (آمن)",
+                callback_data=(
+                    f"{CALLBACK_PREFIX}{OP_TASKS}:confirm:archive:{task_id}"
+                ),
+            )
+        ]
+    ]
+    if deps["total"] == 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🗑️ حذف نهائي",
+                    callback_data=(
+                        f"{CALLBACK_PREFIX}{OP_TASKS}:confirm:delete:{task_id}"
+                    ),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "❌ إلغاء",
+                callback_data=f"{CALLBACK_PREFIX}{OP_TASKS}:cancel:{task_id}",
             )
         ]
     )
@@ -2194,7 +2357,8 @@ def build_task_confirm_keyboard(op_kind: str, task_id: int):
 # Marker on Application.bot_data: the edit-text catch-all has been
 # attached to the LIVE application (single-shot, idempotent).
 def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
-    """Confirmation step → the EXISTING ``db.update_task`` contract.
+    """Confirmation step → the EXISTING ``db.update_task`` contract
+    plus pause/resume/archive/delete store calls.
 
     Fresh re-read first: a pressed card whose state already changed
     (or whose task vanished, or whose edit value was already
@@ -2220,6 +2384,27 @@ def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
         else:
             toast = TOAST_ENABLED if desired else TOAST_DISABLED
             result = "applied"
+            db.write_audit_log(
+                actor, f"task_{kind}", "task", task_id,
+                f'{{"active": {desired}}}',
+            )
+    elif kind in ("pause", "resume"):
+        desired_paused = kind == "pause"
+        task = db.get_task(task_id)
+        if task is None:
+            text, result = MSG_TASK_NOT_FOUND, "missing"
+        elif bool(task.get("paused", False)) == desired_paused:
+            text, result = MSG_STALE_TASK, "stale-state"
+        elif not (db.pause_task(task_id) if desired_paused
+                  else db.resume_task(task_id)):
+            text, result = MSG_STALE_TASK, "stale-race"
+        else:
+            toast = TOAST_PAUSED if desired_paused else TOAST_RESUMED
+            result = "applied"
+            db.write_audit_log(
+                actor, f"task_{kind}", "task", task_id,
+                f'{{"paused": {desired_paused}}}',
+            )
     elif kind == "edit":
         pending = (
             _PENDING_TASK_EDITS.pop(chat_id, None)
@@ -2248,11 +2433,55 @@ def _apply_task_confirm(task_id: int, kind: str, chat_id, actor: int):
                     text, result = MSG_STALE_TASK, "stale-race"
                 else:
                     toast, result = TOAST_EDITED, "applied"
+                    db.write_audit_log(
+                        actor, "task_edit", "task", task_id,
+                        f'{{"field": "{field}"}}',
+                    )
+    elif kind == "archive":
+        task = db.get_task(task_id)
+        if task is None:
+            text, result = MSG_TASK_NOT_FOUND, "missing"
+        elif task.get("archived_at") is not None:
+            text, result = MSG_STALE_TASK, "stale-state"
+        elif not db.archive_task(task_id):
+            text, result = MSG_STALE_TASK, "stale-race"
+        else:
+            toast = TOAST_ARCHIVED
+            result = "applied"
+            db.write_audit_log(
+                actor, "task_archive", "task", task_id,
+                '{"archived_at": true}',
+            )
+    elif kind == "delete":
+        task = db.get_task(task_id)
+        if task is None:
+            text, result = MSG_TASK_NOT_FOUND, "missing"
+        elif task.get("archived_at") is not None:
+            # Archived tasks can be hard-deleted only when dependency-free.
+            deps = db.get_task_dependencies(task_id)
+            if deps["total"] > 0:
+                text, result = MSG_DELETE_BLOCKED, "blocked-deps"
+            elif not db.delete_task(task_id, force=True):
+                text, result = MSG_STALE_TASK, "stale-race"
+            else:
+                toast = TOAST_ARCHIVED
+                result = "applied"
+                db.write_audit_log(
+                    actor, "task_delete", "task", task_id,
+                    '{"force": true}',
+                )
+        else:
+            # Non-archived task: refuse hard delete, offer archive instead.
+            text, result = MSG_DELETE_BLOCKED, "not-archived"
     if result == "applied":
         # Render the refreshed card from the authoritative re-read.
         task = db.get_task(task_id)
-        text = build_task_detail_text(task)
-        markup = build_task_detail_keyboard(task_id, task)
+        if task is None:
+            text = "⚠️ المهمة غير موجودة بعد العملية."
+            markup = _tasks_back_keyboard()
+        else:
+            text = build_task_detail_text(task)
+            markup = build_task_detail_keyboard(task_id, task)
     logger.info(
         "Task management: admin=%d task=%d op=%s result=%s",
         actor, task_id, kind, result,
@@ -2323,6 +2552,49 @@ async def _handle_tasks_op(update, context, query, op: str,
                 label = "تفعيل المهمة" if desired else "تعطيل المهمة"
                 text = build_task_confirm_text(task, label)
                 markup = build_task_confirm_keyboard(kind, task_id)
+        elif op.startswith(f"{OP_TASKS}:pause:"):
+            view = "tasks:confirm"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            elif bool(task.get("paused", False)):
+                text, markup = MSG_STALE_TASK, _tasks_back_keyboard()
+            else:
+                text = build_task_pause_resume_text(task, "pause")
+                markup = build_task_confirm_keyboard("pause", task_id)
+        elif op.startswith(f"{OP_TASKS}:resume:"):
+            view = "tasks:confirm"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            elif not bool(task.get("paused", False)):
+                text, markup = MSG_STALE_TASK, _tasks_back_keyboard()
+            else:
+                text = build_task_pause_resume_text(task, "resume")
+                markup = build_task_confirm_keyboard("resume", task_id)
+        elif op.startswith(f"{OP_TASKS}:archive:"):
+            view = "tasks:confirm"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            elif task.get("archived_at") is not None:
+                text, markup = MSG_STALE_TASK, _tasks_back_keyboard()
+            else:
+                text = build_task_confirm_text(task, "أرشفة المهمة")
+                markup = build_task_confirm_keyboard("archive", task_id)
+        elif op.startswith(f"{OP_TASKS}:delete:"):
+            view = "tasks:confirm"
+            task_id = int(op.rsplit(":", 1)[1])
+            task = db.get_task(task_id)
+            if task is None:
+                text, markup = MSG_TASK_NOT_FOUND, _tasks_back_keyboard()
+            else:
+                deps = db.get_task_dependencies(task_id)
+                text = build_task_delete_confirm_text(task, deps)
+                markup = build_task_delete_confirm_keyboard(task_id, deps)
         elif op.startswith(f"{OP_TASKS}:edit:"):
             view = "tasks:editmenu"
             task_id = int(op.rsplit(":", 1)[1])

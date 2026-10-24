@@ -87,6 +87,13 @@ class TestValidation:
             "action": "follow",
             "target_ref": "https://instagram.com/example",
             "reward_units": 50_000_000,
+            # MT-TASK-28 (repeat_hours fix): repeat policy defaults to
+            # one_time and hours to None when not supplied; execution
+            # limits default to None (legacy behaviour).
+            "repeat_policy": "one_time",
+            "repeat_hours": None,
+            "max_executions": None,
+            "reservation_minutes": None,
         }
         assert [e["event"] for e in request.history] == ["submitted"]
 
@@ -472,3 +479,90 @@ class TestApproval:
         assert spec.reward == 0
         assert spec.reward_units == 50_000_000
         assert spec.target == {"ref": VALID["target_ref"]}
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28 (repeat_hours fix only): supported intervals [1, 3, 6, 12, 24]
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRepeatIntervals:
+    @pytest.mark.parametrize("hours", [1, 3, 6, 12, 24])
+    def test_supported_intervals_accepted(self, env, hours):
+        request = _create(repeat_policy="repeatable", repeat_hours=hours)
+        assert request.payload["repeat_policy"] == "repeatable"
+        assert request.payload["repeat_hours"] == hours
+        assert isinstance(request.payload["repeat_hours"], int)
+
+    def test_one_time_without_hours_keeps_legacy_contract(self, env):
+        request = _create()
+        assert request.payload["repeat_policy"] == "one_time"
+        assert request.payload["repeat_hours"] is None
+
+    def test_one_time_with_hours_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="فاصل التكرار"):
+            _create(repeat_policy="one_time", repeat_hours=6)
+
+    @pytest.mark.parametrize("bad", ["1", 1.5, True, None])
+    def test_repeat_hours_must_be_strict_integer(self, env, bad):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable", repeat_hours=bad)
+
+    def test_unsupported_integer_interval_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable", repeat_hours=5)
+
+    def test_repeatable_without_hours_rejected(self, env):
+        with pytest.raises(TaskRequestError, match="اختر فاصل تكرار"):
+            _create(repeat_policy="repeatable")
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28: execution limits — max_executions / reservation_minutes
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionLimits:
+    @pytest.mark.parametrize("executions, minutes", [
+        (100, 30),
+        (1, 10),
+        (1_000_000, 7 * 24 * 60),
+    ])
+    def test_all_four_together_accepted(self, env, executions, minutes):
+        request = _create(
+            repeat_policy="repeatable", repeat_hours=6,
+            max_executions=executions, reservation_minutes=minutes,
+        )
+        assert request.payload["repeat_policy"] == "repeatable"
+        assert request.payload["repeat_hours"] == 6
+        assert request.payload["max_executions"] == executions
+        assert request.payload["reservation_minutes"] == minutes
+
+    def test_one_time_without_limits_keeps_legacy_contract(self, env):
+        request = _create()
+        assert request.payload["repeat_policy"] == "one_time"
+        assert request.payload["repeat_hours"] is None
+        assert request.payload["max_executions"] is None
+        assert request.payload["reservation_minutes"] is None
+
+    @pytest.mark.parametrize("bad", [0, -1, "abc", 1.5, True])
+    def test_max_executions_rejected(self, env, bad):
+        with pytest.raises(TaskRequestError, match="max_executions"):
+            _create(repeat_policy="repeatable", repeat_hours=6,
+                    max_executions=bad)
+
+    @pytest.mark.parametrize("bad", [0, -10, "abc", 2.5, True])
+    def test_reservation_minutes_rejected(self, env, bad):
+        with pytest.raises(TaskRequestError, match="reservation_minutes"):
+            _create(repeat_policy="repeatable", repeat_hours=6,
+                    reservation_minutes=bad)
+
+    def test_max_executions_ceiling_rejected(self, env):
+        with pytest.raises(TaskRequestError):
+            _create(repeat_policy="repeatable", repeat_hours=6,
+                    max_executions=10 ** 7)
+
+    def test_reservation_ceiling_rejected(self, env):
+        with pytest.raises(TaskRequestError):
+            _create(repeat_policy="repeatable", repeat_hours=6,
+                    reservation_minutes=7 * 24 * 60 + 1)

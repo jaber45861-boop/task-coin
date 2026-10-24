@@ -35,9 +35,12 @@ Architecture boundary (critical):
 The HTTP layer opens NO transaction and NEVER touches wallet/ledger.
 There is no authoritative deposit verification source in this
 repository, so a created request is always ``pending`` (unverified):
-no credit, no ledger entry, no rate, no conversion, no blockchain
-interaction.  Future crediting belongs to a dedicated verifier with
-idempotency via ``external_tx_id`` + the ledger's reference uniqueness.
+no credit and no ledger entry here — for an EGP method the creation
+transaction DOES read the current fresh rate quote (fail-closed) and
+freezes it into the row, but no conversion is credited until the
+dedicated verification boundary approves.  Future crediting belongs
+to a dedicated verifier with idempotency via ``external_tx_id`` +
+the ledger's reference uniqueness.
 
 Security rules enforced here:
 
@@ -73,6 +76,7 @@ from deposit_store import (
     DepositMethodUnavailableError,
     DepositValidationError,
 )
+from rate_quote import RateQuoteError
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,10 @@ _MSG_PM_NOT_FOUND = "وسيلة الإيداع غير موجودة"
 _MSG_PM_UNAVAILABLE = "وسيلة الدفع غير متاحة حالياً"
 _MSG_NOT_DEPOSIT_METHOD = "هذه الوسيلة غير متاحة للإيداع حالياً"
 _MSG_SETTINGS_MISSING = "إعدادات الإيداع غير مكتملة، تواصل مع الإدارة"
+_MSG_RATE_UNAVAILABLE = (
+    "تعذّر الحصول على سعر صرف صالح — حاول مرة أخرى لاحقاً. "
+    "لا يُنشأ إيداع يحتاج تحويل عملات بدون سعر موثوق."
+)
 _MSG_CREATED = "تم إنشاء طلب الإيداع — بانتظار التحقق من الدفع"
 
 # ── Manual proof upload messages (MT-ADMIN-31) ────────────────────
@@ -273,6 +281,11 @@ def _create_error(exc: Exception):
         return _error(
             "deposit_settings_missing", _MSG_SETTINGS_MISSING, 503
         )
+    if isinstance(exc, RateQuoteError):
+        # No fresh, valid rate quote (missing / stale / corrupt row)
+        # for a deposit that needs a conversion — fail-closed: an EGP
+        # deposit is never created against an untrusted rate.
+        return _error("rate_unavailable", _MSG_RATE_UNAVAILABLE, 503)
     return None
 
 

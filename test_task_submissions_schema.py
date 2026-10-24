@@ -106,9 +106,17 @@ class TestSubmissionsTable:
             }
         for table in ("users", "tasks", "user_tasks", "wallets", "ledger"):
             assert table in tables, f"existing table missing: {table}"
-        # user_tasks gains nothing: still exactly the MT-TASK-02 shape.
+        # user_tasks gains only the ONE column MT-TASK-28 shipped —
+        # ``reserved_until``, the deadline of the current reservation.
+        # It stays nullable, so every legacy row keeps its exact
+        # previous behaviour (a start that never expires).  Any FURTHER
+        # vocabulary on this table would still be unbuilt, so the
+        # guard is kept and merely narrowed to the shipped name (the
+        # same reconciliation test_referral_roadmap5.py applies to the
+        # capacity vocabulary).
         assert ut_cols == {
             "user_id", "task_id", "status", "started_at", "completed_at",
+            "reserved_until",
         }
 
     def test_user_task_status_vocabulary_unchanged(self):
@@ -295,6 +303,23 @@ class TestRepeatConstraints:
                 repeat_policy="one_time", repeat_hours=5,
             )
 
+    def test_validation_error_messages_are_arabic(self, path):
+        """No technical English leaks to the user-facing error text."""
+        with pytest.raises(ValueError, match="اختر فاصل تكرار صالحًا"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="repeatable", repeat_hours="24",
+            )
+        with pytest.raises(ValueError, match="فاصل التكرار لا يُستخدم"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="one_time", repeat_hours=5,
+            )
+        with pytest.raises(ValueError, match="سياسة تكرار غير صالحة"):
+            db.create_task(
+                "t", "d", "x", 1, db_path=path,
+                repeat_policy="banana",
+            )
     def test_db_check_rejects_orphan_hours(self, path):
         """Direct SQL cannot bypass the cross-column CHECK."""
         with sqlite3.connect(path) as conn, pytest.raises(

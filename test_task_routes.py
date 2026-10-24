@@ -51,6 +51,7 @@ import pytest
 
 import db
 import serve_miniapp
+import wallet
 from wallet import USDT_SCALE
 from config import CHANNELS, Channel
 from channel_task_verifier import (
@@ -59,6 +60,8 @@ from channel_task_verifier import (
     register_channel_task_verifier,
 )
 from task_start import StartResult
+from task_creation import TaskSpec, create_task_from_spec
+from task_taxonomy import VERIFICATION_MANUAL
 
 # Reuse the existing, independently implemented Telegram initData helper.
 from test_miniapp_auth import _TEST_BOT_TOKEN, _make_init_data
@@ -261,6 +264,7 @@ class TestCatalog:
         assert set(task.keys()) <= {
             "id", "title", "description", "type", "reward",
             "reward_units", "status", "join_url", "is_owner",
+            "paused", "archived_at",
         }
         raw = response.get_data(as_text=True)
         assert "task_data" not in raw
@@ -270,6 +274,43 @@ class TestCatalog:
         assert CHANNEL_SLUG not in raw          # no slug leakage
         assert str(CHANNEL_ID) not in raw       # no numeric channel id
 
+    def test_is_owner_true_for_task_creator(self, client):
+        """is_owner is TRUE when user_id matches task_funding.advertiser_id.
+
+        Creates a funded task through the canonical funding path so that
+        task_funding.advertiser_id == USER_A, proving is_owner resolves
+        from the funding record of record.
+        """
+        wallet.credit_units(USER_A, 100 * USDT_SCALE)
+        spec = TaskSpec(
+            title="مهمة مملوكة",
+            description="وصف المهمة المملوكة",
+            provider="instagram",
+            action="follow",
+            target={},
+            verification=VERIFICATION_MANUAL,
+            reward=10,
+            approver_id=USER_A,
+            reward_units=10 * USDT_SCALE,
+        )
+        task_id = create_task_from_spec(spec, funding_advertiser_id=USER_A)
+
+        # Owner (USER_A) sees is_owner: true
+        response = client.get("/api/tasks", headers=_auth(USER_A))
+        assert response.status_code == 200
+        tasks = {t["id"]: t for t in response.get_json()["tasks"]}
+        assert task_id in tasks, f"task {task_id} missing from catalog"
+        assert tasks[task_id]["is_owner"] is True, \
+            f"expected is_owner=True for creator, got {tasks[task_id].get('is_owner')!r}"
+
+        # Non-owner (USER_B) sees is_owner: false/absent
+        response = client.get("/api/tasks", headers=_auth(USER_B))
+        assert response.status_code == 200
+        tasks = {t["id"]: t for t in response.get_json()["tasks"]}
+        assert task_id in tasks, f"task {task_id} missing from catalog"
+        assert tasks[task_id].get("is_owner") is not True, \
+            f"expected is_owner not True for non-owner, got {tasks[task_id].get('is_owner')!r}"
+
     def test_status_vocabulary_is_exact(self, client):
         task_id = _create_channel_task()
         plain_id = _create_plain_task()
@@ -277,6 +318,10 @@ class TestCatalog:
 
         response = client.get("/api/tasks", headers=_auth())
         seen += [t["status"] for t in response.get_json()["tasks"]]
+        by_id_before = {t["id"]: t["status"]
+                        for t in response.get_json()["tasks"]}
+        assert by_id_before[task_id] == "available"
+        assert by_id_before[plain_id] == "available"
 
         client.post(f"/api/tasks/{task_id}/start", headers=_auth())
         members_status = _Members()
@@ -287,12 +332,12 @@ class TestCatalog:
         client.post(f"/api/tasks/{task_id}/submit", headers=_auth())
         response = client.get("/api/tasks", headers=_auth())
         seen += [t["status"] for t in response.get_json()["tasks"]]
-
-        assert set(seen) <= {"available", "started", "completed"}
         by_id = {t["id"]: t["status"]
                  for t in response.get_json()["tasks"]}
-        assert by_id[task_id] == "completed"
+        # MT-TASK-29: completed tasks leave the active catalog list.
+        assert task_id not in by_id, "completed task must leave active catalog"
         assert by_id[plain_id] == "available"
+        assert set(seen) <= {"available", "started", "completed"}
 
 
 # ════════════════════════════════════════════════════════════════════

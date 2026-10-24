@@ -236,6 +236,11 @@ class WizardTestBase(unittest.TestCase):
         reward="100",
         repeat=db.REPEAT_POLICY_ONE_TIME,
         hours=None,
+        # MT-TASK-28: execution limits.  Defaults produce a fully
+        # specified draft so the flow reaches preview in one pass;
+        # pass None to exercise the unset (legacy) shape.
+        max_executions=100,
+        reservation_minutes=30,
         uid=ADMIN_A,
     ) -> int:
         """Walk the wizard to preview; returns the draft id."""
@@ -257,6 +262,14 @@ class WizardTestBase(unittest.TestCase):
         self._press(f"atw:{draft_id}:repeat:{repeat}", uid)
         if repeat == db.REPEAT_POLICY_REPEATABLE:
             self._send(str(hours), uid)
+        if max_executions is not None:
+            self._send(str(max_executions), uid)
+        elif self._step(draft_id) == admin_task_wizard.STEP_MAX_EXECUTIONS:
+            self._send("", uid)  # skip: leaves the field unset (NULL)
+        if reservation_minutes is not None:
+            self._send(str(reservation_minutes), uid)
+        elif self._step(draft_id) == admin_task_wizard.STEP_RESERVATION:
+            self._send("", uid)  # skip: leaves the field unset (NULL)
         self.assertEqual(self._step(draft_id), admin_task_wizard.STEP_PREVIEW)
         return draft_id
 
@@ -1202,3 +1215,84 @@ class TestPublishIdempotency(WizardTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28: execution limits through the wizard
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionLimitsInWizard(WizardTestBase):
+    """The limits the admin enters must land on the published task."""
+
+    def test_limits_are_shown_in_the_preview(self) -> None:
+        draft_id = self._drive(max_executions=250,
+                               reservation_minutes=45)
+        preview, _ = admin_task_wizard.render_step(self._draft(draft_id))
+        self.assertIn("250", preview)
+        self.assertIn("45 دقيقة", preview)
+
+    def test_unset_limits_are_shown_as_unconfigured(self) -> None:
+        """A legacy draft keeps the legacy behaviour and says so —
+        never silently showing a zero or an invented number."""
+        draft_id = self._drive(max_executions=None,
+                               reservation_minutes=None)
+        preview, _ = admin_task_wizard.render_step(self._draft(draft_id))
+        self.assertIn("بلا حد", preview)
+        self.assertIn("بلا انتهاء", preview)
+
+    def test_limits_reach_the_published_task(self) -> None:
+        draft_id = self._drive(max_executions=250,
+                               reservation_minutes=45)
+        self._confirm(draft_id)
+        with db.get_connection() as conn:
+            last = conn.execute(
+                "SELECT MAX(id) AS id FROM tasks"
+            ).fetchone()["id"]
+        task = db.get_task(last)
+        self.assertEqual(task["max_executions"], 250)
+        self.assertEqual(task["reservation_minutes"], 45)
+
+    def test_unset_limits_publish_as_null(self) -> None:
+        draft_id = self._drive(max_executions=None,
+                               reservation_minutes=None)
+        self._confirm(draft_id)
+        with db.get_connection() as conn:
+            last = conn.execute(
+                "SELECT MAX(id) AS id FROM tasks"
+            ).fetchone()["id"]
+        task = db.get_task(last)
+        self.assertIsNone(task["max_executions"])
+        self.assertIsNone(task["reservation_minutes"])
+
+    def test_invalid_limits_are_rejected(self) -> None:
+        draft_id = self._drive()
+        self._press(f"atw:{draft_id}:edit:max_executions")
+        for bad in ("0", "-5", "abc", "1.5", "1000001"):
+            with self.subTest(value=bad):
+                reply = self._send(bad)
+                self.assertNotIn("✅", reply.await_args.args[0])
+                self.assertEqual(
+                    self._step(draft_id),
+                    admin_task_wizard.STEP_MAX_EXECUTIONS,
+                )
+        # and a valid one still works
+        self._send("77")
+        self.assertEqual(
+            self._payload(draft_id)["max_executions"], 77
+        )
+
+    def test_invalid_reservation_is_rejected(self) -> None:
+        draft_id = self._drive()
+        self._press(f"atw:{draft_id}:edit:reservation_minutes")
+        for bad in ("0", "-1", "abc", "2.5", "10081"):
+            with self.subTest(value=bad):
+                self._send(bad)
+                self.assertEqual(
+                    self._step(draft_id),
+                    admin_task_wizard.STEP_RESERVATION,
+                )
+        self._send("90")
+        self.assertEqual(
+            self._payload(draft_id)["reservation_minutes"], 90
+        )

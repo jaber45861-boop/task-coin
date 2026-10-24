@@ -1703,16 +1703,47 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         )
         return message.message_id
 
+    # MT-ADMIN-34: evidence screenshots for manual task proofs.  A
+    # SEPARATE, explicit transport — the text transports above are
+    # untouched, so every existing text notification behaves exactly
+    # as before.  AdminNotifier itself still resolves the recipients
+    # (config.ADMINS only): no worker, channel or group can ever
+    # receive an evidence image.
+    async def _send_photo(
+        chat_id: int, text: str, image: bytes, reply_markup
+    ) -> int:
+        message = await application.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+        return message.message_id
+
     def _schedule_notification(coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, loop)
 
+    # MT-ADMIN-35: worker notification transport for manual task
+    # proof outcomes.  Deliberately NOT an AdminNotifier: this one
+    # targets the submitting worker, never ADMINS.  A raw bot send is
+    # reused so no new Telegram surface or credential is introduced.
+    async def _send_worker_notice(user_id: int, text: str) -> None:
+        await application.bot.send_message(chat_id=user_id, text=text)
+
+    manual_proof_inbox.bind_user_notifier(
+        _WorkerNotifier(_send_worker_notice)
+    )
+
     # MT-ADMIN-06: the support flow shares the SAME AdminNotifier —
     # ADMINS private chats only, never channels/groups.
-    _admin_notifier = AdminNotifier(_send_text, markup_send=_send_markup)
+    _admin_notifier = AdminNotifier(
+        _send_text, markup_send=_send_markup, photo_send=_send_photo
+    )
     manual_proof_inbox.bind(
         _admin_notifier,
         _schedule_notification,
     )
+
     support_service.bind(_admin_notifier)
     # Withdrawal submission notices share the SAME AdminNotifier and
     # loop scheduler (ADMINS private chats only) — bound only while
@@ -1767,6 +1798,28 @@ def _run_telegram_bot(application: Application, stop_event: threading.Event) -> 
         finally:
             asyncio.set_event_loop(None)
             loop.close()
+
+
+class _WorkerNotifier:
+    """Deliver an outcome notice to ONE worker (MT-ADMIN-35).
+
+    A deliberately narrow transport: it can only send the pre-built
+    text to the worker's own id, so it can never reach an admin chat,
+    a channel or a group.  Any Telegram error is raised to the caller,
+    which is already fail-soft — the decision it reports is durable.
+    """
+
+    def __init__(self, send) -> None:
+        if not callable(send):
+            raise ValueError("send must be callable")
+        self._send = send
+
+    async def notify(self, user_id: int, text: str) -> None:
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("worker id must be a positive integer")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("worker notice text must be non-empty")
+        await self._send(user_id, text)
 
 
 def run_single_entry(application: Application) -> None:
@@ -1859,6 +1912,12 @@ def main() -> None:
     db.init_db()
     db.load_channels()
     _refresh_required_ids()
+
+    # Refresh the market quote in the background. A provider failure is
+    # fail-closed by rate_store.get_current_quote once the last quote ages
+    # past its 15-minute TTL; it never silently extends quote freshness.
+    import rate_worker
+    rate_worker.start()
 
     app = ApplicationBuilder().token(token).build()
 
@@ -2029,6 +2088,14 @@ def main() -> None:
     ), group=0)
     app.add_handler(CommandHandler(
         "editpm", payment_method_admin.edit_pm_command,
+    ), group=0)
+    # MT-ADMIN-08b: emergency deposit minimum repair — private admin
+    #    chat ONLY.  First invocation is read-only; the admin must
+    #    explicitly repeat with APPLY to write the approved minimums to
+    #    payment methods #1 and #2 inside one transaction.
+    app.add_handler(CommandHandler(
+        "repairdepositminimums",
+        payment_method_admin.repair_deposit_minimums_command,
     ), group=0)
     # MT-ADMIN-26: /setrate — authoritative manual EGP-per-USDT rate.
     #    Private admin chat ONLY; authorization is enforced inside the

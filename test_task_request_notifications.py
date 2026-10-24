@@ -431,10 +431,17 @@ class TestBotWiring:
         source = inspect.getsource(bot)
         assert "task_request_notifications.bind(" in source
         assert "task_request_notifications.unbind()" in source
-        # Same notifier instance as the other server-side flows.
+        # Same notifier instance as the other server-side flows: the
+        # notifier must be constructed BEFORE any of them bind to it.
+        notifier_anchor = "_admin_notifier = AdminNotifier("
+        assert notifier_anchor in source
         assert source.index("task_request_notifications.bind(") > source.index(
-            "AdminNotifier(_send_text, markup_send=_send_markup)"
+            notifier_anchor
         )
+        # MT-ADMIN-34: the evidence-photo transport is ADDITIVE — the
+        # text transports are still the ones every flow binds through.
+        assert "photo_send=_send_photo" in source
+        assert "markup_send=_send_markup" in source
 
     def test_routes_call_notify_pending_on_create_and_resubmit(self):
         import inspect

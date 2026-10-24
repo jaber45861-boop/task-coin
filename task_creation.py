@@ -60,7 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import db
 import platform_settings
@@ -69,6 +69,10 @@ import wallet
 from task_funding import TaskFundingError
 from config import CHANNELS
 from manual_task import MANUAL_TASK_TYPE, validate_manual_task_data
+from task_capacity import (
+    validate_max_executions,
+    validate_reservation_minutes,
+)
 from task_taxonomy import (
     ACTION_JOIN_CHANNEL,
     GENERIC_PROVIDER_SET,
@@ -312,6 +316,12 @@ class TaskSpec:
     repeat_policy: str = db.REPEAT_POLICY_ONE_TIME
     repeat_hours: int | None = None
     reward_units: int | None = None
+    # MT-TASK-28: the OPTIONAL execution limits.  None means "not
+    # configured" and reproduces the exact legacy behaviour (unlimited
+    # executions / a start that never expires).  A value is never
+    # replaced by a default and never silently dropped.
+    max_executions: int | None = None
+    reservation_minutes: int | None = None
 
 
 def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
@@ -355,6 +365,21 @@ def build_task_definition(spec: TaskSpec) -> tuple[str, str]:
             "reward_units must be a non-negative integer within the "
             "SQLite INTEGER range"
         )
+    # ── MT-TASK-28: the OPTIONAL execution limits ─────────────────────
+    # Validated with the SAME canonical validators the wizard and the
+    # request store use, so a task can never be created with a limit
+    # the capacity layer would have to second-guess.  None is valid and
+    # means "not configured" (legacy behaviour).  The normalized values
+    # are returned so the caller writes exactly what was validated.
+    try:
+        spec_max_executions = validate_max_executions(spec.max_executions)
+        spec_reservation_minutes = validate_reservation_minutes(
+            spec.reservation_minutes
+        )
+    except ValueError as exc:
+        raise TaskCreationError(
+            "حدود تنفيذ المهمة غير صالحة."
+        ) from exc
 
     # ── auto: the EXISTING Telegram membership verifier only ──────────
     if spec.verification == VERIFICATION_AUTO:
@@ -457,6 +482,15 @@ def create_task_from_spec(
             account) — admin-displayable message, zero rows written.
     """
     task_type, task_data = build_task_definition(spec)
+    # MT-TASK-28: write the NORMALIZED execution limits (the ones the
+    # canonical validators accepted), never the raw input.
+    spec = replace(
+        spec,
+        max_executions=validate_max_executions(spec.max_executions),
+        reservation_minutes=validate_reservation_minutes(
+            spec.reservation_minutes
+        ),
+    )
 
     # Funding identity is validated pre-write like every other input.
     # The value itself always comes from the authenticated creation
@@ -546,6 +580,11 @@ def _insert_and_fund(
         conn=conn,
         reward_units=spec.reward_units,
         commission_units=commission_units,
+        # MT-TASK-28: the advertiser's execution limits reach the task
+        # row verbatim.  None stays None (legacy behaviour); db
+        # validates the shape, task_capacity owns the policy.
+        max_executions=spec.max_executions,
+        reservation_minutes=spec.reservation_minutes,
     )
     if advertiser_id is not None:
         _fund_created_task(conn, task_id, advertiser_id)

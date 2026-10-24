@@ -166,14 +166,16 @@ class TestStartedManualProofUi:
             "the proof input must carry an Arabic placeholder"
 
     def test_proof_input_is_bounded_single_line_text(self):
-        """Bounded text/URL only — never a file/photo upload."""
+        """The TEXT proof stays bounded (MT-TASK-17).  A screenshot is
+        accepted only through the SEPARATE file control (MT-ADMIN-34) —
+        never as an unbounded text value."""
         content = _tasks_js()
         assert "proofInput.type = 'text'" in content
         assert "proofInput.maxLength = 500" in content
-        for banned in ("FormData", "FileReader", "multipart",
-                       "type = 'file'"):
-            assert banned not in content, \
-                f"file upload mechanism found: {banned}"
+        # the text input is never turned into a file/photo input itself
+        assert "proofInput.type = 'file'" not in content
+        # the only file mechanism is the dedicated control
+        assert "fileInput.type = 'file'" in content
 
     def test_non_manual_started_keeps_verify_action(self):
         started = self._started()
@@ -201,11 +203,24 @@ class TestProofSubmissionContract:
         assert fields == ["proof_ref"], \
             f"client must serialize only proof_ref, found: {fields}"
 
-    def test_only_one_request_body_in_the_page(self):
+    def test_only_one_proof_request_body_in_the_page(self):
+        # The PROOF submission is still exactly one JSON body (the
+        # existing path).  The screenshot upload uses FormData on its
+        # own endpoint and never submits a proof (MT-ADMIN-34).
         bodies = re.findall(r"body:\s*([^,\n]+)", _tasks_js())
-        assert bodies, "expected the proof request body"
-        assert all(b.strip() == "_proofBody(input.value)" for b in bodies), \
-            f"unexpected request body: {bodies}"
+        assert "_proofBody(input.value)" in bodies
+        proof_bodies = [b for b in bodies if b.strip() != "payload"]
+        assert all(b.strip() == "_proofBody(input.value)"
+                   for b in proof_bodies), \
+            f"unexpected proof request body: {proof_bodies}"
+        # the upload sends the file itself, never a proof payload
+        assert "payload" in bodies
+
+    def test_proof_input_is_bounded_single_line_text(self):
+        """The TEXT proof stays bounded; the screenshot is separate."""
+        content = _tasks_js()
+        assert "proofInput.type = 'text'" in content
+        assert "proofInput.maxLength = 500" in content
 
     def test_identity_still_rides_init_data_header(self):
         fn = _proof_submit_fn()
@@ -429,3 +444,139 @@ class TestProofStyling:
 
     def test_tasks_js_file_exists(self):
         assert os.path.exists("miniapp/js/tasks.js")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Task proof screenshot evidence (MT-ADMIN-34) — source-level contract
+#
+# tasks.js is the contract: these read it the same way the module's
+# existing tests do.  They assert the upload control is SEPARATE, that
+# no automatic navigation or submission happens, and that the existing
+# approve/reject path (the text/URL proof) is untouched.
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestScreenshotControls:
+    """The picker, preview and remove controls exist and are separate."""
+
+    def test_screenshot_picker_control_exists(self):
+        src = _tasks_js()
+        assert "task-proof-file" in src
+        assert 'type = \'file\'' in src or 'type="file"' in src
+        # Only real image formats are offered by the picker.
+        assert "accept = 'image/png,image/jpeg,image/gif'" in src
+
+    def test_preview_and_remove_controls_exist(self):
+        src = _tasks_js()
+        assert "task-proof-preview" in src
+        assert "task-proof-remove" in src
+        assert "إزالة الصورة" in src
+
+    def test_upload_status_control_exists(self):
+        src = _tasks_js()
+        assert "task-proof-upload-status" in src
+
+    def test_preview_is_built_locally_not_fetched(self):
+        src = _tasks_js()
+        preview = _branch(src, "const reader = new FileReader()")
+        assert "readAsDataURL" in preview
+        # the preview never hits the network
+        assert "fetch(" not in preview.split(";")[0]
+        # and it is hidden until a file is actually chosen
+        assert "preview.hidden = true" in src
+
+    def test_removing_clears_every_related_control(self):
+        clear = _branch(src := _tasks_js(), "function _clearImage(")
+        assert "preview.hidden = true" in clear
+        assert "removeBtn.hidden = true" in clear
+        assert "statusEl.hidden = true" in clear
+        # resetting the value lets the user re-pick the SAME file
+        assert "fileInput.value = ''" in clear
+
+    def test_styles_exist_for_the_new_controls(self):
+        css = _css()
+        for cls in (
+            ".task-proof-file",
+            ".task-proof-preview",
+            ".task-proof-remove",
+            ".task-proof-upload-status",
+        ):
+            assert cls in css
+
+
+class TestScreenshotSubmitContract:
+    """The image is staged, then carried by the EXISTING submit path."""
+
+    def test_submit_uploads_before_submitting(self):
+        body = _branch(
+            _tasks_js(),
+            "async function submitProof(",
+            "return {",
+        )
+        # the screenshot is uploaded first
+        assert "_uploadScreenshot(task, fileInput, statusEl)" in body
+        # then the EXISTING submit call carries it as proof_ref
+        assert "body: _proofBody(input.value)" in body
+        # no second, separate submission endpoint is introduced
+        assert "proof-image/submit" not in body
+
+    def test_upload_failure_aborts_the_submission(self):
+        body = _branch(
+            _tasks_js(),
+            "if (fileInput && fileInput.files && fileInput.files[0]) {",
+            "let data = null;",
+        )
+        assert "return;" in body          # no empty proof is submitted
+        assert "_showNotice" in body      # a clear error is shown
+        assert "busy = false" in body     # the guard is released
+
+    def test_upload_uses_multipart_not_json(self):
+        body = _branch(
+            _tasks_js(),
+            "async function _uploadScreenshot(",
+            "return data.proof_ref;",
+        )
+        assert "new FormData()" in body
+        assert "payload.append('file'" in body
+        # never sends the file as a JSON body
+        assert "JSON.stringify" not in body
+
+    def test_upload_endpoint_is_the_task_scoped_one(self):
+        body = _branch(
+            _tasks_js(),
+            "async function _uploadScreenshot(",
+            "return data.proof_ref;",
+        )
+        assert "/proof-image" in body
+        assert "task.id" in body
+
+    def test_text_proof_path_is_unchanged(self):
+        src = _tasks_js()
+        # without a file chosen the flow is identical to before
+        body = _branch(src, "async function submitProof(", "return {")
+        assert "headers['Content-Type'] = 'application/json'" in body
+        assert "headers['Idempotency-Key'] = _idempotencyKey()" in body
+
+    def test_no_automatic_navigation_or_self_click(self):
+        body = _branch(_tasks_js(), "async function submitProof(", "return {")
+        assert "window.location" not in body
+        assert ".click()" not in body
+        # starting a task must never stage or submit a proof either
+        start = _branch(
+            _tasks_js(), "async function startTask", "async function submitTask"
+        )
+        assert "_uploadScreenshot" not in start
+        assert "submitProof" not in start
+
+    def test_no_client_side_image_validation_is_trusted(self):
+        """The client never decides what is a valid image — the server
+        does (magic bytes).  Any local check is only for early feedback."""
+        body = _branch(
+            _tasks_js(),
+            "async function _uploadScreenshot(",
+            "return data.proof_ref;",
+        )
+        # it does not invent a "valid" verdict before the server answers
+        assert "accepted" not in body.lower()
+        # and it never sends a file the server has already rejected
+        assert "proof_image/accepted" not in body

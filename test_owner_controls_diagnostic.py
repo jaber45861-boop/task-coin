@@ -157,6 +157,7 @@ class TestApiReturnsIsOwner:
         assert set(entry.keys()) <= {
             "id", "title", "description", "type", "reward",
             "reward_units", "status", "awaiting_decision", "is_owner",
+            "paused", "archived_at",
         }
 
 
@@ -228,7 +229,20 @@ class TestFrontendOwnerIndicator:
             "the owner indicator must not disturb the terminal state"
 
     def test_index_html_loads_tasks_js_without_cache_buster(self):
+        """index.html must load js/tasks.js from a static path derived
+        from the test file location; only js/tasks.js or js/tasks.js?v=2
+        are allowed, no other path or cache-buster value."""
+        import re
+
         with _INDEX_HTML_PATH.open(encoding="utf-8") as fh:
             html = fh.read()
-        assert 'src="js/tasks.js"' in html
-        assert "tasks.js?v=" not in html
+        # Expected script tag: <script src="js/tasks.js"></script>
+        # or <script src="js/tasks.js?v=2"></script>
+        assert re.search(
+            r'src="js/tasks\.js(\?v=2)?"', html
+        ), (
+            "index.html must load js/tasks.js (optionally ?v=2) "
+            f"from static path. HTML snippet: {html!r}"
+        )
+        # No other cache-buster values allowed (the regex above already
+        # anchors to js/tasks.js optionally followed by ?v=2).

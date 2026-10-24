@@ -94,6 +94,7 @@ Security rules enforced here:
 
 import json
 import logging
+import uuid
 import os
 
 from flask import Blueprint, jsonify, request
@@ -124,8 +125,11 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
-import task_funding
 import task_request_notifications
+import wallet
+from urllib.parse import urlsplit
+
+import task_proof_storage
 import task_request_rate_limit
 import task_request_store
 from account_summary import load_summary
@@ -192,6 +196,12 @@ _MSG_REJECTED_OK = "تم رفض الطلب"
 # Manual/social-proof claims (MT-TASK-15)
 _MSG_PROOF_RECEIVED = "تم استلام إثباتك، بانتظار مراجعة المشرف"
 _MSG_INVALID_PROOF = "الإثبات غير صالح، أرسل رابطاً أو نصاً واضحاً"
+# Manual task proof screenshot evidence (MT-ADMIN-34)
+_MSG_PROOF_NOT_STARTED = "ابدأ المهمة قبل إرسال الإثبات"
+_MSG_INVALID_IMAGE = "الصورة غير صالحة أو غير مدعومة"
+_MSG_INVALID_UPLOAD = "ملف غير صالح"
+_MSG_FILE_TOO_LARGE = "حجم الصورة كبير جداً"
+_MSG_PROOF_IMAGE_READY = "تم تجهيز الصورة، أرسل الإثبات الآن"
 
 _MSG_STARTED_OK = "تم بدء المهمة"
 _MSG_COMPLETED_OK = "تم إنجاز المهمة بنجاح"
@@ -378,6 +388,56 @@ def _safe_join_url(task_id: int, task_type: str) -> str | None:
     return "https://t.me/" + username
 
 
+def _safe_task_url(task_id: int) -> str | None:
+    """The manual task's external destination, or ``None``.
+
+    Narrow scope: ``manual`` tasks only, and only the ONE field
+    ``task_data["target"]["ref"]``.  The raw ``task_data`` blob is
+    never returned — in particular the ``approver`` block and every
+    other key stay server-side.
+
+    The value is validated, never followed: this function performs no
+    network request.  It is rejected unless it is a non-empty string
+    with scheme exactly ``https``, a non-empty hostname, and no
+    embedded credentials (``user:password@host``).  Anything else —
+    ``javascript:``, ``data:``, ``http:``, an empty or whitespace
+    string, a non-string, a bare word, a host-less URL, or a
+    credential-bearing URL — yields ``None`` so the client simply
+    shows no open-link control.
+    """
+    task = db.get_task(task_id)
+    if task is None:
+        return None
+    raw = task.get("task_data") or ""
+    try:
+        task_data = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(task_data, dict):
+        return None
+    target = task_data.get("target")
+    if not isinstance(target, dict):
+        return None
+    ref = target.get("ref")
+    if not isinstance(ref, str):
+        return None
+    candidate = ref.strip()
+    if not candidate:
+        return None
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "https":
+        return None
+    if not parts.netloc or not parts.hostname:
+        return None
+    # Reject embedded credentials: https://user:pass@host/…
+    if parts.username or parts.password or "@" in parts.netloc:
+        return None
+    return candidate
+
+
 # ── Paid referral claim helpers (MT-TASK-06) ─────────────────────────
 
 
@@ -509,17 +569,20 @@ def list_tasks():
 
     Safe fields only: id, title, description, type, reward,
     reward_units, status (plus ``join_url`` for channel tasks when a
-    public username is configured), plus the narrow boolean
-    ``is_owner`` — true only when the verified caller is the task's
-    funding advertiser of record (``task_funding.advertiser_id``;
-    the ``tasks`` table has no owner column).  Unfunded tasks grant
-    ownership to no one.  No advertiser identity or funding amount
-    is ever exposed.
+    public username is configured, and ``task_url`` for manual tasks
+    when a valid external destination exists).
 
     ``reward_units`` (MT-ADMIN-14) is the exact atomic accounting
     value: the page derives sub-cent USDT display from it with
     integer math only.  ``reward`` stays the whole-USDT
     compatibility/display field.
+
+    MT-TASK-29: a task whose caller-cycle is fully approved
+    (``user_tasks.status == completed``) is EXCLUDED from this active
+    list — it disappears on every reload/reopen.  Nothing is mutated:
+    the row, its submissions and its approval audit stay intact in
+    the database, the account stats keep counting them, and only the
+    ACTIVE catalog read skips the terminal cycle.
     """
     user = _authenticate()
     if user is None:
@@ -528,10 +591,31 @@ def list_tasks():
 
     try:
         summaries = TaskCatalog().list_available_tasks()
+        # Batch-load advertisers so the frontend can show owner actions
+        # only for tasks the caller funds (one query, not N+1).
+        task_ids = [s.id for s in summaries]
+        advertisers: dict[int, int] = {}
+        if task_ids:
+            with db.get_connection() as conn:
+                placeholders = ",".join("?" * len(task_ids))
+                rows = conn.execute(
+                    f"SELECT task_id, advertiser_id FROM task_funding "
+                    f"WHERE task_id IN ({placeholders})",
+                    task_ids,
+                ).fetchall()
+                for r in rows:
+                    advertisers[r["task_id"]] = r["advertiser_id"]
+
         tasks = []
         for summary in summaries:
             row = db.get_user_task(user_id, summary.id)
+            # MT-TASK-29: approved (completed) cycles leave the active
+            # list.  A plain read-skip — no state, history, reward or
+            # repeat-policy semantics change with it.
+            if row is not None and row["status"] == _STATUS_COMPLETED:
+                continue
             status = row["status"] if row is not None else _STATUS_AVAILABLE
+            task_row = db.get_task(summary.id)
             entry = {
                 "id": summary.id,
                 "title": summary.title,
@@ -540,6 +624,9 @@ def list_tasks():
                 "reward": summary.reward,
                 "reward_units": summary.reward_units,
                 "status": status,
+                "paused": bool(task_row["paused"]) if task_row else False,
+                "archived_at": task_row["archived_at"] if task_row else None,
+                "is_owner": advertisers.get(summary.id) == user_id,
             }
             join_url = _safe_join_url(summary.id, summary.type)
             if join_url:
@@ -560,15 +647,14 @@ def list_tasks():
                 entry["awaiting_decision"] = worker_awaiting_decision(
                     user_id, summary.id
                 )
-            # Ownership flag — a narrow boolean computed ONLY from
-            # the funding record of record (task_funding is the
-            # schema's single ownership source).  No funding row →
-            # no owner: is_owner stays false for every caller.
-            funding = task_funding.get_funding(summary.id)
-            entry["is_owner"] = bool(
-                funding is not None
-                and funding["advertiser_id"] == user_id
-            )
+                # The task's own external destination (MT-TASK-17), so
+                # the user can open it BEFORE sending a proof.  One
+                # validated field only — the raw task_data, and every
+                # approver identity, stays server-side.  Absent unless
+                # a valid https link exists.
+                task_url = _safe_task_url(summary.id)
+                if task_url:
+                    entry["task_url"] = task_url
             tasks.append(entry)
     except Exception:
         logger.exception("Failed to list tasks for user %s", user_id)
@@ -586,9 +672,15 @@ def account_summary():
 
     Every figure comes from an existing source of truth:
 
-    - ``wallet.availableUnits`` — ``wallets.available_units``
-      (a user without a wallet row reads as a real zero, the
-      wallet service's documented contract — never "unknown")
+    - ``wallet`` — ``null`` when the caller has no wallet row
+      (never had a wallet created), else
+      ``{"availableUnits": <int>, "egpDisplayMinor": <int|null>}``
+      with the exact ``wallets.available_units`` — a wallet that
+      exists with a zero balance is a real zero, never "unknown".
+      ``egpDisplayMinor`` is the wallet's EGP ESTIMATE at the
+      current market rate, in integer piastres, and is ``null``
+      when no fresh valid rate exists.  It is a display figure,
+      not a withdrawable EGP balance.
     - ``stats.completedTasks`` / ``stats.inProgressTasks`` —
       the caller's own ``user_tasks`` rows
     - ``stats.earnedUnits`` — the ledger's ``credit``/``task``
@@ -622,10 +714,16 @@ def account_summary():
                 "username": user.get("username"),
                 "firstName": user.get("first_name"),
             },
-            "wallet": {
-                "availableUnits":
-                    summary["wallet"]["available_units"],
-            },
+            "wallet": (
+                {
+                    "availableUnits":
+                        summary["wallet"]["available_units"],
+                    "egpDisplayMinor":
+                        summary["wallet"]["egp_display_minor"],
+                }
+                if summary["wallet"] is not None
+                else None
+            ),
             "stats": {
                 "completedTasks":
                     summary["stats"]["completed_tasks"],
@@ -844,6 +942,106 @@ def submit_task(task_id: int):
     )
 
 
+# ── POST /api/tasks/<task_id>/proof-image — evidence upload (MT-ADMIN-34) ──
+
+
+@tasks_bp.post("/api/tasks/<int:task_id>/proof-image")
+def upload_task_proof_image(task_id: int):
+    """Store one task-proof screenshot as review evidence.
+
+    This handler ONLY stores the evidence bytes and returns a
+    server-generated reference.  It opens NO submission, never
+    changes the task's state, and can never reward or complete
+    anything: the client then submits that reference through the
+    existing ``POST /api/tasks/<id>/submit`` path, so the whole
+    approval lifecycle, idempotency and reward rules stay exactly
+    where they were.
+
+    Authorization mirrors the deposit-proof upload (MT-ADMIN-31):
+    identity comes only from cryptographically verified initData — a
+    ``user_id`` in the body/form/query is ignored; the caller must
+    own a STARTED claim on a manual task.
+
+    Content is validated by MAGIC BYTES with bounded size and pixel
+    dimensions; the client filename and claimed MIME type are never
+    trusted or stored.  The on-disk name is server-generated.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task = db.get_task(task_id)
+    if task is None or task["type"] != MANUAL_TASK_TYPE:
+        return _error(
+            "payment_method_not_found", _MSG_TASK_NOT_FOUND, 404
+        )
+
+    # The claim must exist and be in progress — the same precondition
+    # the submit path enforces, so an image can never be attached to
+    # an available, completed or unknown task.
+    row = db.get_user_task(user_id, task_id)
+    if row is None:
+        return _error(
+            "invalid_request", _MSG_PROOF_NOT_STARTED, 409
+        )
+    if row["status"] != "started":
+        return _error(
+            "invalid_request", _MSG_PROOF_NOT_STARTED, 409
+        )
+
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return _error("invalid_upload", _MSG_INVALID_UPLOAD, 400)
+
+    # ── bounded read + content sniffing (client MIME ignored) ────
+    try:
+        data = upload.read(task_proof_storage.MAX_IMAGE_BYTES + 1)
+        if not data:
+            return _error("invalid_upload", _MSG_INVALID_UPLOAD, 400)
+        if len(data) > task_proof_storage.MAX_IMAGE_BYTES:
+            return _error(
+                "file_too_large", _MSG_FILE_TOO_LARGE, 400
+            )
+        _mime, ext, _width, _height = task_proof_storage.probe(data)
+    except task_proof_storage.ProofImageError as exc:
+        return _error(getattr(exc, "code", "invalid_upload"),
+                      _MSG_INVALID_IMAGE, 400)
+    except Exception:
+        logger.exception(
+            "Task proof read failed: task=%s user=%s", task_id, user_id
+        )
+        return _server_error()
+
+    # ── evidence file under a server-generated key.  A store failure
+    #    removes the just-written file — no orphan evidence.
+    proof_id = uuid.uuid4().hex
+    try:
+        storage_key = task_proof_storage.save_image(
+            data, proof_id=proof_id, ext=ext
+        )
+    except Exception:
+        logger.exception(
+            "Task proof storage failed: task=%s user=%s",
+            task_id, user_id,
+        )
+        return _server_error()
+
+    logger.info(
+        "Task proof image stored: task=%s user=%s size=%d",
+        task_id, user_id, len(data),
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "task_id": task_id,
+            "proof_ref": storage_key,
+            "bytes": len(data),
+            "message": _MSG_PROOF_IMAGE_READY,
+        }
+    ), 201
+
+
 # ── GET /api/tasks/<task_id>/claims — buyer/approver view ────────────
 
 
@@ -1017,6 +1215,12 @@ def _trq_safe(req) -> dict:
         "target_ref": req.payload.get("target_ref"),
         "reward": req.reward,
         "reward_units": req.reward_units,
+        # MT-TASK-28: the advertiser's execution policy (all optional;
+        # null = not configured = legacy behaviour on the task row).
+        "repeat_policy": req.repeat_policy,
+        "repeat_hours": req.repeat_hours,
+        "max_executions": req.max_executions,
+        "reservation_minutes": req.reservation_minutes,
         "reason": req.decision_reason,
         "task_id": req.published_task_id,
         "created_at": req.created_at,
@@ -1215,4 +1419,343 @@ def resubmit_task_request(request_id: int):
             "request": _trq_safe(updated),
             "message": _MSG_TRQ_SUBMITTED,
         }
+    ), 200
+
+
+# ── Arabic messages for owner task management (MT-MINIAPP-USER-TASK-MANAGEMENT) ──
+_MSG_OWNER_NOT_FOUND = "أنت لست صاحب هذه المهمة"
+_MSG_TASK_ALREADY_PAUSED = "المهمة متوقفة مؤقتاً مسبقاً"
+_MSG_TASK_ALREADY_ACTIVE = "المهمة نشطة بالفعل"
+_MSG_TASK_ALREADY_ARCHIVED = "المهمة مؤرشفة مسبقاً"
+_MSG_TASK_NOT_ARCHIVED = "المهمة ليست مؤرشفة"
+_MSG_INSUFFICIENT_BALANCE_FOR_RESUME = (
+    "رصيدك غير كافٍ لاستئناف المهمة. يرجى شحن المحفظة ثم إعادة المحاولة."
+)
+_MSG_UPDATE_OK = "تم تحديث المهمة بنجاح"
+_MSG_PAUSE_OK = "تم إيقاف المهمة مؤقتاً"
+_MSG_RESUME_OK = "تم استئناف المهمة"
+_MSG_ARCHIVE_OK = "تم أرشفة المهمة"
+_MSG_UNARCHIVE_OK = "تم إعادة المهمة إلى القائمة النشطة"
+
+
+# ── Task owner management (MT-MINIAPP-USER-TASK-MANAGEMENT) ─────────
+# Every endpoint verifies ownership server-side via task_funding — the
+# browser never chooses the owner.  Financial rules:
+#   * increasing reward → extra commitment checked against available
+#     balance BEFORE any write
+#   * decreasing reward → no automatic refund (approved refund path only)
+#   * submissions, claims, audit rows and financial constraints are
+#     never deleted or retroactively changed
+
+
+def _task_owner_only(task_id: int, user_id: int):
+    """Return (task_row, None) on success, or (None, error_response).
+
+    Ownership is decided by task_funding.advertiser_id — the
+    authenticated advertiser who funded the task.  A client-supplied
+    user_id is never trusted.
+    """
+    task = db.get_task(task_id)
+    if task is None:
+        return None, _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+    advertiser_id = db.get_task_advertiser(task_id)
+    if advertiser_id is None or advertiser_id != user_id:
+        return None, _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
+    return task, None
+
+
+def _funding_cost_units(task_id: int):
+    """Total funded cost (reward_units + commission_units) or None."""
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT reward_units, commission_units FROM task_funding "
+            "WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    ru = row["reward_units"] or 0
+    cu = row["commission_units"] or 0
+    return ru + cu
+
+
+@tasks_bp.patch("/api/tasks/<int:task_id>/owner")
+def update_owned_task(task_id: int):
+    """Edit the caller's OWN task (title, description, reward).
+
+    Server-side ownership verification: only the task's advertiser
+    (task_funding.advertiser_id) may edit.  Increasing the reward
+    requires sufficient available balance; the extra commitment is
+    computed and checked BEFORE any write.  Decreasing the reward never
+    triggers an automatic refund.
+
+    Allowed body fields: title, description, reward.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task, err = _task_owner_only(task_id, user_id)
+    if err:
+        return err
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
+
+    new_title = body.get("title")
+    new_description = body.get("description")
+    new_reward = body.get("reward")
+
+    if new_title is not None and (not new_title or not new_title.strip()):
+        return _error("invalid_payload", "العنوان لا يمكن أن يكون فارغاً", 400)
+    if new_description is not None and (
+        not new_description or not new_description.strip()
+    ):
+        return _error("invalid_payload", "الوصف لا يمكن أن يكون فارغاً", 400)
+    if new_reward is not None:
+        try:
+            new_reward = int(new_reward)
+        except (TypeError, ValueError):
+            return _error("invalid_payload", "المكافأة يجب أن تكون رقمًا صحيحًا", 400)
+        if new_reward < 0:
+            return _error("invalid_payload", "المكافأة لا يمكن أن تكون سالبة", 400)
+
+    # ── Financial guard: reward increase requires balance check ─────
+    reward_increase_units = 0
+    if new_reward is not None and new_reward > task["reward"]:
+        delta_reward = new_reward - task["reward"]
+        delta_units = delta_reward * wallet.USDT_SCALE
+        total_cost_units = _funding_cost_units(task_id)
+        if total_cost_units is not None and task["reward_units"]:
+            original_reward_units = task["reward_units"]
+            commission_ratio = (
+                task["commission_units"] / original_reward_units
+                if original_reward_units else 0
+            )
+            delta_commission_units = int(delta_units * commission_ratio)
+        else:
+            delta_commission_units = 0
+        reward_increase_units = delta_units + delta_commission_units
+
+        with db.get_connection() as conn:
+            wallet_row = conn.execute(
+                "SELECT available_units FROM wallets WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        available_units = int(wallet_row["available_units"]) if wallet_row else 0
+        if available_units < reward_increase_units:
+            available = units_to_decimal(available_units)
+            needed = units_to_decimal(reward_increase_units)
+            return _error(
+                "balance_insufficient",
+                "رصيدك غير كافٍ لتغطية الزيادة في مكافأة المهمة. "
+                f"الرصيد المتاح: {available:.8f} USDT، "
+                f"المطلوب إضافياً: {needed:.8f} USDT.",
+                400,
+                available_balance=float(available),
+                required_reward=float(needed),
+            )
+
+    # ── Apply the update inside a transaction ───────────────────────
+    try:
+        with db.transaction() as conn:
+            fresh = db.get_task(task_id)
+            if fresh is None:
+                return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+            advertiser_id = db.get_task_advertiser(task_id)
+            if advertiser_id is None or advertiser_id != user_id:
+                return _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
+
+            if reward_increase_units > 0:
+                wallet_row = conn.execute(
+                    "SELECT available_units FROM wallets WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                available_units = (
+                    int(wallet_row["available_units"]) if wallet_row else 0
+                )
+                if available_units < reward_increase_units:
+                    return _error(
+                        "balance_insufficient",
+                        "رصيدك غير كافٍ لتغطية الزيادة في مكافأة المهمة.",
+                        400,
+                    )
+
+            ok = db.update_task(
+                task_id,
+                title=new_title.strip() if new_title is not None else None,
+                description=(
+                    new_description.strip()
+                    if new_description is not None else None
+                ),
+                reward=new_reward,
+                conn=conn,
+            )
+            if not ok:
+                return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+    except Exception:
+        logger.exception(
+            "Owner task update failed: user=%s task=%s", user_id, task_id
+        )
+        return _server_error()
+
+    updated = db.get_task(task_id)
+    return jsonify(
+        {
+            "ok": True,
+            "task": updated,
+            "message": _MSG_UPDATE_OK,
+        }
+    ), 200
+
+
+@tasks_bp.post("/api/tasks/<int:task_id>/pause")
+def pause_owned_task(task_id: int):
+    """Pause the caller's OWN task — stops new starts/assignments.
+
+    Existing user_tasks, submissions and claims are preserved.  Only
+    the advertiser (task_funding.advertiser_id) may pause.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task, err = _task_owner_only(task_id, user_id)
+    if err:
+        return err
+    if task.get("paused"):
+        return _error("already_paused", _MSG_TASK_ALREADY_PAUSED, 409)
+    if task.get("archived_at") is not None:
+        return _error("task_archived", "لا يمكن إيقاف مهمة مؤرشفة", 409)
+
+    try:
+        with db.transaction() as conn:
+            fresh = db.get_task(task_id)
+            if fresh is None or fresh.get("archived_at") is not None:
+                return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+            advertiser_id = db.get_task_advertiser(task_id)
+            if advertiser_id is None or advertiser_id != user_id:
+                return _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
+            db.update_task(task_id, paused=True, conn=conn)
+    except Exception:
+        logger.exception("Pause failed: user=%s task=%s", user_id, task_id)
+        return _server_error()
+
+    return jsonify(
+        {"ok": True, "message": _MSG_PAUSE_OK, "paused": True}
+    ), 200
+
+
+@tasks_bp.post("/api/tasks/<int:task_id>/resume")
+def resume_owned_task(task_id: int):
+    """Resume the caller's OWN task after a pause.
+
+    Before resuming, verify the advertiser still has sufficient
+    available balance to cover the task's total funded cost
+    (reward + commission).  Only the advertiser may resume.
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task, err = _task_owner_only(task_id, user_id)
+    if err:
+        return err
+    if not task.get("paused"):
+        return _error("not_paused", _MSG_TASK_ALREADY_ACTIVE, 409)
+    if task.get("archived_at") is not None:
+        return _error("task_archived", "لا يمكن استئناف مهمة مؤرشفة", 409)
+
+    # Funding/balance guard: the advertiser must still cover the cost.
+    total_units = _funding_cost_units(task_id)
+    if total_units is not None and total_units > 0:
+        with db.get_connection() as conn:
+            wallet_row = conn.execute(
+                "SELECT available_units FROM wallets WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        available_units = int(wallet_row["available_units"]) if wallet_row else 0
+        if available_units < total_units:
+            available = units_to_decimal(available_units)
+            required = units_to_decimal(total_units)
+            return _error(
+                "balance_insufficient",
+                _MSG_INSUFFICIENT_BALANCE_FOR_RESUME,
+                400,
+                available_balance=float(available),
+                required_reward=float(required),
+            )
+
+    try:
+        with db.transaction() as conn:
+            fresh = db.get_task(task_id)
+            if fresh is None or fresh.get("archived_at") is not None:
+                return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+            advertiser_id = db.get_task_advertiser(task_id)
+            if advertiser_id is None or advertiser_id != user_id:
+                return _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
+            if not fresh.get("paused"):
+                return _error("not_paused", _MSG_TASK_ALREADY_ACTIVE, 409)
+            db.update_task(task_id, paused=False, conn=conn)
+    except Exception:
+        logger.exception("Resume failed: user=%s task=%s", user_id, task_id)
+        return _server_error()
+
+    return jsonify(
+        {"ok": True, "message": _MSG_RESUME_OK, "paused": False}
+    ), 200
+
+
+@tasks_bp.post("/api/tasks/<int:task_id>/archive")
+def archive_owned_task(task_id: int):
+    """Archive the caller's OWN task (soft delete).
+
+    Archives the task — sets archived_at — without deleting any rows:
+    user_tasks, task_submissions, task_funding, ledger entries and audit
+    records all stay intact.  Only the advertiser may archive, and a
+    clear confirmation is required (the client must send
+    {"confirm": true}).
+    """
+    user = _authenticate()
+    if user is None:
+        return _unauthenticated()
+    user_id = _ensure_user(user)
+
+    task, err = _task_owner_only(task_id, user_id)
+    if err:
+        return err
+    if task.get("archived_at") is not None:
+        return _error("already_archived", _MSG_TASK_ALREADY_ARCHIVED, 409)
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return _error(
+            "confirmation_required",
+            "تأكيد مطلوب قبل الأرشفة — أرسل {\"confirm\": true}",
+            400,
+        )
+
+    try:
+        with db.transaction() as conn:
+            fresh = db.get_task(task_id)
+            if fresh is None:
+                return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+            advertiser_id = db.get_task_advertiser(task_id)
+            if advertiser_id is None or advertiser_id != user_id:
+                return _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
+            if fresh.get("archived_at") is not None:
+                return _error("already_archived", _MSG_TASK_ALREADY_ARCHIVED, 409)
+            conn.execute(
+                "UPDATE tasks SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (task_id,),
+            )
+    except Exception:
+        logger.exception("Archive failed: user=%s task=%s", user_id, task_id)
+        return _server_error()
+
+    return jsonify(
+        {"ok": True, "message": _MSG_ARCHIVE_OK, "archived": True}
     ), 200

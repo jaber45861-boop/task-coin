@@ -106,6 +106,8 @@ import sqlite3
 import struct
 import threading
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telegram import InlineKeyboardMarkup, InputFile
@@ -138,6 +140,7 @@ from test_deposit import (
     _auth,
     _make_pm,
     _read_js,
+    _seed_auto_rate,
 )
 from test_deposit_verification import (
     AMOUNT,
@@ -758,6 +761,48 @@ class TestManualApproval:
         stored = deposit_proof_store.get_proof(proof.proof_id, db_path=env)
         assert stored.status == deposit_proof_store.STATUS_APPROVED
 
+    def test_egp_approval_credits_frozen_units_exactly_once(self, env):
+        """An EGP deposit approved manually credits the FROZEN USDT
+        units (rate captured at creation — 50 EGP @ 48.5 →
+        103_092_784 units, ROUND_CEILING) exactly once; the EGP amount
+        row is untouched and a replay is an idempotent no-op."""
+        _fund()
+        frozen_units = 103_092_784
+        pm = _make_pm(
+            env, category="cash", asset="EGP", network=None,
+            display_name="TEST EGP", min_units=5000,
+        )
+        _seed_auto_rate(env, "48.5")
+        req = deposit_store.create_deposit_request(
+            user_id=USER_A,
+            payment_method_id=pm.id,
+            amount="50",
+            db_path=env,
+        )
+        proof = _new_proof(req.request_id)
+
+        first = deposit_manual_review.approve(
+            proof.proof_id, admin_id=ADMIN_ID, db_path=env
+        )
+        assert first.credited is True
+        assert first.already_processed is False
+        assert _wallet_units(env) == (FUND + frozen_units, 0)
+        rows = _deposit_ledger(env, req.request_id)
+        assert len(rows) == 1
+        assert rows[0]["amount_units"] == frozen_units
+        assert rows[0]["rate_usdt_egp"] == "48.5"
+
+        # The EGP intent itself never becomes USDT units.
+        assert _row(env, req.request_id)["amount_units"] == 5000
+
+        second = deposit_manual_review.approve(
+            proof.proof_id, admin_id=ADMIN_ID, db_path=env
+        )
+        assert second.credited is False
+        assert second.already_processed is True
+        assert _wallet_units(env) == (FUND + frozen_units, 0)
+        assert len(_deposit_ledger(env, req.request_id)) == 1
+
     def test_22_approval_is_atomic(self, env):
         """22. Two concurrent approvals → exactly ONE financial
         credit, one ledger entry, one state transition."""
@@ -1016,6 +1061,67 @@ class TestIdempotency:
         assert len(_deposit_ledger(env, req.request_id)) == 1
         assert _row(env, req.request_id)["external_tx_id"] == manual_tx
         assert _row(env, req.request_id)["status"] == "credited"
+
+    def test_49_photo_message_card_edits_caption_not_text(self, env):
+        """49. Regression (merge blocker): the detail card is built as
+        a PHOTO message, and in python-telegram-bot ``message.photo``
+        is a tuple of PhotoSize (never a list).  The approve and
+        reject callbacks must therefore edit the card via
+        ``edit_message_caption`` on a photo card, while a text card
+        keeps the ``edit_message_text`` fallback.  The old
+        ``isinstance(photo, list)`` guard never matched a real PTB
+        message and silently degraded every photo edit."""
+        _fund()
+        # The REAL PTB shape: tuple of PhotoSize, truthy one-element.
+        photo_sizes = ("photosize",)
+
+        # ── photo card → caption edit, never a text edit ──
+        req_a = _request(env)
+        proof_a = _new_proof(req_a.request_id)
+        approve = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_approve_callback_data(proof_a.proof_id),
+        )
+        approve.callback_query.message = SimpleNamespace(photo=photo_sizes)
+        approve.callback_query.edit_message_caption = AsyncMock()
+        approve.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(approve, _context()))
+        approve.callback_query.edit_message_caption.assert_awaited_once()
+        assert "تم اعتماد الدفع" in (
+            approve.callback_query.edit_message_caption.await_args[0][0]
+        )
+        approve.callback_query.edit_message_text.assert_not_called()
+        assert _wallet_units(env) == (FUND + AMOUNT_UNITS, 0)
+
+        # A rejection is possible on its own (still-pending) request.
+        req_b = _request(env)
+        proof_b = _new_proof(req_b.request_id)
+        reject = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_reject_callback_data(proof_b.proof_id),
+        )
+        reject.callback_query.message = SimpleNamespace(photo=photo_sizes)
+        reject.callback_query.edit_message_caption = AsyncMock()
+        reject.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(reject, _context()))
+        reject.callback_query.edit_message_caption.assert_awaited_once()
+        assert "تم رفض" in (
+            reject.callback_query.edit_message_caption.await_args[0][0]
+        )
+        reject.callback_query.edit_message_text.assert_not_called()
+
+        # ── text card (photo is None) → the text fallback stays ──
+        req_c = _request(env)
+        proof_c = _new_proof(req_c.request_id)
+        text_card = _callback(
+            ADMIN_ID,
+            deposit_proof_admin.do_reject_callback_data(proof_c.proof_id),
+        )
+        text_card.callback_query.message = SimpleNamespace(photo=None)
+        text_card.callback_query.edit_message_caption = AsyncMock()
+        text_card.callback_query.edit_message_text = AsyncMock()
+        _run(deposit_proof_admin.proof_callback(text_card, _context()))
+        text_card.callback_query.edit_message_text.assert_awaited_once()
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -46,6 +46,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram import InlineKeyboardMarkup
@@ -1616,6 +1617,285 @@ class TestMinimumDepositUnits(WizardTestBase):
         fields.update(overrides)
         return store.update_payment_method(method_id, **fields)
 
+    def _run_approved_minimum_repair(
+        self,
+        text: str = "/repairdepositminimums",
+        *,
+        admin_id: int = ADMIN_A,
+        chat_type: str = "private",
+        chat_id: int | None = None,
+    ) -> MagicMock:
+        update = _update(
+            admin_id,
+            text,
+            chat_type=chat_type,
+            chat_id=chat_id,
+        )
+        _run(admin.repair_deposit_minimums_command(update, MagicMock()))
+        return update
+
+    def _seed_approved_targets(self) -> None:
+        """Create the two APPROVED repair targets at ids 3 and 4, with
+        the assets the targets expect (method 4 stores the lowercase
+        label production actually uses).  Two throwaway methods first
+        so the autoincrement lands on 3 and 4 — mirroring the current
+        production shape rather than assuming ids 1 and 2."""
+        self._add("crypto | وسيلة قديمة 1 | USDT | OLD | مزود | addr1 | -")
+        self._add("crypto | وسيلة قديمة 2 | USDT | OLD | مزود | addr2 | -")
+        self._add(self.CASH_FORM)          # -> id 3, asset EGP
+        self._add(self.CRYPTO_FORM)        # -> id 4, asset USDT
+
+    def test_repair_command_previews_without_writing(self) -> None:
+        self._seed_approved_targets()
+
+        preview = self._run_approved_minimum_repair()
+
+        self.assertIn("معاينة فقط", _reply(preview))
+        self.assertIn("50.00", _reply(preview))
+        self.assertIn("1.00000000", _reply(preview))
+        saved = self._raw(
+            "SELECT id, min_deposit_units, updated_by "
+            "FROM payment_methods ORDER BY id"
+        )
+        # Only the two APPROVED targets are in scope; the seeded
+        # throwaway methods are listed too and must stay untouched.
+        self.assertEqual(
+            [
+                (row["id"], row["min_deposit_units"], row["updated_by"])
+                for row in saved
+            ],
+            [
+                (1, None, ADMIN_A),
+                (2, None, ADMIN_A),
+                (3, None, ADMIN_A),
+                (4, None, ADMIN_A),
+            ],
+        )
+
+    def test_repair_command_confirms_via_existing_save_path_atomically(
+        self,
+    ) -> None:
+        self._seed_approved_targets()
+
+        with patch.object(
+            store,
+            "update_payment_method",
+            wraps=store.update_payment_method,
+        ) as update_method:
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("تم حفظ الحدين والتحقق منهما", _reply(response))
+        self.assertEqual(update_method.call_count, 2)
+        expected = ((3, "EGP", "50"), (4, "USDT", "1"))
+        connection = update_method.call_args_list[0].kwargs["connection"]
+        for call, (method_id, asset, amount) in zip(
+            update_method.call_args_list, expected
+        ):
+            self.assertEqual(call.args[0], method_id)
+            self.assertEqual(call.kwargs["asset"], asset)
+            self.assertEqual(call.kwargs["min_deposit_units"], amount)
+            self.assertEqual(call.kwargs["updated_by"], ADMIN_A)
+            self.assertIs(call.kwargs["connection"], connection)
+
+        saved = self._raw(
+            "SELECT id, asset, min_deposit_units, updated_by, is_active, "
+            "deposits_enabled FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["asset"],
+                    row["min_deposit_units"],
+                    row["updated_by"],
+                    row["is_active"],
+                    row["deposits_enabled"],
+                )
+                for row in saved
+            ],
+            [
+                (1, "USDT", None, ADMIN_A, 1, 0),
+                (2, "USDT", None, ADMIN_A, 1, 0),
+                (3, "EGP", 5000, ADMIN_A, 1, 0),
+                (4, "USDT", 100000000, ADMIN_A, 1, 0),
+            ],
+        )
+
+    def test_repair_command_preflights_both_assets_before_writing(self) -> None:
+        self._seed_approved_targets()
+        self._update_row(4, asset="EGP")
+
+        with patch.object(
+            store,
+            "update_payment_method",
+            wraps=store.update_payment_method,
+        ) as update_method:
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("الأصل الحالي EGP", _reply(response))
+        update_method.assert_not_called()
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [
+                (1, None),
+                (2, None),
+                (3, None),
+                (4, None),
+            ],
+        )
+
+    def test_repair_targets_match_production_ids_and_lowercase_usdt(
+        self,
+    ) -> None:
+        """The approved targets are the ACTIVE production methods: ids
+        3 (EGP) and 4 (USDT — stored lowercase in production).  Both
+        the pre-write preflight AND the post-save verification compare
+        the asset case-insensitively, so a lowercase ``usdt`` label is
+        NOT treated as a mismatch that would roll the whole repair
+        back. Regression: the post-save check was case-sensitive and
+        rejected every APPLY against the real row."""
+        self._seed_approved_targets()
+        # Production stores the quote label in lowercase.
+        self._update_row(4, asset="usdt")
+
+        response = self._run_approved_minimum_repair(
+            "/repairdepositminimums APPLY"
+        )
+        self.assertIn("تم حفظ الحدين والتحقق منهما", _reply(response))
+        saved = self._raw(
+            "SELECT id, asset, min_deposit_units FROM payment_methods "
+            "WHERE id IN (3, 4) ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["asset"], row["min_deposit_units"])
+             for row in saved],
+            [(3, "EGP", 5000), (4, "usdt", 100000000)],
+        )
+
+    def test_repair_command_rolls_back_both_methods_on_store_failure(
+        self,
+    ) -> None:
+        self._seed_approved_targets()
+        original_update = store.update_payment_method
+
+        def fail_on_second(method_id, **kwargs):
+            if method_id == 4:   # the second target
+                raise RuntimeError("simulated write failure")
+            return original_update(method_id, **kwargs)
+
+        with patch.object(
+            store, "update_payment_method", side_effect=fail_on_second
+        ):
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        self.assertIn("تم التراجع عن العملية", _reply(response))
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [
+                (1, None),
+                (2, None),
+                (3, None),
+                (4, None),
+            ],
+        )
+
+    def test_repair_command_is_admin_only_and_private_only(self) -> None:
+        self._add(self.CASH_FORM)
+        self._add(self.CRYPTO_FORM)
+
+        with patch.object(
+            store, "update_payment_method", wraps=store.update_payment_method
+        ) as update_method:
+            denied = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY", admin_id=STRANGER
+            )
+            group = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY",
+                chat_type="supergroup",
+                chat_id=-1009,
+            )
+
+        self.assertEqual(_reply(denied), admin.MSG_ADMIN_ONLY)
+        self.assertEqual(group.message.reply_text.call_count, 0)
+        update_method.assert_not_called()
+
+    def test_repair_command_success_only_after_commit(self) -> None:
+        """Regression (merge blocker): the ✅ success message must be
+        sent only AFTER db.transaction() exits and COMMIT succeeds.
+        A simulated COMMIT failure must surface the rollback error
+        message and NEVER a false success."""
+        self._seed_approved_targets()
+
+        # sqlite3.Connection is immutable, so the COMMIT failure is
+        # simulated by re-running the REAL db.transaction() generator
+        # machinery with a patched Connection factory: the open
+        # connection is a subclass whose execute() fails the one
+        # COMMIT statement — exactly the production commit path.
+        real_transaction = db.transaction
+        commit_attempts: list[str] = []
+
+        class _FailingCommitConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore
+                if sql == "COMMIT":
+                    commit_attempts.append("failed")
+                    raise sqlite3.OperationalError(
+                        "simulated COMMIT failure (disk full)"
+                    )
+                return super().execute(sql, *args, **kwargs)
+
+        @contextmanager
+        def transaction_with_failing_commit(*args, **kwargs):
+            """Re-run the REAL transaction() opening a connection
+            subclass whose COMMIT fails."""
+            real_connect = sqlite3.connect
+
+            def connect_subclass(*a, **k):
+                k.pop("factory", None)
+                return real_connect(*a, factory=_FailingCommitConnection, **k)
+
+            commit_attempts.append("entered")
+            with patch.object(sqlite3, "connect", connect_subclass):
+                with real_transaction(*args, **kwargs) as connection:
+                    yield connection
+
+        with patch.object(
+            db, "transaction", side_effect=transaction_with_failing_commit
+        ):
+            response = self._run_approved_minimum_repair(
+                "/repairdepositminimums APPLY"
+            )
+
+        # COMMIT was attempted exactly once and refused.
+        self.assertEqual(commit_attempts, ["entered", "failed"])
+        text = _reply(response)
+        self.assertNotIn("تم حفظ الحدين والتحقق منهما", text)
+        self.assertIn("تم التراجع عن العملية", text)
+        # Nothing persisted.
+        saved = self._raw(
+            "SELECT id, min_deposit_units FROM payment_methods ORDER BY id"
+        )
+        self.assertEqual(
+            [(row["id"], row["min_deposit_units"]) for row in saved],
+            [
+                (1, None),
+                (2, None),
+                (3, None),
+                (4, None),
+            ],
+        )
+
     def test_approved_method_minimums_flow_through_admin_save_and_persist(
         self,
     ) -> None:
@@ -1796,6 +2076,23 @@ class TestMinimumDepositUnits(WizardTestBase):
         method = self._method(mid)
         self.assertEqual(method.asset, "WZNEWASSET")
         self.assertIsNone(method.min_deposit_units)
+
+    def test_save_with_unset_minimum_warns_admin(self) -> None:
+        """A save that leaves the minimum unconfigured (settings
+        incomplete) tells the admin clearly, in the save
+        confirmation itself, that deposits stay refused — the
+        warning names the problem and the consequence."""
+        mid = self._create()  # minimum never configured
+        self._open(mid)
+        saved = self._press_w("pm:wsave")
+        text = _edited(saved.callback_query)
+        self.assertIn(f"تم تعديل الوسيلة #{mid}", text)
+        self.assertIn("⚠️ الحد الأدنى للإيداع غير مضبوط", text)
+        self.assertIn("الإيداع مرفوض حتى تضبطه", text)
+        # The warning never fabricates a value or silently enables
+        # deposits: the row is saved with the minimum still unset.
+        self.assertIsNone(self._method(mid).min_deposit_units)
+        self.assertFalse(self._method(mid).deposits_enabled)
 
     def test_enabling_deposits_requires_min(self) -> None:
         """Decision 10: with no minimum the enable flag is refused at
@@ -1986,6 +2283,7 @@ class TestBotRegistrations(unittest.TestCase):
             "paymethods": admin.paymethods_command,
             "addpm": admin.add_pm_command,
             "editpm": admin.edit_pm_command,
+            "repairdepositminimums": admin.repair_deposit_minimums_command,
         }
         for name, callback in expected.items():
             matches = [
@@ -1995,6 +2293,43 @@ class TestBotRegistrations(unittest.TestCase):
             ]
             self.assertEqual(len(matches), 1, f"one /{name} handler")
             self.assertIs(matches[0].callback, callback)
+
+    def test_repair_command_registered(self) -> None:
+        from telegram.ext import CommandHandler
+
+        captured = self._capture_main_handlers()
+        matches = [
+            h
+            for h, _g in captured
+            if isinstance(h, CommandHandler)
+            and "repairdepositminimums" in h.commands
+        ]
+        self.assertEqual(len(matches), 1, "exactly one /repairdepositminimums handler")
+        self.assertIs(
+            matches[0].callback,
+            admin.repair_deposit_minimums_command,
+            "handler is the admin command"
+        )
+
+
+    def test_repair_command_is_registered(self) -> None:
+        """After integration: bot.py registers /repairdepositminimums
+        exactly once and connects it to the admin command."""
+        from telegram.ext import CommandHandler
+
+        captured = self._capture_main_handlers()
+        matches = [
+            h
+            for h, _g in captured
+            if isinstance(h, CommandHandler)
+            and "repairdepositminimums" in h.commands
+        ]
+        self.assertEqual(len(matches), 1, "exactly one /repairdepositminimums handler")
+        self.assertIs(
+            matches[0].callback,
+            admin.repair_deposit_minimums_command,
+            "handler is the admin command"
+        )
 
     def test_callback_family_registered(self) -> None:
         from telegram.ext import CallbackQueryHandler

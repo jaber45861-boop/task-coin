@@ -283,6 +283,12 @@ class TestCreateValidation:
             "request_id", "status", "title", "description", "provider",
             "action", "target_ref", "reward", "reward_units", "reason",
             "task_id", "created_at", "updated_at",
+            # MT-TASK-28: optional execution limits (None = legacy).
+            "max_executions",
+            "reservation_minutes",
+            # Repeat policy is always part of the safe payload.
+            "repeat_policy",
+            "repeat_hours",
         }
 
 
@@ -717,3 +723,146 @@ class TestRateLimit:
         assert "task_request_rate_limit" not in inspect.getsource(
             task_request_store
         )
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28 (repeat_hours fix only): supported intervals [1, 3, 6, 12, 24]
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestRepeatIntervals:
+    @pytest.mark.parametrize("hours", [1, 3, 6, 12, 24])
+    def test_all_supported_intervals_accepted(self, client, hours):
+        """كل فاصل مدعوم من قائمة الاختيار يُنشأ الطلب بنجاح (200)."""
+        response = self._post(client, repeat_policy="repeatable", repeat_hours=hours)
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+    def test_every_hour_is_stored_as_sent(self, client):
+        """القيمة تُخزّن كما أُُرسلت (عدد صحيح)، لا تُستبدل بالنص المعروض."""
+        created = _create(client, repeat_policy="repeatable", repeat_hours=24)
+        assert created["repeat_policy"] == "repeatable"
+        assert created["repeat_hours"] == 24
+        assert isinstance(created["repeat_hours"], int)
+
+    def test_one_time_without_hours_is_accepted(self, client):
+        """السياسة one_time لا تفرض فاصل تكرار — العقد الحالي للـ API."""
+        assert self._post(client).status_code == 200
+        assert self._post(client, repeat_policy="one_time").status_code == 200
+
+    def test_one_time_with_hours_is_rejected(self, client):
+        """one_time مع repeat_hours مرفوضة وفقًا للعقد الحالي."""
+        assert self._post(client, repeat_policy="one_time", repeat_hours=6).status_code == 400
+
+    @pytest.mark.parametrize("bad", ["1", "01", 1.5, 2.5, True, None])
+    def test_repeat_hours_must_be_strict_integer(self, client, bad):
+        """النص، الكسر، المنطق، والقيمة الناقصة مرفوضة — لا تحويل متساهل."""
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=bad).status_code == 400
+
+    def test_unsupported_integer_interval_rejected(self, client):
+        """عدد صحيح غير مدرج في القائمة [1, 3, 6, 12, 24] مرفوض."""
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=5).status_code == 400
+        assert self._post(client, repeat_policy="repeatable", repeat_hours=48).status_code == 400
+
+    def test_repeat_error_message_is_localized_arabic(self, client):
+        """رسالة الخطأ مترجمة للعربية، لا تُعرض العبارة التقنية الإنجليزية."""
+        response = self._post(client, repeat_policy="repeatable", repeat_hours=5)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["ok"] is False
+        assert "اختر فاصل تكرار صالحًا" in data["message"]
+
+    def test_one_time_hours_error_message_is_localized_arabic(self, client):
+        response = self._post(client, repeat_policy="one_time", repeat_hours=6)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "فاصل التكرار لا يُستخدم" in data["message"]
+
+    @staticmethod
+    def _post(client, **overrides):
+        return client.post(
+            "/api/task-requests",
+            headers=_auth(),
+            json=_payload(**overrides),
+        )
+
+
+# ════════════════════════════════════════════════════════════════════
+# MT-TASK-28: execution limits — max_executions / reservation_minutes
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionLimits:
+    @staticmethod
+    def _post(client, **overrides):
+        return client.post(
+            "/api/task-requests",
+            headers=_auth(),
+            json=_payload(**overrides),
+        )
+
+    @pytest.mark.parametrize("executions, minutes", [
+        (100, 30),
+        (1, 10),
+        (1_000_000, 7 * 24 * 60),
+    ])
+    def test_all_four_together_accepted(self, client, executions, minutes):
+        response = self._post(
+            client,
+            repeat_policy="repeatable", repeat_hours=6,
+            max_executions=executions, reservation_minutes=minutes,
+        )
+        assert response.status_code == 200, response.get_data(as_text=True)
+        data = response.get_json()["request"]
+        assert data["repeat_policy"] == "repeatable"
+        assert data["repeat_hours"] == 6
+        assert data["max_executions"] == executions
+        assert data["reservation_minutes"] == minutes
+
+    def test_one_time_without_limits_keeps_legacy_contract(self, client):
+        assert self._post(client).status_code == 200
+        assert self._post(client, repeat_policy="one_time").status_code == 200
+
+    @pytest.mark.parametrize("bad", [0, -1, "abc", 1.5, True])
+    def test_max_executions_rejected(self, client, bad):
+        assert self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            max_executions=bad,
+        ).status_code == 400
+
+    @pytest.mark.parametrize("bad", [0, -10, "abc", 2.5, True])
+    def test_reservation_minutes_rejected(self, client, bad):
+        assert self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            reservation_minutes=bad,
+        ).status_code == 400
+
+    def test_max_executions_ceiling_rejected(self, client):
+        assert self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            max_executions=10 ** 7,
+        ).status_code == 400
+
+    def test_reservation_ceiling_rejected(self, client):
+        assert self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            reservation_minutes=7 * 24 * 60 + 1,
+        ).status_code == 400
+
+    def test_limit_error_messages_are_localized_arabic(self, client):
+        response = self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            max_executions="abc",
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["ok"] is False
+        assert "max_executions" in data["message"]
+
+        response = self._post(
+            client, repeat_policy="repeatable", repeat_hours=6,
+            reservation_minutes=2.5,
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["ok"] is False
+        assert "reservation_minutes" in data["message"]

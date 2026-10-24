@@ -21,12 +21,16 @@ Creating a row:
   NULL at creation (there is no blockchain interaction here), with a
   partial UNIQUE index so one verified external transaction can never
   be credited twice (idempotency-ready).
-- NEVER invents a rate or asset conversion: the amount is stored as
-  exact integer ATOMIC UNITS OF ``pm_asset`` at that asset's
-  registered scale (the ``asset_units`` registry — USDT 8 dp, EGP
-  2 dp); no exchange rate is ever read and crediting a non-USDT
-  asset later requires an explicit configured mapping — none exists
-  yet and none is invented here.
+- NEVER invents a rate: for a non-wallet asset (EGP) the CURRENT
+  validated quote (``rate_store.get_current_quote`` — fail-closed on
+  missing/stale/corrupt rows) is read on the SAME transaction and
+  FROZEN into the row (``wallet_rate_usdt_egp`` / ``rate_provider`` /
+  ``rate_captured_at``), together with the precomputed exact integer
+  ``credited_usdt_units`` (Decimal math, ROUND_CEILING).  The amount
+  itself stays exact integer ATOMIC UNITS OF ``pm_asset`` at that
+  asset's registered scale (the ``asset_units`` registry — USDT 8 dp,
+  EGP 2 dp); USDT methods read no rate at all, and a later rate
+  change never rewrites a stored snapshot.
 
 Architecture notes:
 
@@ -151,12 +155,19 @@ class DepositRequest:
     external_tx_id: str | None
     created_at: str
     updated_at: str
+    # Frozen EGP → USDT conversion snapshot (NULL for USDT methods
+    # and for legacy rows created before the snapshot migration).
+    wallet_rate_usdt_egp: str | None = None
+    rate_provider: str | None = None
+    rate_captured_at: str | None = None
+    credited_usdt_units: int | None = None
 
 
 _COLUMNS = (
     "request_id, user_id, payment_method_id, amount_units, status, "
     "pm_display_name, pm_asset, pm_network, pm_provider, pm_destination, "
-    "external_tx_id, created_at, updated_at"
+    "external_tx_id, created_at, updated_at, wallet_rate_usdt_egp, "
+    "rate_provider, rate_captured_at, credited_usdt_units"
 )
 
 
@@ -175,6 +186,14 @@ def _row_to_request(row) -> DepositRequest:
         external_tx_id=row["external_tx_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        wallet_rate_usdt_egp=row["wallet_rate_usdt_egp"],
+        rate_provider=row["rate_provider"],
+        rate_captured_at=row["rate_captured_at"],
+        credited_usdt_units=(
+            int(row["credited_usdt_units"])
+            if row["credited_usdt_units"] is not None
+            else None
+        ),
     )
 
 
@@ -245,9 +264,12 @@ def create_deposit_request(
     that exact connection → require the explicit deposit opt-in →
     resolve the asset's registered scale (fail-closed) → require the
     configured PER-METHOD minimum (fail-closed) → parse the amount at
-    that SAME asset's scale → compare in the same units → INSERT the
-    snapshot row.  No wallet call, no ledger call, no rate read, no
-    external transaction id — ever.
+    that SAME asset's scale → compare in the same units → for EGP,
+    read the FRESH rate quote on that SAME connection (fail-closed)
+    and freeze rate + converted units into the row → INSERT the
+    snapshot row.  No wallet call, no ledger call, no external
+    transaction id — crediting still belongs to
+    ``deposit_verification``.
 
     Raises:
         PaymentMethodNotFoundError / PaymentMethodInactiveError /
@@ -257,6 +279,11 @@ def create_deposit_request(
             configured (NULL) for the method — fail-closed, no
             invented default (mapped by the HTTP layer to
             ``deposit_settings_missing``).
+        rate_store.RateUnavailableError (incl. ``RateStaleError``) /
+            ``InvalidPersistedRateError``: an EGP method but no fresh,
+            valid rate quote exists — fail-closed, nothing is
+            inserted (mapped by the HTTP layer to
+            ``rate_unavailable``).
         asset_units.UnknownAssetScaleError: the method's asset has no
             registered decimal scale — fail-closed, no fallback
             scale (mapped the same way).
@@ -317,12 +344,45 @@ def create_deposit_request(
                 amount_units, pm.min_deposit_units
             )
 
+        wallet_rate = rate_provider = rate_captured_at = None
+        credited_usdt_units = None
+        if pm.asset.strip().casefold() == "egp":
+            # The quote is read on the SAME transaction/connection as
+            # the request insert; missing/stale/corrupt quotes fail
+            # closed (nothing is inserted — deposits needing a
+            # conversion are refused without a trustworthy rate).
+            import rate_store
+            from rate_quote import (
+                canonical_rate_text,
+                canonical_timestamp_text,
+                egp_to_wallet_units,
+            )
+
+            quote = rate_store.get_current_quote(
+                connection=conn, now=at
+            )
+            wallet_rate = canonical_rate_text(quote.rate_usdt_egp)
+            rate_provider = quote.provider
+            rate_captured_at = canonical_timestamp_text(quote.captured_at)
+            egp_amount = asset_units.units_to_asset_decimal(
+                amount_units, pm.asset
+            )
+            # Exact integer math only (Decimal → ROUND_CEILING):
+            # the wallet never under-holds (MT-ADMIN-17 contract).
+            credited_usdt_units = egp_to_wallet_units(egp_amount, quote)
+            if credited_usdt_units <= 0:
+                raise DepositConfigurationError(
+                    "EGP conversion produced no creditable USDT units"
+                )
+
         conn.execute(
             "INSERT INTO deposit_requests "
             "(request_id, user_id, payment_method_id, amount_units, "
             " status, pm_display_name, pm_asset, pm_network, pm_provider, "
-            " pm_destination, external_tx_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            " pm_destination, external_tx_id, created_at, updated_at, "
+            " wallet_rate_usdt_egp, rate_provider, rate_captured_at, "
+            " credited_usdt_units) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             (
                 request_id,
                 user_id,
@@ -336,6 +396,10 @@ def create_deposit_request(
                 pm.destination,
                 at_text,
                 at_text,
+                wallet_rate,
+                rate_provider,
+                rate_captured_at,
+                credited_usdt_units,
             ),
         )
         row = conn.execute(

@@ -897,6 +897,7 @@ class TestAwaitingDecisionState:
         assert tasks[tid]["awaiting_decision"] is False
 
     def test_awaiting_false_after_decision(self, client, env):
+        """MT-TASK-29: an APPROVED task leaves the active list."""
         tid = env["task_id"]
         _start(WORKER, tid)
         sid = ManualProofService.submit(
@@ -904,8 +905,38 @@ class TestAwaitingDecisionState:
         ManualReviewService.decide(APPROVER, tid, sid, True)
         resp = client.get("/api/tasks", headers=_auth(WORKER))
         tasks = {t["id"]: t for t in resp.get_json()["tasks"]}
+        assert tid not in tasks
+
+    def test_rejected_task_stays_listed_without_awaiting(self, client, env):
+        """MT-TASK-29: a REJECTED proof keeps the task visible."""
+        tid = env["task_id"]
+        _start(WORKER, tid)
+        sid = ManualProofService.submit(
+            WORKER, tid, PROOF, "k1").submission_id
+        ManualReviewService.decide(APPROVER, tid, sid, False)
+        resp = client.get("/api/tasks", headers=_auth(WORKER))
+        tasks = {t["id"]: t for t in resp.get_json()["tasks"]}
         assert tasks[tid]["awaiting_decision"] is False
-        assert tasks[tid]["status"] == db.USER_TASK_STATUS_COMPLETED
+        assert tasks[tid]["status"] == db.USER_TASK_STATUS_STARTED
+
+    def test_approved_task_hidden_but_records_and_reward_intact(
+            self, client, env):
+        """MT-TASK-29: hiding never deletes or moves anything."""
+        tid = env["task_id"]
+        _start(WORKER, tid)
+        sid = ManualProofService.submit(
+            WORKER, tid, PROOF, "k1").submission_id
+        ManualReviewService.decide(APPROVER, tid, sid, True)
+
+        resp = client.get("/api/tasks", headers=_auth(WORKER))
+        assert resp.status_code == 200
+        assert tid not in {t["id"] for t in resp.get_json()["tasks"]}
+
+        # user_task row, claim audit and credited reward all intact.
+        assert _status(WORKER, tid) == db.USER_TASK_STATUS_COMPLETED
+        claim = _claim_row(sid)
+        assert claim["status"] == db.SUBMISSION_STATUS_PASSED
+        assert _wallet_units(WORKER) == REWARD_UNITS
 
     def test_non_manual_tasks_have_no_boolean(self, client, env):
         _make_task({"expected": "x"}, task_type="deterministic")

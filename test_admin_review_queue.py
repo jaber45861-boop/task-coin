@@ -563,9 +563,12 @@ class TestReviewCallback(QueueTestBase):
         # The EXISTING inbox representation: proof card + mproof buttons.
         self.assertIn("مهمة مراجعة تجريبية", text)
         self.assertIn(PROOF, text)
-        # The inbox card renders "رقم الطلب: <id>" (no # prefix — that
-        # format belongs to the queue list only).
-        self.assertIn(f"رقم الطلب: {sid}", text)
+        # The inbox card renders "رقم المطالبة: <id>" (no # prefix — that
+        # format belongs to the queue list only).  MT-ADMIN-35: the id is
+        # the CLAIM id (task_submissions), never labelled "رقم الطلب",
+        # which collides with the user_task_requests numbering.
+        self.assertIn(f"رقم المطالبة: {sid}", text)
+        self.assertNotIn("رقم الطلب", text)
         self.assertIsInstance(markup, InlineKeyboardMarkup)
         self.assertEqual(
             [b.callback_data for b in markup.inline_keyboard[0]],

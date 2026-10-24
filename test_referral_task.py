@@ -709,6 +709,9 @@ class TestSecurity:
             }
         assert cols == {
             "user_id", "task_id", "status", "started_at", "completed_at",
+            # MT-TASK-28: the reservation deadline is a scheduling field,
+            # never approval state.
+            "reserved_until",
         }
         assert db.ALLOWED_USER_TASK_STATUSES == {
             db.USER_TASK_STATUS_AVAILABLE,
@@ -809,14 +812,25 @@ class TestTaskListApi:
         assert tasks[tid]["awaiting_decision"] is True
 
     def test_awaiting_flag_false_after_decision(self, client, env):
+        """MT-TASK-29: an APPROVED referral claim leaves the list."""
         tid = env["task_id"]
         _start(WORKER, tid)
         sid = ReferralClaimService.submit(WORKER, tid, "k1").submission_id
         ReferralApprovalService.decide(BUYER, tid, sid, True)
         response = client.get("/api/tasks", headers=_auth(WORKER))
         tasks = {t["id"]: t for t in response.get_json()["tasks"]}
+        assert tid not in tasks
+
+    def test_rejected_claim_stays_listed_without_awaiting(self, client, env):
+        """MT-TASK-29: a REJECTED claim keeps the task visible."""
+        tid = env["task_id"]
+        _start(WORKER, tid)
+        sid = ReferralClaimService.submit(WORKER, tid, "k1").submission_id
+        ReferralApprovalService.decide(BUYER, tid, sid, False)
+        response = client.get("/api/tasks", headers=_auth(WORKER))
+        tasks = {t["id"]: t for t in response.get_json()["tasks"]}
         assert tasks[tid]["awaiting_decision"] is False
-        assert tasks[tid]["status"] == db.USER_TASK_STATUS_COMPLETED
+        assert tasks[tid]["status"] == db.USER_TASK_STATUS_STARTED
 
     def test_non_referral_tasks_have_no_boolean(self, client, env):
         _make_task({"channel_slug": "x"}, task_type="deterministic")

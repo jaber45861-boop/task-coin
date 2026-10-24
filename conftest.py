@@ -46,3 +46,27 @@ def task_request_rate_limit_isolated():
     reset()
     yield
     reset()
+
+
+@pytest.fixture(autouse=True)
+def rate_worker_start_guarded(request):
+    """``rate_worker.start`` is a no-op inside tests.
+
+    ``bot.main()`` (and ``serve_miniapp``'s ``__main__`` block) start
+    the background automatic-rate worker, which performs REAL network
+    I/O and writes through the process-global ``db.DB_PATH``.  Letting
+    it spawn during handler-registration tests would leak outbound
+    requests into the suite and could write a quote into an ACTIVE
+    test's database.  Tests drive ``rate_worker._refresh_once()``
+    explicitly instead; the thread lifecycle itself is owned by
+    ``test_rate_worker.py``, which opts out below.
+    """
+    if request.node.path.name == "test_rate_worker.py":
+        yield
+        return
+    from unittest.mock import patch
+
+    import rate_worker
+
+    with patch.object(rate_worker, "start"):
+        yield

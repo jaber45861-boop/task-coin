@@ -92,18 +92,43 @@ const Wallet = (() => {
         section.className = 'wallet-balance-card';
         section.setAttribute('data-testid', 'wallet-balance-card');
 
-        const balance = WalletData.getBalance();
-        const usdt = WalletData.formatUsdt(balance.availableUnits);
-        const egp = WalletData.formatEgp(balance.egpDisplayMinor);
+        // While the shared WalletData read (GET /api/me) is in flight
+        // — or if it fails — the neutral «—» stays; the values below
+        // are replaced only by backend-confirmed ones.
+        const usdt = '—';
+        const egp = '—';
 
         section.innerHTML = `
             <span class="wallet-balance-title">رصيدك الحالي</span>
             <span class="wallet-balance-amount" data-testid="wallet-balance-amount">
-                <span class="wallet-balance-value">${usdt}</span>
+                <span class="wallet-balance-value" data-testid="wallet-balance-value">${usdt}</span>
                 <span class="wallet-balance-currency">USDT</span>
             </span>
             <span class="wallet-balance-egp" data-testid="wallet-balance-egp">≈ ${egp} EGP</span>
         `;
+
+        // The real balance arrives asynchronously from the shared
+        // WalletData source — same source Home reads, so the two
+        // screens can never contradict each other.
+        Promise.resolve(WalletData.getBalance()).then((balance) => {
+            if (!balance || balance.availableUnits === null ||
+                    balance.availableUnits === undefined) {
+                return;
+            }
+            const valueEl = section.querySelector(
+                '[data-testid="wallet-balance-value"]');
+            const egpEl = section.querySelector(
+                '[data-testid="wallet-balance-egp"]');
+            if (valueEl) {
+                valueEl.textContent =
+                    WalletData.formatUsdt(balance.availableUnits);
+            }
+            if (egpEl) {
+                egpEl.textContent =
+                    '≈ ' + WalletData.formatEgp(balance.egpDisplayMinor) + ' EGP';
+            }
+        });
+
         return section;
     }
 

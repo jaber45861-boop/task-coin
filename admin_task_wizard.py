@@ -49,6 +49,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import db
 import task_draft_store
 from config import ADMINS, CHANNELS, is_admin
+from task_capacity import (
+    validate_max_executions,
+    validate_reservation_minutes,
+)
 from task_creation import (
     TaskCreationError,
     TaskSpec,
@@ -128,6 +132,9 @@ STEP_APPROVER = "approver"
 STEP_REWARD = "reward"
 STEP_REPEAT = "repeat"
 STEP_REPEAT_HOURS = "repeat_hours"
+# MT-TASK-28: execution capacity and per-start reservation window.
+STEP_MAX_EXECUTIONS = "max_executions"
+STEP_RESERVATION = "reservation_minutes"
 STEP_PREVIEW = "preview"
 
 STEP_ORDER = (
@@ -142,13 +149,15 @@ STEP_ORDER = (
     STEP_REWARD,
     STEP_REPEAT,
     STEP_REPEAT_HOURS,
+    STEP_MAX_EXECUTIONS,
+    STEP_RESERVATION,
     STEP_PREVIEW,
 )
 
 # Steps that collect free text from the admin's next message.
 TEXT_INPUT_STEPS = frozenset(
     {STEP_TITLE, STEP_TARGET, STEP_INSTRUCTIONS, STEP_REWARD,
-     STEP_REPEAT_HOURS}
+     STEP_REPEAT_HOURS, STEP_MAX_EXECUTIONS, STEP_RESERVATION}
 )
 
 # payload field written by each step.
@@ -164,6 +173,8 @@ _FIELD_BY_STEP = {
     STEP_REWARD: "reward",
     STEP_REPEAT: "repeat_policy",
     STEP_REPEAT_HOURS: "repeat_hours",
+    STEP_MAX_EXECUTIONS: "max_executions",
+    STEP_RESERVATION: "reservation_minutes",
 }
 
 # Preview edit menu: (payload field / step key, button label).
@@ -176,6 +187,8 @@ EDIT_MENU_FIELDS = (
     (STEP_VERIFICATION, "🔍 طريقة التحقق"),
     (STEP_REWARD, "💰 المكافأة"),
     (STEP_REPEAT, "🔁 سياسة التكرار"),
+    (STEP_MAX_EXECUTIONS, "🔢 إجمالي التنفيذات"),
+    (STEP_RESERVATION, "⏳ مدة الحجز"),
 )
 
 # ── Messages (Arabic UI) ──────────────────────────────────────────────
@@ -221,6 +234,16 @@ MSG_REWARD_PROMPT = (
 MSG_REPEAT_PROMPT = "🔟 اختر سياسة التكرار:"
 MSG_REPEAT_HOURS_PROMPT = (
     "🔁 كم ساعة بين كل دورة؟ أرسل رقمًا صحيحًا 1 أو أكثر."
+)
+MSG_MAX_EXECUTIONS_PROMPT = (
+    "🔢 إجمالي عدد التنفيذات المطلوبة:\n"
+    "العدد الكلي للمنفّذين الذين ستُدفع لهم المكافأة "
+    "(حتى 1,000,000)."
+)
+MSG_RESERVATION_PROMPT = (
+    "⏳ مدة حجز التنفيذ (بالدقائق):\n"
+    "المتاح للمنفّف لإكمال المهمة وإرسال الإثبات "
+    "(حتى أسبوع كامل = 10080 دقيقة)."
 )
 MSG_EDIT_PROMPT = "✏️ اختر ما تريد تعديله:"
 
@@ -302,6 +325,14 @@ def _step_satisfied(step: str, payload: dict) -> bool:
             payload.get("repeat_policy") != db.REPEAT_POLICY_REPEATABLE
             or payload.get("repeat_hours") is not None
         )
+    # MT-TASK-28: both execution limits are OPTIONAL.  A draft that
+    # already carries the advertiser's value (approved request) skips
+    # the step entirely, so the advertiser's figure is never replaced
+    # by a default or re-asked; a fresh manual draft still asks.
+    if step == STEP_MAX_EXECUTIONS:
+        return payload.get("max_executions") is not None
+    if step == STEP_RESERVATION:
+        return payload.get("reservation_minutes") is not None
     if step == STEP_FAMILY:
         return bool(payload.get("family")) or bool(
             payload.get("provider")
@@ -459,6 +490,14 @@ def _validate_text_step(step: str, text: str, payload: dict) -> dict:
         payload["repeat_hours"] = parse_positive_int(
             text, field="عدد الساعات"
         )
+    elif step == STEP_MAX_EXECUTIONS:
+        # MT-TASK-28: the SAME bounds the creation path enforces, so a
+        # draft can always become a valid task.
+        payload["max_executions"] = validate_max_executions(text)
+    elif step == STEP_RESERVATION:
+        payload["reservation_minutes"] = validate_reservation_minutes(
+            text
+        )
     else:  # pragma: no cover — guarded by TEXT_INPUT_STEPS
         raise ValueError(MSG_INVALID)
     return payload
@@ -520,6 +559,22 @@ def build_preview_text(draft: TaskDraft) -> str:
                      else "🔁 التكرار: قابلة للتكرار")
     else:
         lines.append("🔁 التكرار: مرة واحدة")
+    # MT-TASK-28: the advertiser's execution limits, shown verbatim.
+    # "غير محدد" means the field was never configured — the task keeps
+    # the legacy behaviour (unlimited / no deadline).  A value is never
+    # replaced by a default and never silently dropped.
+    max_executions = p.get("max_executions")
+    lines.append(
+        "🔢 إجمالي التنفيذات: "
+        + (str(max_executions) if max_executions is not None
+           else "غير محدد (بلا حد)")
+    )
+    minutes = p.get("reservation_minutes")
+    lines.append(
+        "⏳ مدة الحجز: "
+        + (f"{minutes} دقيقة" if minutes is not None
+           else "غير محددة (بلا انتهاء)")
+    )
     return "\n".join(lines)
 
 
@@ -654,6 +709,17 @@ def render_step(draft: TaskDraft) -> tuple[str, InlineKeyboardMarkup]:
         return (MSG_REPEAT_HOURS_PROMPT,
                 InlineKeyboardMarkup([_cancel_row(draft_id)]))
 
+    # MT-TASK-28: execution capacity and reservation window are plain
+    # numeric steps, validated server-side by the same validators the
+    # creation path uses (task_capacity).
+    if step == STEP_MAX_EXECUTIONS:
+        return (MSG_MAX_EXECUTIONS_PROMPT,
+                InlineKeyboardMarkup([_cancel_row(draft_id)]))
+
+    if step == STEP_RESERVATION:
+        return (MSG_RESERVATION_PROMPT,
+                InlineKeyboardMarkup([_cancel_row(draft_id)]))
+
     # STEP_PREVIEW (and any unknown legacy step — fail toward review)
     return build_preview_text(draft), _preview_keyboard(draft)
 
@@ -717,6 +783,11 @@ def spec_from_draft(draft: TaskDraft) -> TaskSpec:
         approver_id=approver_id,
         repeat_policy=p.get("repeat_policy") or db.REPEAT_POLICY_ONE_TIME,
         repeat_hours=p.get("repeat_hours"),
+        # MT-TASK-28: the draft's execution limits reach the task row.
+        # They are validated when the step is saved, so this only carries
+        # them through; None stays None (legacy behaviour).
+        max_executions=p.get("max_executions"),
+        reservation_minutes=p.get("reservation_minutes"),
     )
 
 

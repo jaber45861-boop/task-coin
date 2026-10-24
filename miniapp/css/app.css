@@ -1427,21 +1427,6 @@ body[data-page="profile"] .app-content {
     font-weight: 700;
 }
 
-/* ── Owner indicator (funding advertiser of record) ───────────── */
-.task-owner-badge {
-    flex: 1 1 100%;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 28px;
-    border-radius: 10px;
-    background-color: var(--home-card-inner-bg);
-    border: 1px solid var(--border-color);
-    color: var(--text-secondary);
-    font-size: 12px;
-    font-weight: 700;
-}
-
 /* ── Manual proof input (MT-TASK-17) ─────────────────────────── */
 .task-proof-input {
     flex: 1 1 100%;
@@ -1461,6 +1446,46 @@ body[data-page="profile"] .app-content {
 .task-proof-input:focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 2px;
+}
+
+/* ── Task proof screenshot evidence (MT-ADMIN-34) ────────────── */
+.task-proof-file {
+    flex: 1 1 100%;
+    min-height: 40px;
+    padding: 6px 8px;
+    border-radius: 10px;
+    background-color: var(--bg-secondary);
+    border: 1px dashed var(--border-color);
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.task-proof-preview {
+    flex: 1 1 100%;
+    max-height: 220px;
+    width: auto;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    object-fit: contain;
+    background-color: var(--bg-secondary);
+}
+
+.task-proof-remove {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    padding: 4px 10px;
+    border: none;
+    border-radius: 8px;
+    background-color: transparent;
+    color: var(--danger-color, #d33);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.task-proof-upload-status {
+    flex: 1 1 100%;
+    font-size: 12px;
+    color: var(--text-secondary);
 }
 
 /* ── Reviewer entry & Review page (MT-TASK-18) ──────────────── */
@@ -2002,6 +2027,18 @@ a.review-proof {
     margin-bottom: 6px;
     font-size: 13px;
     color: var(--text-secondary);
+}
+
+/* MT-TASK-28: helper line under an execution-policy field. */
+.taskreq-hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
+.taskreq-field[hidden] {
+    display: none;
 }
 
 .taskreq-input,

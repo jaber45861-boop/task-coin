@@ -53,6 +53,7 @@ Boundaries (this module must NOT):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
@@ -68,6 +69,7 @@ from manual_task import (
     manual_task_approver_user_id,
 )
 from task_submission_store import SubmissionRecord, TaskSubmissionStore
+import task_proof_storage
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,12 @@ MSG_STALE = "⚠️ الطلب غير صالح أو منتهي الصلاحية"
 MSG_INVALID = "⚠️ أمر غير صالح"
 MSG_ERROR = "⚠️ تعذر تنفيذ العملية، حاول مرة أخرى"
 MSG_EDIT_CLOSED = "⚠️ لم يعد هذا الطلب قابلاً للمعالجة."
+MSG_WORKER_APPROVED = (
+    "✅ تمت الموافقة على إثبات مهمتك، وتمت إضافة المكافأة إلى رصيدك."
+)
+MSG_WORKER_REJECTED = (
+    "❌ لم يتم قبول إثبات مهمتك، يمكنك إرسال إثبات آخر من صفحة المهام."
+)
 
 BUTTON_APPROVE = "✅ موافقة"
 BUTTON_REJECT = "❌ رفض"
@@ -114,6 +122,20 @@ def _task_label(task: dict) -> str:
     return f"{title} (#{task.get('task_id', task.get('id', '?'))})"
 
 
+def _proof_display(proof_ref: object) -> str:
+    """Human proof line — never an internal storage key.
+
+    A stored task-proof screenshot (MT-ADMIN-34) is shown as an
+    attached image: the key is an internal identifier and printing it
+    would tell the reviewer nothing.  A plain text/URL proof is
+    rendered verbatim, exactly as before.  Nothing is parsed and no
+    markdown is ever applied on this surface.
+    """
+    if task_proof_storage.is_image_reference(proof_ref):
+        return "📷 صورة مرفقة (انظر الصورة أعلاه)"
+    return str(proof_ref) if proof_ref else "—"
+
+
 def build_pending_text(task: dict, record: SubmissionRecord) -> str:
     """Arabic pending notification: task, claim and proof only.
 
@@ -124,8 +146,11 @@ def build_pending_text(task: dict, record: SubmissionRecord) -> str:
     return (
         f"{MSG_PENDING_HEADER}\n\n"
         f"المهمة: {_task_label(task)}\n"
-        f"رقم الطلب: {record.submission_id}\n"
-        f"الإثبات: {record.proof_ref or '—'}\n\n"
+        # MT-ADMIN-35: this id is the CLAIM (task_submissions) id —
+        # calling it "رقم الطلب" collided with the user_task_requests
+        # numbering and misdirected reviews.
+        f"رقم المطالبة: {record.submission_id}\n"
+        f"الإثبات: {_proof_display(record.proof_ref)}\n\n"
         f"{MSG_PENDING_STATE}"
     )
 
@@ -139,7 +164,8 @@ def build_decided_text(
     return (
         f"{header}\n\n"
         f"المهمة: {_task_label(task)}\n"
-        f"رقم الطلب: {record.submission_id}\n"
+        # MT-ADMIN-35: claim id — never "رقم الطلب" (see build_pending_text).
+        f"رقم المطالبة: {record.submission_id}\n"
         f"الحالة: {status}"
     )
 
@@ -204,6 +230,11 @@ def parse_callback(data: object) -> tuple[bool, int] | None:
 # worker's claim.  No operation state lives here — only transports.
 _notifier = None
 _scheduler: Optional[ScheduleFunc] = None
+# Delivery transport for the WORKER's outcome notice (MT-ADMIN-35).
+# Kept strictly separate from the admin-bound transports above so the
+# admin notification path cannot be affected by it, and so nothing
+# here can ever reach a chat other than the submitting worker.
+_user_notifier = None
 
 
 def bind(notifier, scheduler: ScheduleFunc) -> None:
@@ -216,12 +247,36 @@ def bind(notifier, scheduler: ScheduleFunc) -> None:
     logger.info("Manual proof inbox bound to the Telegram bot loop")
 
 
+def bind_user_notifier(user_notifier) -> None:
+    """Attach the WORKER outcome transport (bot.py, MT-ADMIN-35).
+
+    A separate, optional transport: it delivers the decision to the
+    worker whose proof was reviewed.  It is bound only while the bot
+    loop runs, exactly like the admin transport, and a failure is
+    always fail-soft — the decision itself is already durable.
+    """
+    global _user_notifier
+    _user_notifier = user_notifier
+    logger.info("Manual proof worker notifier bound")
+
+
+def unbind_user_notifier() -> None:
+    """Detach the worker transport (bot shutdown)."""
+    global _user_notifier
+    _user_notifier = None
+    logger.info("Manual proof worker notifier unbound")
+
+
+def is_user_notifier_bound() -> bool:
+    return _user_notifier is not None
+
+
 def unbind() -> None:
     """Detach transports (bot shutdown) — notifications fail soft."""
     global _notifier, _scheduler
     _notifier = None
     _scheduler = None
-    logger.info("Manual proof inbox unbound")
+    logger.info("Manual proof inbox unbound"); unbind_user_notifier()
 
 
 def is_bound() -> bool:
@@ -233,11 +288,20 @@ async def _deliver(
     text: str,
     reply_markup: InlineKeyboardMarkup,
     submission_id: int,
+    evidence_image: bytes | None = None,
 ) -> None:
     """Send the pending notification and persist its linkages.
 
     Runs on the bot event loop.  Failures are logged, never raised —
     the worker's claim is already durable before this runs.
+
+    When *evidence_image* is present it is delivered through the
+    notifier's ADDITIONAL photo path so the reviewer sees the actual
+    screenshot instead of a storage key.  That path is entirely
+    optional: when no notifier photo transport is configured, or the
+    photo send fails, it falls back to the plain text notification, so
+    a missing transport can never lose the event.  Without an image
+    the behaviour is byte-identical to before.
     """
     try:
         # Replay guard: never issue a second pending notification for
@@ -250,9 +314,19 @@ async def _deliver(
                 submission_id,
             )
             return
-        delivered = await notifier.notify_system(
-            text, reply_markup=reply_markup
-        )
+        if evidence_image is not None and hasattr(
+            notifier, "notify_system_photo"
+        ):
+            # Additional photo path — never a replacement.  It reuses
+            # the notifier's own admin-only recipient resolution and
+            # falls back to text on any failure.
+            delivered = await notifier.notify_system_photo(
+                text, evidence_image, reply_markup=reply_markup
+            )
+        else:
+            delivered = await notifier.notify_system(
+                text, reply_markup=reply_markup
+            )
         for chat_id, message_id in delivered:
             if not isinstance(message_id, int) or message_id <= 0:
                 logger.warning(
@@ -268,6 +342,88 @@ async def _deliver(
         logger.exception(
             "Manual proof notification delivery failed: submission=%d",
             submission_id,
+        )
+
+
+def build_worker_notice_text(approved: bool) -> str:
+    """The worker's outcome message.  No internal identifiers, no
+    approver identity, no reward figure — only the decision and what
+    the worker should do next."""
+    return MSG_WORKER_APPROVED if approved else MSG_WORKER_REJECTED
+
+
+def schedule_worker_notice(user_id: int, approved: bool) -> None:
+    """Schedule the WORKER's outcome notice (MT-ADMIN-35).
+
+    Called from the decision path ONLY after ManualReviewService has
+    durably approved/rejected the claim — never for a transient
+    failure, an unauthorized press or a repeat of an already-decided
+    claim, so a retry cannot notify twice.
+
+    Delivery uses the worker's OWN trusted telegram user id (the
+    submission row's user_id); no client-supplied id is ever used.
+    The send is fail-soft: a Telegram failure is logged and never
+    changes the already-saved decision.
+    """
+    notifier = _user_notifier
+    if notifier is None:
+        logger.info(
+            "Worker notice skipped (transport not bound): user=%d "
+            "approved=%s",
+            user_id, approved,
+        )
+        return
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+    ):
+        logger.warning("Worker notice skipped: invalid user id")
+        return
+    text = build_worker_notice_text(approved)
+
+    if _scheduler is not None:
+        # Hand the send across when this runs off the bot loop.
+        coroutine = _deliver_worker_notice(notifier, user_id, text)
+        try:
+            future = _scheduler(coroutine)
+        except Exception:
+            coroutine.close()
+            raise
+        if future is not None and hasattr(future, "add_done_callback"):
+            future.add_done_callback(_log_future_result)
+        return
+
+    # Inside the bot's own coroutine there is already a running loop;
+    # awaiting is correct and cannot lose the send.
+    asyncio.run(_deliver_worker_notice(notifier, user_id, text))
+
+
+async def _deliver_worker_notice(notifier, user_id: int, text: str) -> None:
+    """Send one worker notice.  Runs on the bot event loop.
+
+    Fail-soft by design: the decision it reports is already durable,
+    so a Telegram failure must never be able to look like a failed
+    approval.  Failures are logged with the id only — never the
+    message body, which is already fixed text.
+    """
+    # Guard here rather than only inside a specific transport, so the
+    # rule holds for whatever is bound.  Both arguments are already
+    # produced by this module, so this is a bug guard, not input
+    # validation of untrusted data.
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+    ):
+        raise ValueError("worker id must be a positive integer")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("worker notice text must be non-empty")
+    try:
+        await notifier.notify(user_id, text)
+    except Exception:
+        logger.exception(
+            "Worker notice delivery failed: user=%s", user_id
         )
 
 
@@ -304,11 +460,30 @@ def schedule_pending_notification(
                 record.submission_id,
             )
             return
+        # When the evidence is a stored screenshot, read it back (the
+        # storage layer re-validates the key) so the reviewer sees the
+        # actual image.  A missing/damaged file or a plain text/URL
+        # proof yields None and the notification stays text-only —
+        # never a broken state.
+        evidence_image = None
+        try:
+            if task_proof_storage.is_image_reference(record.proof_ref):
+                evidence_image = task_proof_storage.read_image(
+                    record.proof_ref
+                )
+        except Exception:
+            logger.exception(
+                "Task proof evidence unreadable: submission=%d "
+                "(delivering text-only)",
+                record.submission_id,
+            )
+            evidence_image = None
         coroutine = _deliver(
             notifier,
             build_pending_text(task, record),
             build_decision_keyboard(record.submission_id),
             record.submission_id,
+            evidence_image,
         )
         try:
             future = scheduler(coroutine)
@@ -466,6 +641,14 @@ async def handle_callback(
         return "unauthorized"  # no edit, no state change
 
     # ── 4. The SOLE decision path (CAS + idempotency authoritative) ──
+    # Snapshot the claim state BEFORE deciding.  ManualReviewService is
+    # idempotent: re-pressing Approve on an already-approved claim
+    # re-returns the same outcome WITHOUT raising, so without this
+    # snapshot a repeated press would look like a fresh approval and
+    # notify the worker twice.
+    was_pending = (
+        record.approval_status == db.SUBMISSION_APPROVAL_PENDING
+    )
     try:
         outcome = ManualReviewService.decide(
             actor_user_id,
@@ -531,6 +714,34 @@ async def handle_callback(
         answer, MSG_APPROVED_TOAST if approved else MSG_REJECTED_TOAST
     )
     await _edit_all(edit, targets, build_decided_text(task, record, approved))
+
+    # ── 6. Tell the WORKER the outcome (MT-ADMIN-35) ──────────────
+    # Only when this press actually APPLIED the decision.  A replay of
+    # an already-decided claim re-runs decide() idempotently and lands
+    # here too, but was_pending is False then — the worker was already
+    # told, so no second notice.  Fail-soft by design: the decision is
+    # already saved, so a delivery problem must not look like a failed
+    # approval.
+    if was_pending:
+        # The decision path already runs on the bot's event loop, so the
+        # notice is awaited directly — no cross-thread hop, and nothing
+        # can silently drop it.
+        notifier = _user_notifier
+        try:
+            if notifier is not None and isinstance(record.user_id, int) \
+                    and not isinstance(record.user_id, bool) \
+                    and record.user_id > 0:
+                await _deliver_worker_notice(
+                    notifier,
+                    record.user_id,
+                    build_worker_notice_text(approved),
+                )
+        except Exception:
+            logger.exception(
+                "Worker notice scheduling failed: submission=%d user=%s",
+                record.submission_id, record.user_id,
+            )
+
     logger.info(
         "Manual proof decided via Telegram: submission=%d actor=%d "
         "decision=%s status=%s",

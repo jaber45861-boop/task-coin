@@ -85,10 +85,14 @@ from urllib.parse import urlparse
 
 import deposit_store
 import deposit_verification
-from deposit_verification import DepositNotFoundError
+from deposit_verification import (
+    DepositAssetNotCreditableError,
+    DepositNotFoundError,
+)
+
+import asset_units
 
 # ── Protocol constants (NOT deployment configuration) ────────────────
-
 # BNB Smart Chain mainnet — the chain this adapter verifies.
 CHAIN_ID = 56
 
@@ -871,6 +875,21 @@ def verify_and_credit_deposit(
     if request is None:
         raise DepositNotFoundError(
             f"no deposit request matches {request_id!r}"
+        )
+    # ── Asset gate BEFORE any external call or financial write ────
+    # This adapter verifies on-chain transfers of the SURFACE
+    # (USDT) token, and it reads `request.amount_units` as that
+    # token's atomic units.  An EGP request stores EGP cents there
+    # (50.00 EGP = 5000), so feeding it to the chain verifier would
+    # compare against a 0.00005-USDT-scale amount — a false
+    # AmountMismatchError at best, and an accidental match at worst.
+    # Only wallet-credit-asset requests may be verified this way; an
+    # unsupported asset is refused here, before `verify_deposit_
+    # transaction` can open a connection.
+    if not asset_units.is_wallet_credit_asset(request.pm_asset):
+        raise DepositAssetNotCreditableError(
+            f"deposit asset {request.pm_asset!r} is not verifiable "
+            "through the on-chain adapter"
         )
     facts = verify_deposit_transaction(
         tx_hash,

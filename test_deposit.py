@@ -48,7 +48,8 @@ D. WALLET SAFETY (22–25)
    22 creating a deposit request does not credit wallet
    23 creating a deposit request does not write a credit ledger entry
    24 no fake blockchain transaction is created
-   25 no fake conversion rate is created
+   25 rate facts are server-side only (frozen snapshot columns, never
+      in the response; no fabricated rate)
 
 E. IDEMPOTENCY (26–28)
    26 duplicate request behavior is deterministic
@@ -81,6 +82,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -90,9 +92,15 @@ import config
 import deposit_proof_admin
 import deposit_store
 import payment_method_store
+import rate_store
 import serve_miniapp
 import wallet
 from config import CHANNELS
+from rate_quote import (
+    PROVIDER_COINGECKO,
+    RateQuote,
+    canonical_timestamp_text,
+)
 
 # Reuse the existing, independently implemented Telegram initData helper.
 from test_miniapp_auth import _TEST_BOT_TOKEN, _make_init_data
@@ -184,6 +192,21 @@ def _make_pm(db_path: str, *, enabled: bool = True, active: bool = True,
             method.id, False, updated_by=ADMIN_ID, db_path=db_path
         )
     return payment_method_store.get_payment_method(method.id, db_path)
+
+
+def _seed_auto_rate(
+    db_path: str, rate: str = "48.5", *, age_seconds: float = 0.0
+) -> RateQuote:
+    """A fresh AUTOMATIC quote — the normal operating mode.
+
+    ``age_seconds`` backdates the capture instant so the staleness
+    path (age >= TTL) is deterministically reachable.  Returns the
+    stored quote so tests can assert the exact frozen snapshot.
+    """
+    captured = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    quote = RateQuote(Decimal(rate), PROVIDER_COINGECKO, captured)
+    rate_store.set_automatic_rate(quote, db_path=db_path)
+    return quote
 
 
 def _get_methods(client, headers: dict | None = None):
@@ -748,20 +771,35 @@ class TestWalletSafety:
         assert "external_tx_id" in _deposit_columns(env)  # future key,
         # present but deliberately NULL — never invented at creation.
 
-    def test_25_no_fake_conversion_rate(self, client, env):
-        """25. No rate/conversion fact exists anywhere in the deposit
-        flow — crediting a non-USDT asset later requires an explicit
-        future mapping rule."""
+    def test_25_rate_facts_are_server_side_only(self, client, env):
+        """25. Rate/conversion facts exist ONLY in server-side
+        columns — the additive EGP snapshot columns (frozen at
+        creation, NULL for USDT and for legacy rows), never in the
+        API response, and no rate is ever fabricated: an EGP method
+        without a fresh quote fails closed (see TestEgpRateFreeze)."""
         pm = _make_pm(env)
 
         columns = _deposit_columns(env)
-        assert not any("rate" in name for name in columns)
+        for name in (
+            "wallet_rate_usdt_egp",
+            "rate_provider",
+            "rate_captured_at",
+            "credited_usdt_units",
+        ):
+            assert name in columns
         assert not any("conversion" in name for name in columns)
 
         response = _post(client, _payload(pm.id))
         data = response.get_json()
+        assert response.status_code == 200
         assert not any("rate" in key for key in _keys(data))
-        # The wallet was never consulted for a conversion either.
+        # A USDT creation fills none of the snapshot columns and the
+        # wallet is never consulted at creation.
+        row = _deposit_rows(env)[0]
+        assert row["wallet_rate_usdt_egp"] is None
+        assert row["rate_provider"] is None
+        assert row["rate_captured_at"] is None
+        assert row["credited_usdt_units"] is None
         assert _wallet_row(env) is None
 
 
@@ -1087,6 +1125,159 @@ class TestUI:
 
 
 # ══════════════════════════════════════════════════════════════════
+# G2. PROOF-UPLOAD BUTTON PATH (regression: silent dead button)
+# ══════════════════════════════════════════════════════════════════
+
+
+def _slice(deposit: str, start: str, end: str) -> str:
+    """Source between two anchors (the JS is plain, top-level ordered)."""
+    return deposit[deposit.index(start):deposit.index(end)]
+
+
+class TestProofUploadUI:
+    """The «إرسال إثبات الدفع» button must actually fire its upload,
+    report only server-confirmed success, and recover from every
+    failure.  Root cause of the production incident: `_submit()`
+    left the shared `busy` lock true after a SUCCESSFUL create, so
+    `_uploadProof()`'s `if (busy) return;` guard silently swallowed
+    every click on the proof button of that receipt."""
+
+    def test_49_create_success_releases_lock_before_receipt(self):
+        """49. REGRESSION: the create-success path resets `busy`
+        BEFORE rendering the created panel — otherwise the proof
+        button on that receipt is dead (its handler returns on the
+        still-true lock and never contacts the server)."""
+        deposit = _read_js("deposit.js")
+        submit_body = _slice(
+            deposit, "async function _submit()",
+            "/* ── Created (ALWAYS pending",
+        )
+        # Exactly one successful-create render…
+        assert submit_body.count("_renderCreated(data.request") == 1
+        # …and the lock is released on EVERY exit: HTTP error,
+        # success, and thrown/network failure.
+        assert submit_body.count("busy = false;") == 3
+        render = submit_body.index("_renderCreated(data.request")
+        # The SUCCESS branch must release the lock right BEFORE the
+        # receipt panel swap: the last `busy` mutation preceding the
+        # render is a release, and nothing re-takes it in between.
+        prefix = submit_body[:render]
+        last_release = prefix.rindex("busy = false;")
+        between = prefix[last_release:]
+        assert "busy = true;" not in between
+        assert between.count("busy = false;") == 1
+        assert "catch (err)" in submit_body
+
+    def test_50_proof_button_wired_and_guards_duplicate(self):
+        """50. The receipt wires the proof button to `_uploadProof`,
+        which refuses re-entry while an upload is in flight (the
+        shared lock) and disables the button during that window."""
+        deposit = _read_js("deposit.js")
+        assert (
+            "'[data-testid=\"deposit-proof-submit\"]'" in deposit
+            and "_uploadProof(request)" in deposit
+        )
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        # Duplicate-submission guard: the lock is taken first…
+        assert proof.index("if (busy) {") < proof.index("busy = true;")
+        # …the button is disabled for the whole flight…
+        assert "button.disabled = true" in proof
+        # …and only re-enabled when the server did NOT confirm.
+        assert proof.count("button.disabled = false") == 2
+
+    def test_51_no_file_shows_error_and_sends_nothing(self):
+        """51. With no file chosen the user gets a clear message and
+        NO upload is attempted (the fetch is never reached)."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        nofile = proof[:proof.index("busy = true;")]
+        assert "if (!file)" in nofile
+        assert "اختر صورة إثبات الدفع أولاً" in nofile
+        assert "_proofError" in nofile
+        assert "fetch(" not in nofile      # nothing is sent
+
+    def test_52_upload_posts_expected_fields_only(self):
+        """52. The upload sends exactly the server-expected
+        `request_id` form field plus the file under `file`, with the
+        initData header and NO JSON content-type (multipart needs
+        the browser-set boundary)."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert "form.append('request_id', request.request_id)" in proof
+        assert "form.append('file', file)" in proof
+        assert "headers[INIT_DATA_HEADER] = _initData()" in proof
+        # No user id / amount / status is ever uploaded from here.
+        for forbidden in ("user_id", "amount", "status"):
+            assert f"form.append('{forbidden}'" not in proof
+        # Server side reads the same names.
+        routes = open("deposit_routes.py", encoding="utf-8").read()
+        assert 'request.form.get("request_id")' in routes
+        assert 'request.files.get("file")' in routes
+
+    def test_53_success_claim_only_when_server_confirms(self):
+        """53. The review-pending success claim is rendered only on
+        an ok response with `ok: true`; an HTTP failure, a malformed
+        body, or a thrown/network error shows the error path instead
+        and re-enables the button."""
+        deposit = _read_js("deposit.js")
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert "if (!response.ok || !data.ok)" in proof
+        # The single success render sits inside the else-branch only.
+        after_guard = proof[proof.index("if (!response.ok || !data.ok)"):]
+        assert after_guard.count("_renderProofSent(data.message)") == 1
+        assert "catch (err)" in proof
+        assert "_proofError(_messageFor(null))" in proof   # network fail
+        assert "_proofError(_messageFor(data))" in proof   # HTTP fail
+
+    def test_54_unsupported_file_rejected_by_server_contract(self):
+        """54. File type/size validation stays SERVER-side (magic
+        bytes, bounded size) and the client surfaces the server's
+        Arabic message verbatim — the UI never pre-accepts a file."""
+        deposit = _read_js("deposit.js")
+        assert "unsupported_image_type" in deposit       # error map
+        assert "file_too_large" in deposit
+        # The client does not filter by extension/MIME before send.
+        proof = _slice(
+            deposit, "async function _uploadProof",
+            "/** The ONLY success state",
+        )
+        assert ".type" not in proof
+        assert ".name" not in proof
+        routes = open("deposit_routes.py", encoding="utf-8").read()
+        assert "probe_image" in routes                  # magic bytes
+        assert "MAX_IMAGE_BYTES" in routes
+
+    def test_55_deposit_creation_behavior_unchanged(self):
+        """55. The fix touched ONLY the lock release: the create
+        request still posts the same body, the same header and the
+        same URL, and never claims credit."""
+        deposit = _read_js("deposit.js")
+        submit_body = _slice(
+            deposit, "async function _submit()",
+            "/* ── Created (ALWAYS pending",
+        )
+        assert "const CREATE_URL = '/api/deposit'" in deposit
+        assert "payment_method_id: method.id" in submit_body
+        assert "amount: amount" in submit_body
+        assert "headers: _headers()" in submit_body
+        # No success claim beyond the server-provided pending text.
+        for claim in ("تمت إضافة", "credited", "تم الإيداع بنجاح"):
+            assert claim not in submit_body
+
+
+# ══════════════════════════════════════════════════════════════════
 # H. PER-ASSET MINIMUM / SCALE (39–47)
 # ══════════════════════════════════════════════════════════════════
 
@@ -1119,6 +1310,7 @@ class TestPerAssetMinimums:
         """40. EGP 50 → accepted, stored as 5000 EGP cents — NEVER
         the old 8-dp USDT interpretation (5_000_000_000)."""
         pm = self._make_egp_pm(env)
+        _seed_auto_rate(env)
         response = _post(client, _payload(pm.id, "50"))
         assert response.status_code == 200
         request = response.get_json()["request"]
@@ -1167,6 +1359,7 @@ class TestPerAssetMinimums:
         100_000_000 for USDT — scale is per-method, never global."""
         egp = self._make_egp_pm(env, min_units=100)
         usdt = _make_pm(env)
+        _seed_auto_rate(env)
         egp_units = _post(
             client, _payload(egp.id, "1")
         ).get_json()["request"]["amount_units"]
@@ -1210,6 +1403,7 @@ class TestPerAssetMinimums:
         assert ") USDT" not in deposit    # the old hardcoded unit
 
         egp = self._make_egp_pm(env)
+        _seed_auto_rate(env)
         egp_request_id = _post(
             client, _payload(egp.id, "50")
         ).get_json()["request"]["request_id"]
@@ -1233,6 +1427,222 @@ class TestPerAssetMinimums:
         assert deposit_proof_admin._amount_text(request) == (
             "1.50000000 USDT"
         )
+
+    def test_48_receipt_currency_is_the_request_asset(
+        self, client, env
+    ):
+        """48. The receipt currency is ALWAYS the API's
+        request.asset: an EGP request shows EGP (2 dp), a USDT
+        request shows USDT (8 dp), and a missing asset degrades to
+        the amount ALONE — never a default USDT and never the
+        literal 'undefined'.  The amount text keeps the asset's
+        registered scale (server-rendered, never reformatted here)."""
+        pm = _make_pm(env)          # USDT, min 1 USDT
+        usdt = _post(
+            client, _payload(pm.id, "1.5")
+        ).get_json()["request"]
+        assert usdt["asset"] == "USDT"
+        assert usdt["amount"] == "1.50000000"   # 8-dp USDT scale
+
+        egp = self._make_egp_pm(env)
+        _seed_auto_rate(env)
+        egp_request = _post(
+            client, _payload(egp.id, "50")
+        ).get_json()["request"]
+        assert egp_request["asset"] == "EGP"
+        assert egp_request["amount"] == "50.00"  # 2-dp EGP scale
+
+        deposit = _read_js("deposit.js")
+        # Receipt: server-rendered amount + the API-provided asset.
+        assert (
+            "${_esc(request.amount)} ${_esc(request.asset)}" in deposit
+        )
+        # No currency string literal anywhere in the deposit panel —
+        # the unit is only ever server data (prose in comments and
+        # the Arabic error map is not a currency literal).
+        assert "'USDT'" not in deposit
+        assert '\"USDT\"' not in deposit
+        assert "EGP" not in deposit   # EGP appears only via the API
+        # Missing-asset safety: ONE helper decides every currency
+        # label and degrades to '' — never 'undefined'/'null'.
+        assert "function _assetLabel(" in deposit
+        assert "_assetLabel(method.asset)" in deposit
+        assert "_assetLabel(first.asset)" in deposit
+        assert ".textContent = method.asset" not in deposit
+        # The composition never invents "undefined · NETWORK".
+        composition = deposit[
+            deposit.index("function _composition("):
+            deposit.index("function _buildShell(")
+        ]
+        assert "${method.asset}" not in composition
+
+
+# ══════════════════════════════════════════════════════════════════
+# J. AUTOMATIC-RATE POLICY AT THE DEPOSIT EDGE (56–59)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestEgpRateFreeze:
+    """The automatic-rate policy where deposits are created: a fresh
+    trustworthy quote is REQUIRED for EGP (fail-closed otherwise) and
+    is FROZEN into the row — exact rate text, provider, capture
+    instant and the ROUND_CEILING unit count.  Rate facts never leak
+    into the API response."""
+
+    EGP_RATE = "48.5"
+    # 50 EGP at 48.5 EGP/USDT = 1.030927835051546… USDT → ×1e8 →
+    # 103_092_783.505… atomic units → ROUND_CEILING (MT-ADMIN-17:
+    # the wallet never under-holds) → 103_092_784 — computed here
+    # independently of the production Decimal code path.
+    FROZEN_UNITS = 103_092_784
+
+    @staticmethod
+    def _make_egp_pm(db_path: str, min_units: int = 5000):
+        return _make_pm(
+            db_path,
+            category="cash",
+            asset="EGP",
+            network=None,
+            display_name="TEST EGP",
+            min_units=min_units,
+        )
+
+    def test_56_egp_creation_without_rate_fails_closed(self, client, env):
+        """56. No quote at all → 503 rate_unavailable with a clear
+        message, no row, no wallet — never a guessed price."""
+        pm = self._make_egp_pm(env)
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 503
+        body = response.get_json()
+        assert body["error"] == "rate_unavailable"
+        assert "سعر" in body["message"]       # clear Arabic message
+        assert _deposit_rows(env) == []
+        assert _wallet_row(env) is None
+
+    def test_57_egp_creation_with_stale_rate_fails_closed(
+        self, client, env
+    ):
+        """57. A quote aged out (age >= TTL) is as unusable as a
+        missing one — a failed refresh never extends freshness."""
+        pm = self._make_egp_pm(env)
+        _seed_auto_rate(
+            env, self.EGP_RATE,
+            age_seconds=rate_store.RATE_TTL_SECONDS,
+        )
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 503
+        assert response.get_json()["error"] == "rate_unavailable"
+        assert _deposit_rows(env) == []
+
+    def test_58_egp_creation_freezes_the_quote(self, client, env):
+        """58. A fresh quote is frozen canonically — exact rate text,
+        provider, capture instant, exact converted units — while the
+        response carries NO rate facts and the wallet is untouched."""
+        pm = self._make_egp_pm(env)
+        quote = _seed_auto_rate(env, self.EGP_RATE)
+        response = _post(client, _payload(pm.id, "50"))
+        assert response.status_code == 200
+        data = response.get_json()
+        assert not any("rate" in key for key in _keys(data))
+
+        row = _deposit_rows(env)[0]
+        assert row["request_id"] == data["request"]["request_id"]
+        assert row["wallet_rate_usdt_egp"] == self.EGP_RATE  # canonical
+        assert row["rate_provider"] == PROVIDER_COINGECKO
+        assert row["rate_captured_at"] == canonical_timestamp_text(
+            quote.captured_at
+        )
+        assert row["credited_usdt_units"] == self.FROZEN_UNITS
+        assert row["amount_units"] == 5000          # EGP cents, exact
+        assert _wallet_row(env) is None             # no credit yet
+
+    def test_59_usdt_creation_needs_no_rate(self, client, env):
+        """59. The USDT path never consults a rate: creation works
+        with NO quote present and freezes nothing."""
+        pm = _make_pm(env)
+        response = _post(client, _payload(pm.id, "1.5"))
+        assert response.status_code == 200
+        row = _deposit_rows(env)[0]
+        assert row["wallet_rate_usdt_egp"] is None
+        assert row["rate_provider"] is None
+        assert row["credited_usdt_units"] is None
+
+    def test_60_init_db_migrates_a_preexisting_database(self, tmp_path):
+        """60. Database compatibility: a ``deposit_requests`` created
+        BEFORE the snapshot columns gains them through the additive
+        startup migration; existing rows keep NULL snapshot fields
+        (never a fabricated rate), old data stays byte-for-byte, and
+        a second ``init_db`` run is a no-op."""
+        legacy = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(legacy)
+        try:
+            conn.execute(
+                "CREATE TABLE deposit_requests ("
+                " request_id TEXT PRIMARY KEY,"
+                " user_id INTEGER NOT NULL,"
+                " payment_method_id INTEGER NOT NULL,"
+                " amount_units INTEGER NOT NULL,"
+                " status TEXT NOT NULL,"
+                " pm_display_name TEXT NOT NULL,"
+                " pm_asset TEXT NOT NULL,"
+                " pm_network TEXT,"
+                " pm_provider TEXT NOT NULL,"
+                " pm_destination TEXT NOT NULL,"
+                " external_tx_id TEXT,"
+                " created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                " updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                " FOREIGN KEY (user_id) REFERENCES users(user_id),"
+                " FOREIGN KEY (payment_method_id)"
+                " REFERENCES payment_methods(id))"
+            )
+            conn.execute(
+                "INSERT INTO deposit_requests (request_id, user_id, "
+                " payment_method_id, amount_units, status, "
+                " pm_display_name, pm_asset, pm_provider, pm_destination,"
+                " external_tx_id) "
+                "VALUES ('legacy1', 1, 1, 5000, 'pending', 'OLD', 'EGP', "
+                " 'P', 'D', NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        db.init_db(legacy)          # additive migration runs
+        db.init_db(legacy)          # idempotent — no error, no dupes
+
+        conn = sqlite3.connect(legacy)
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(deposit_requests)"
+                )
+            }
+            for name in (
+                "wallet_rate_usdt_egp",
+                "rate_provider",
+                "rate_captured_at",
+                "credited_usdt_units",
+            ):
+                assert name in columns
+            rows = conn.execute(
+                "SELECT * FROM deposit_requests"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1
+        legacy_row = rows[0]
+        # Old data intact; the new columns are NULL — a legacy row is
+        # NEVER assigned a fabricated/current rate (it is refused at
+        # the credit boundary instead).
+        assert legacy_row["request_id"] == "legacy1"
+        assert legacy_row["amount_units"] == 5000
+        assert legacy_row["status"] == "pending"
+        assert legacy_row["wallet_rate_usdt_egp"] is None
+        assert legacy_row["rate_provider"] is None
+        assert legacy_row["rate_captured_at"] is None
+        assert legacy_row["credited_usdt_units"] is None
 
 
 if __name__ == "__main__":

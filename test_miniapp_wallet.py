@@ -483,7 +483,16 @@ class TestUiOnlyScope:
                     f"Wallet/ledger mutation token '{token}' found in {path}"
 
     def test_no_withdrawal_deposit_business_logic(self):
-        """(24) No financial flows, float maths, or network calls."""
+        """(24) No financial flows, float maths, or network calls.
+
+        The balance-display fix adds ONE approved network exception:
+        ``miniapp/js/wallet-data.js`` binds its read-only balance
+        source to ``GET /api/me`` (the same initData-authenticated
+        read ``profile.js`` performs) — a GET that mutates nothing.
+        Every other banned token still applies to it, and
+        ``wallet.js`` / ``home.js`` keep the full ban (including
+        ``fetch(``).
+        """
         banned = [
             "fetch(", "XMLHttpRequest", "axios", "$.ajax",
             "parseFloat", "toFixed", "Math.round",
@@ -493,9 +502,19 @@ class TestUiOnlyScope:
         for path in ("miniapp/js/wallet.js", "miniapp/js/wallet-data.js",
                      "miniapp/js/home.js"):
             content = _read(path)
-            for token in banned:
+            # wallet-data.js: the read-only GET /api/me binding is
+            # the one approved network call — never a mutation.
+            tokens = [t for t in banned
+                      if not (path == "miniapp/js/wallet-data.js"
+                              and t == "fetch(")]
+            for token in tokens:
                 assert token not in content, \
                     f"Business-logic token '{token}' found in {path}"
+            if path == "miniapp/js/wallet-data.js":
+                # The only allowed fetch is the read-only balance GET.
+                assert "fetch(" in content
+                assert "ACCOUNT_URL = '/api/me'" in content
+                assert "method:" not in content  # never POST/PUT/DELETE
 
     def test_formatting_is_integer_only(self):
         """Formatting uses integer-exact operations (no float maths)."""

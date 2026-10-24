@@ -9,6 +9,7 @@ Run:
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -57,7 +58,11 @@ def _set_correct_answer(ctx: MagicMock, answer: int = 10) -> None:
 
 
 def _persist_language(user_id: int, language: str = "ar") -> None:
-    """Persist a language so /start skips the language-selection step."""
+    """Persist a language so /start skips the language-selection step.
+
+    Runs against the per-test temp database (setUp installs it as
+    ``db.DB_PATH``); it must NEVER touch the default/production path.
+    """
     import db
 
     db.init_db()
@@ -65,13 +70,60 @@ def _persist_language(user_id: int, language: str = "ar") -> None:
     db.set_user_language(user_id, language)
 
 
-# ── Tests: /start initialises anti-bot ────────────────────────────────
+class _TempDbMixin:
+    """Give every anti-bot test its own SQLite file.
+
+    Regression guard for MT-TASK-28: this module used to call
+    ``db.init_db()`` with no path, which silently ran whatever
+    migrations the current ``db.py`` carried against the PRODUCTION
+    database.  Patching ``db.DB_PATH`` to a temp file makes that
+    impossible, and the teardown proves the production file was not
+    written.
+    """
+
+    def setUp(self):
+        import os
+
+        import db
+
+        super().setUp()
+        self._orig_db_path = db.DB_PATH
+        self._prod_path = self._orig_db_path
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        db.DB_PATH = self._tmp.name
+        db.init_db(db.DB_PATH)
+        # fingerprint the real database BEFORE the test body runs
+        try:
+            st = os.stat(self._prod_path)
+            self._prod_before = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            self._prod_before = (None, None)
+        self.addCleanup(self._restore_db)
+
+    def _restore_db(self):
+        import db
+
+        db.DB_PATH = self._orig_db_path
+        # The production database must be byte-identical to before.
+        import os
+
+        try:
+            st = os.stat(self._prod_path)
+            after = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            after = (None, None)
+        assert after == self._prod_before, (
+            "test_anti_bot wrote to the PRODUCTION database "
+            f"({self._prod_path}); every test must use a temp DB_PATH"
+        )
 
 
-class TestStartInit(unittest.IsolatedAsyncioTestCase):
+class TestStartInit(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Tests that /start sets up the anti-bot question."""
 
     def setUp(self) -> None:
+        super().setUp()
         _persist_language(_TEST_USER_ID)
 
     async def test_start_returns_anti_bot_state(self) -> None:
@@ -119,7 +171,7 @@ class TestStartInit(unittest.IsolatedAsyncioTestCase):
 # ── Tests: correct answer on first try ───────────────────────────────
 
 
-class TestCorrectFirstTry(unittest.IsolatedAsyncioTestCase):
+class TestCorrectFirstTry(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Correct answer on the first attempt passes immediately."""
 
     def setUp(self) -> None:
@@ -162,7 +214,7 @@ class TestCorrectFirstTry(unittest.IsolatedAsyncioTestCase):
 # ── Tests: wrong then correct ────────────────────────────────────────
 
 
-class TestWrongThenCorrect(unittest.IsolatedAsyncioTestCase):
+class TestWrongThenCorrect(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """One wrong answer followed by a correct answer."""
 
     def setUp(self) -> None:
@@ -217,7 +269,7 @@ class TestWrongThenCorrect(unittest.IsolatedAsyncioTestCase):
 # ── Tests: wrong twice then correct ──────────────────────────────────
 
 
-class TestWrongTwiceThenCorrect(unittest.IsolatedAsyncioTestCase):
+class TestWrongTwiceThenCorrect(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Two wrong answers followed by a correct answer."""
 
     def setUp(self) -> None:
@@ -264,7 +316,7 @@ class TestWrongTwiceThenCorrect(unittest.IsolatedAsyncioTestCase):
 # ── Tests: 3 errors block ────────────────────────────────────────────
 
 
-class TestThreeErrorsBlock(unittest.IsolatedAsyncioTestCase):
+class TestThreeErrorsBlock(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Three wrong answers block the user."""
 
     def setUp(self) -> None:
@@ -368,7 +420,7 @@ class TestThreeErrorsBlock(unittest.IsolatedAsyncioTestCase):
 # ── Tests: answer after being blocked ────────────────────────────────
 
 
-class TestAnswerAfterBlock(unittest.IsolatedAsyncioTestCase):
+class TestAnswerAfterBlock(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Sending an answer after being blocked is handled."""
 
     async def test_blocked_handler_replies_with_start_prompt(self) -> None:
@@ -406,7 +458,7 @@ class TestAnswerAfterBlock(unittest.IsolatedAsyncioTestCase):
 # ── Tests: constants and configuration ───────────────────────────────
 
 
-class TestAntiBotConfig(unittest.TestCase):
+class TestAntiBotConfig(_TempDbMixin, unittest.TestCase):
     """Verify anti-bot configuration constants."""
 
     def test_max_attempts_is_three(self) -> None:
@@ -425,7 +477,7 @@ class TestAntiBotConfig(unittest.TestCase):
 # ── Tests: start → check_answer flow ────────────────────────────────
 
 
-class TestStartThenAnswerFlow(unittest.IsolatedAsyncioTestCase):
+class TestStartThenAnswerFlow(_TempDbMixin, unittest.IsolatedAsyncioTestCase):
     """Integration test: start then answer correctly in one flow."""
 
     def setUp(self) -> None:
@@ -485,7 +537,7 @@ class TestStartThenAnswerFlow(unittest.IsolatedAsyncioTestCase):
 # ── Tests: no ReplyKeyboard introduced ───────────────────────────────
 
 
-class TestNoReplyKeyboard(unittest.TestCase):
+class TestNoReplyKeyboard(_TempDbMixin, unittest.TestCase):
     """Verify no ReplyKeyboard was introduced."""
 
     def test_no_reply_keyboard_in_bot(self) -> None:

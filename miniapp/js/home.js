@@ -72,17 +72,11 @@ const Home = (() => {
         const user = typeof TelegramApp !== 'undefined' ? TelegramApp.getUser() : null;
 
         // Wallet balance shown beside the profile (same shared data
-        // source as the Wallet page — neutral placeholder while no
-        // backend wallet API exists; never a hard-coded amount).
-        const balance = typeof WalletData !== 'undefined'
-            ? WalletData.getBalance()
-            : { availableUnits: null, egpDisplayMinor: null };
-        const usdtText = typeof WalletData !== 'undefined'
-            ? WalletData.formatUsdt(balance.availableUnits)
-            : '—';
-        const egpText = typeof WalletData !== 'undefined'
-            ? WalletData.formatEgp(balance.egpDisplayMinor)
-            : '—';
+        // source as the Wallet page).  While the GET /api/me read is
+        // in flight — or when it fails — the neutral «—» stays; the
+        // spans are replaced only by a backend-confirmed value.
+        const usdtText = '—';
+        const egpText = '—';
 
         // Shared inline-SVG wallet icon (defined by wallet.js).
         const walletIcon = typeof WalletIcon !== 'undefined' ? WalletIcon : '👛';
@@ -134,6 +128,32 @@ const Home = (() => {
         walletButton.addEventListener('click', () => {
             Navigation.navigateTo('wallet');
         });
+
+        // The real balance arrives asynchronously from the shared
+        // WalletData source (GET /api/me).  The «—» above is the
+        // loading state; it is replaced only with a confirmed value
+        // and a failed read leaves it untouched — never a fake number.
+        if (typeof WalletData !== 'undefined' &&
+                WalletData && WalletData.getBalance) {
+            Promise.resolve(WalletData.getBalance()).then((balance) => {
+                if (!balance || balance.availableUnits === null ||
+                        balance.availableUnits === undefined) {
+                    return;
+                }
+                const usdtEl = section.querySelector(
+                    '[data-testid="home-wallet-usdt"]');
+                const egpEl = section.querySelector(
+                    '[data-testid="home-wallet-egp"]');
+                if (usdtEl) {
+                    usdtEl.textContent =
+                        WalletData.formatUsdt(balance.availableUnits) + ' USDT';
+                }
+                if (egpEl) {
+                    egpEl.textContent = '≈ ' +
+                        WalletData.formatEgp(balance.egpDisplayMinor) + ' EGP';
+                }
+            });
+        }
 
         return section;
     }
