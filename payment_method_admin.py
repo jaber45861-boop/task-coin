@@ -953,28 +953,6 @@ def build_wizard_summary(state: dict) -> str:
     )
 
 
-def _min_deposit_display(state: dict) -> str:
-    """Staged minimum in the staged asset's unit — never invented.
-
-    ``None`` renders as not-configured. If the asset has no registered
-    scale or the stored units are invalid, never present the atomic
-    integer as if it were an amount in the asset's currency.
-    """
-    units = state.get("min_deposit_units")
-    if units is None:
-        return "غير مضبوط"
-    try:
-        return str(
-            asset_units.units_to_asset_decimal(
-                units, state.get("asset")
-            )
-        )
-    except asset_units.UnknownAssetScaleError:
-        return "غير معروض (مقياس الأصل غير مسجل)"
-    except asset_units.AssetAmountError:
-        return "غير معروض (قيمة مخزنة غير صالحة)"
-
-
 def build_review_text(state: dict) -> str:
     return f"🔎 مراجعة وسيلة الدفع\n{WZ_RULE}\n\n{build_wizard_summary(state)}"
 

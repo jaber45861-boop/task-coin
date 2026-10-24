@@ -2204,8 +2204,7 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
                 active: bool | None = None, paused: bool | None = None,
                 db_path: str | None = None,
                 repeat_policy: str | None = None,
-                repeat_hours: int | None = None,
-                conn: sqlite3.Connection | None = None) -> bool:
+                repeat_hours: int | None = None) -> bool:
     """Update a task. Returns True if the task existed and was updated.
 
     ``repeat_policy`` / ``repeat_hours`` are validated as a merged pair
@@ -2273,16 +2272,10 @@ def update_task(task_id: int, title: str | None = None, description: str | None 
         return False
 
     values.append(task_id)
-    if conn is not None:
+    with get_connection(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE tasks SET " + ", ".join(fields) + " WHERE id = ?",
-            values,
-        )
-        return cursor.rowcount > 0
-    with get_connection(db_path) as own_conn:
-        cursor = own_conn.execute(
-            "UPDATE tasks SET " + ", ".join(fields) + " WHERE id = ?",
-            values,
+            f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?",
+            values
         )
         return cursor.rowcount > 0
 

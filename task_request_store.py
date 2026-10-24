@@ -393,28 +393,6 @@ def count_pending() -> int:
 # ── User transitions (create / edit + resubmit) ───────────────────────
 
 
-def get_request_by_published_task(published_task_id: int) -> TaskRequest | None:
-    """Fetch one request by its published task id.
-
-    Returns the ``TaskRequest`` whose ``published_task_id`` matches,
-    or ``None`` when no such request exists (or is not published).
-
-    This is used by ``task_owner_management`` to look up a request
-    from the task id that appears in the public ``tasks`` table,
-    so the ownership check can compare ``req.user_id`` against the
-    verified caller id.
-    """
-    if isinstance(published_task_id, bool) or not isinstance(published_task_id, int):
-        return None
-    with db.get_connection() as conn:
-        row = conn.execute(
-            f"SELECT {_COLUMNS} FROM user_task_requests "
-            "WHERE published_task_id = ?",
-            (published_task_id,),
-        ).fetchone()
-    return _row_to_request(row)
-
-
 def create_request(user_id: int, raw: object) -> TaskRequest:
     """Validate + insert a fresh ``pending`` request for ``user_id``."""
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:

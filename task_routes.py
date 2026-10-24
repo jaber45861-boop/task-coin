@@ -125,7 +125,6 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
-import task_funding
 import task_request_notifications
 import wallet
 from urllib.parse import urlsplit
@@ -571,12 +570,7 @@ def list_tasks():
     Safe fields only: id, title, description, type, reward,
     reward_units, status (plus ``join_url`` for channel tasks when a
     public username is configured, and ``task_url`` for manual tasks
-    when a valid external destination exists), plus the narrow boolean
-    ``is_owner`` — true only when the verified caller is the task's
-    funding advertiser of record (``task_funding.advertiser_id``;
-    the ``tasks`` table has no owner column).  Unfunded tasks grant
-    ownership to no one.  No advertiser identity or funding amount
-    is ever exposed.
+    when a valid external destination exists).
 
     ``reward_units`` (MT-ADMIN-14) is the exact atomic accounting
     value: the page derives sub-cent USDT display from it with
@@ -622,21 +616,6 @@ def list_tasks():
                 continue
             status = row["status"] if row is not None else _STATUS_AVAILABLE
             task_row = db.get_task(summary.id)
-            # is_owner: task_funding.advertiser_id takes priority;
-            # fallback to task_data.approver.telegram_user_id (the verified
-            # buyer/creator identity per MT-TASK-15 / MT-TASK-06), then to
-            # tasks.advertiser_id (legacy column, may not exist in production).
-            is_owner = advertisers.get(summary.id) == user_id
-            if not is_owner and task_row:
-                try:
-                    task_data = json.loads(task_row.get("task_data") or "{}")
-                    approver = task_data.get("approver", {})
-                    if approver.get("telegram_user_id") == user_id:
-                        is_owner = True
-                except (ValueError, TypeError):
-                    pass
-                if not is_owner and task_row.get("advertiser_id") == user_id:
-                    is_owner = True
             entry = {
                 "id": summary.id,
                 "title": summary.title,
@@ -647,7 +626,7 @@ def list_tasks():
                 "status": status,
                 "paused": bool(task_row["paused"]) if task_row else False,
                 "archived_at": task_row["archived_at"] if task_row else None,
-                "is_owner": is_owner,
+                "is_owner": advertisers.get(summary.id) == user_id,
             }
             join_url = _safe_join_url(summary.id, summary.type)
             if join_url:
@@ -676,14 +655,6 @@ def list_tasks():
                 task_url = _safe_task_url(summary.id)
                 if task_url:
                     entry["task_url"] = task_url
-
-                # Ownership flag — computed ONLY from the funding record
-                # of record.  No funding row → no owner.
-                funding = task_funding.get_funding(summary.id)
-                entry["is_owner"] = bool(
-                    funding is not None
-                    and funding["advertiser_id"] == user_id
-                )
             tasks.append(entry)
     except Exception:
         logger.exception("Failed to list tasks for user %s", user_id)
@@ -1528,9 +1499,6 @@ def update_owned_task(task_id: int):
     if err:
         return err
 
-    if task.get("archived_at") is not None:
-        return _error("task_archived", "لا يمكن تعديل مهمة مؤرشفة", 409)
-
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return _error("invalid_request", _MSG_INVALID_REQUEST, 400)
@@ -1595,8 +1563,6 @@ def update_owned_task(task_id: int):
             fresh = db.get_task(task_id)
             if fresh is None:
                 return _error("task_not_found", _MSG_TASK_NOT_FOUND, 404)
-            if fresh.get("archived_at") is not None:
-                return _error("task_archived", "لا يمكن تعديل مهمة مؤرشفة", 409)
             advertiser_id = db.get_task_advertiser(task_id)
             if advertiser_id is None or advertiser_id != user_id:
                 return _error("not_owner", _MSG_OWNER_NOT_FOUND, 403)
