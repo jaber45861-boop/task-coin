@@ -300,13 +300,15 @@ const Tasks = (() => {
             return;
         }
 
-        // Owner controls — only for the task advertiser/creator
+        // Owner indicator — rendered ONLY from the server's own boolean
+        // (the funding advertiser of record). Display only: no task
+        // management controls are offered here.
         if (task.is_owner === true) {
-            const ownerLabel = document.createElement('span');
-            ownerLabel.className = 'task-owner-label';
-            ownerLabel.setAttribute('data-testid', 'task-owner');
-            ownerLabel.textContent = 'owner';
-            actions.appendChild(ownerLabel);
+            const ownerTag = document.createElement('span');
+            ownerTag.className = 'task-owner-badge';
+            ownerTag.setAttribute('data-testid', 'task-owner-badge');
+            ownerTag.textContent = 'أنت مالك هذه المهمة';
+            actions.appendChild(ownerTag);
         }
 
         // A referral claim or manual proof is already awaiting its
