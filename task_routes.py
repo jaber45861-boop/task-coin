@@ -124,6 +124,7 @@ from manual_task import (
     manual_task_approver_user_id,
     worker_awaiting_decision,
 )
+import task_funding
 import task_request_notifications
 import task_request_rate_limit
 import task_request_store
@@ -508,7 +509,12 @@ def list_tasks():
 
     Safe fields only: id, title, description, type, reward,
     reward_units, status (plus ``join_url`` for channel tasks when a
-    public username is configured).
+    public username is configured), plus the narrow boolean
+    ``is_owner`` — true only when the verified caller is the task's
+    funding advertiser of record (``task_funding.advertiser_id``;
+    the ``tasks`` table has no owner column).  Unfunded tasks grant
+    ownership to no one.  No advertiser identity or funding amount
+    is ever exposed.
 
     ``reward_units`` (MT-ADMIN-14) is the exact atomic accounting
     value: the page derives sub-cent USDT display from it with
@@ -554,6 +560,15 @@ def list_tasks():
                 entry["awaiting_decision"] = worker_awaiting_decision(
                     user_id, summary.id
                 )
+            # Ownership flag — a narrow boolean computed ONLY from
+            # the funding record of record (task_funding is the
+            # schema's single ownership source).  No funding row →
+            # no owner: is_owner stays false for every caller.
+            funding = task_funding.get_funding(summary.id)
+            entry["is_owner"] = bool(
+                funding is not None
+                and funding["advertiser_id"] == user_id
+            )
             tasks.append(entry)
     except Exception:
         logger.exception("Failed to list tasks for user %s", user_id)
