@@ -17,7 +17,7 @@ Run:
 """
 
 import json
-import os
+from pathlib import Path
 
 import pytest
 
@@ -40,7 +40,9 @@ WORKER = 7102       # a different, unrelated user
 USDT = wallet.USDT_SCALE
 REWARD = 1 * USDT
 
-_TASKS_JS_PATH = os.path.join("miniapp", "js", "tasks.js")
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_TASKS_JS_PATH = _PROJECT_ROOT / "miniapp" / "js" / "tasks.js"
+_INDEX_HTML_PATH = _PROJECT_ROOT / "miniapp" / "index.html"
 
 
 @pytest.fixture
@@ -54,13 +56,17 @@ def env(monkeypatch, tmp_path):
     db.register_user(ADVERTISER, "adv", "Advertiser")
     db.register_user(WORKER, "worker", "Worker")
 
+    original_channels = CHANNELS.copy()
     CHANNELS.clear()
     CHANNELS["main"] = Channel(
         slug="main", channel_id=-100777, username="taskcoin_diag",
         title="TaskCoin", required=True,
     )
-    yield db_path
-    CHANNELS.clear()
+    try:
+        yield db_path
+    finally:
+        CHANNELS.clear()
+        CHANNELS.update(original_channels)
 
 
 @pytest.fixture
@@ -222,7 +228,7 @@ class TestFrontendOwnerIndicator:
             "the owner indicator must not disturb the terminal state"
 
     def test_index_html_loads_tasks_js_without_cache_buster(self):
-        with open("miniapp/index.html", encoding="utf-8") as fh:
+        with _INDEX_HTML_PATH.open(encoding="utf-8") as fh:
             html = fh.read()
         assert 'src="js/tasks.js"' in html
         assert "tasks.js?v=" not in html

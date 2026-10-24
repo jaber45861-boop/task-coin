@@ -21,13 +21,13 @@ Run:
 """
 
 import json
-import os
+from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
 
-_TASKS_JS = os.path.join("miniapp", "js", "tasks.js")
+_TASKS_JS = Path(__file__).resolve().parent / "miniapp" / "js" / "tasks.js"
 
 # ── The harness: a purpose-built DOM shim (no external dependency) ──
 # It implements exactly the surface tasks.js touches: createElement,
@@ -149,22 +149,18 @@ main().catch((error) => {
 
 
 @pytest.fixture(scope="module")
-def rendered():
+def rendered(tmp_path_factory):
     """Run the real tasks.js through the Node harness once."""
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to execute the UI harness")
-    harness_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "_owner_badge_harness.js")
-    with open(harness_path, "w", encoding="utf-8") as fh:
+    harness_path = tmp_path_factory.mktemp("owner_badge") / "harness.js"
+    with harness_path.open("w", encoding="utf-8") as fh:
         fh.write(_HARNESS)
-    try:
-        proc = subprocess.run(
-            [node, harness_path, _TASKS_JS],
-            capture_output=True, text=True, timeout=60,
-        )
-    finally:
-        os.remove(harness_path)
+    proc = subprocess.run(
+        [node, harness_path, _TASKS_JS],
+        capture_output=True, text=True, timeout=60,
+    )
     assert proc.returncode == 0, f"harness failed:\n{proc.stderr}"
     return json.loads(proc.stdout)
 
