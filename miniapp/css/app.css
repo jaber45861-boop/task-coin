@@ -1427,21 +1427,6 @@ body[data-page="profile"] .app-content {
     font-weight: 700;
 }
 
-/* ── Owner indicator (funding advertiser of record) ───────────── */
-.task-owner-badge {
-    flex: 1 1 100%;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 28px;
-    border-radius: 10px;
-    background-color: var(--home-card-inner-bg);
-    border: 1px solid var(--border-color);
-    color: var(--text-secondary);
-    font-size: 12px;
-    font-weight: 700;
-}
-
 /* ── Manual proof input (MT-TASK-17) ─────────────────────────── */
 .task-proof-input {
     flex: 1 1 100%;
